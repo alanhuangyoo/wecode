@@ -9,11 +9,14 @@ use tokio::sync::Notify;
 use wecode::agent::{Agent, Conversation, RunOptions};
 use wecode::approval::{ApprovalClient, ApprovalDecision};
 use wecode::cache::ResponseCache;
-use wecode::config::{ApprovalPolicy, CacheConfig, Config, McpServerConfig};
+#[cfg(unix)]
+use wecode::config::McpServerConfig;
+use wecode::config::{ApprovalPolicy, CacheConfig, Config};
 use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
 use wecode::input_queue::InputQueue;
 use wecode::interaction::{PlanState, UserInputClient, UserInputResponse, resolve_answers};
+#[cfg(unix)]
 use wecode::mcp::McpManager;
 use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, ToolProfile, Usage};
 use wecode::protocol::{Action, PlanItem, PlanStatus, QuestionOption, UserQuestion};
