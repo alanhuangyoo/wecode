@@ -43,6 +43,10 @@ and let SWE-bench grade the final patch separately.
 For a clean comparison, use `--cache-mode off`. For iteration on the harness itself, `read-write`
 allows interrupted jobs to reuse identical provider responses. Always disclose the mode.
 
+Independent native read tools can execute concurrently inside one model step. Their observations
+are returned in provider call order and share one hard output budget, so trajectories remain
+deterministic and bounded. Repository mutations never execute in a parallel batch.
+
 ## Terminal-Bench integration
 
 Run one task per container and pass the task instruction on stdin. Terminal-Bench may require

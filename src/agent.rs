@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -17,8 +18,11 @@ use crate::file_tools::FileTools;
 use crate::git::{collect_patch, head_id};
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
-use crate::model::{CompletionRequest, Model, ModelStream, ModelStreamEvent, Usage, action_text};
+use crate::model::{
+    CompletionRequest, Model, ModelStream, ModelStreamEvent, Usage, action_batch_text,
+};
 use crate::protocol::{Action, parse_action};
+use crate::tool_registry::ToolRegistry;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
@@ -226,7 +230,7 @@ impl Agent {
                 self.emit(&recorder, Event::RunCancelled { step })?;
                 break;
             };
-            let response = match response {
+            let mut response = match response {
                 Ok(response) => response,
                 Err(error) => {
                     summary = format!("model request failed: {error:#}");
@@ -250,11 +254,12 @@ impl Agent {
                     usage: response.usage,
                 },
             )?;
-            let normalized_response = response
-                .action
-                .as_ref()
-                .map(action_text)
-                .unwrap_or_else(|| response.text.clone());
+            let mut actions = response.take_actions();
+            let normalized_response = if actions.is_empty() {
+                response.text.clone()
+            } else {
+                action_batch_text(&actions)
+            };
             self.emit(
                 &recorder,
                 Event::AssistantMessage {
@@ -264,12 +269,11 @@ impl Agent {
             )?;
             messages.push(Message::assistant(normalized_response));
 
-            let action = match response.action {
-                Some(action) => action,
-                None => match parse_action(&response.text) {
+            if actions.is_empty() {
+                actions = match parse_action(&response.text) {
                     Ok(action) => {
                         format_errors = 0;
-                        action
+                        vec![action]
                     }
                     Err(error) => {
                         format_errors += 1;
@@ -290,8 +294,76 @@ impl Agent {
                         messages.push(Message::user(observation));
                         continue;
                     }
-                },
-            };
+                };
+            }
+            if let Err(error) = ToolRegistry::validate_batch(&actions) {
+                let observation = format!("TOOL BATCH ERROR: {error}.");
+                self.emit(
+                    &recorder,
+                    Event::ToolOutput {
+                        step,
+                        output: observation.clone(),
+                    },
+                )?;
+                messages.push(Message::user(observation));
+                continue;
+            }
+            if actions.len() > 1 {
+                for action in &actions {
+                    self.emit_action(step, action, &recorder)?;
+                }
+                let batch_budget =
+                    (self.config.agent.command_output_bytes / actions.len()).max(1_024);
+                let batch_tools = FileTools::new(self.workspace.clone(), batch_budget);
+                let execution = join_all(
+                    actions
+                        .iter()
+                        .map(|action| execute_read_action(&batch_tools, action)),
+                );
+                let results = if let Some(cancellation) = &cancellation {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => None,
+                        results = execution => Some(results),
+                    }
+                } else {
+                    Some(execution.await)
+                };
+                let Some(results) = results else {
+                    summary = "cancelled by user".into();
+                    reason = "cancelled".into();
+                    self.emit(&recorder, Event::RunCancelled { step })?;
+                    break;
+                };
+                let mut combined = String::new();
+                for (index, (action, result)) in actions.iter().zip(results).enumerate() {
+                    let observation = self.execution_observation(step, result, &recorder, true)?;
+                    let framed = format!(
+                        "TOOL RESULT {}/{} [{} · {}]\n{}",
+                        index + 1,
+                        actions.len(),
+                        action.kind(),
+                        action.description(),
+                        observation
+                    );
+                    self.emit(
+                        &recorder,
+                        Event::ToolOutput {
+                            step,
+                            output: framed.clone(),
+                        },
+                    )?;
+                    if !combined.is_empty() {
+                        combined.push_str("\n\n");
+                    }
+                    combined.push_str(&framed);
+                }
+                messages.push(Message::user(combined));
+                continue;
+            }
+            let action = actions
+                .pop()
+                .expect("a validated model turn always contains one action");
             self.emit(
                 &recorder,
                 Event::Action {
@@ -596,6 +668,25 @@ impl Agent {
         messages: &mut Vec<Message>,
         compact_output: bool,
     ) -> Result<()> {
+        let observation = self.execution_observation(step, result, recorder, compact_output)?;
+        self.emit(
+            recorder,
+            Event::ToolOutput {
+                step,
+                output: observation.clone(),
+            },
+        )?;
+        messages.push(Message::user(observation));
+        Ok(())
+    }
+
+    fn execution_observation(
+        &self,
+        step: usize,
+        result: Result<ExecutionResult>,
+        recorder: &JsonlSink,
+        compact_output: bool,
+    ) -> Result<String> {
         let observation = match result {
             Ok(result) => {
                 self.emit(
@@ -622,15 +713,19 @@ impl Agent {
             }
             Err(error) => format!("TOOL ERROR: {error}"),
         };
+        Ok(observation)
+    }
+
+    fn emit_action(&self, step: usize, action: &Action, recorder: &JsonlSink) -> Result<()> {
         self.emit(
             recorder,
-            Event::ToolOutput {
+            Event::Action {
                 step,
-                output: observation.clone(),
+                kind: action.kind().into(),
+                description: action.description().into(),
+                detail: action_detail(action),
             },
-        )?;
-        messages.push(Message::user(observation));
-        Ok(())
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -888,6 +983,48 @@ fn action_detail(action: &Action) -> String {
             }
         }
         Action::Finish { summary } => summary.clone(),
+    }
+}
+
+async fn execute_read_action(file_tools: &FileTools, action: &Action) -> Result<ExecutionResult> {
+    match action {
+        Action::ReadFile {
+            path,
+            offset,
+            limit,
+        } => file_tools.read_file(path, *offset, *limit).await,
+        Action::ListFiles { path, depth, limit } => {
+            file_tools.list_files(path, *depth, *limit).await
+        }
+        Action::Glob {
+            pattern,
+            path,
+            limit,
+        } => file_tools.glob(pattern, path, *limit).await,
+        Action::Grep {
+            pattern,
+            path,
+            glob,
+            literal,
+            ignore_case,
+            context,
+            limit,
+        } => {
+            file_tools
+                .grep(
+                    pattern,
+                    path,
+                    glob.as_deref(),
+                    *literal,
+                    *ignore_case,
+                    *context,
+                    *limit,
+                )
+                .await
+        }
+        Action::Shell { .. } | Action::Patch { .. } | Action::Finish { .. } => {
+            unreachable!("only read-only actions enter the parallel executor")
+        }
     }
 }
 

@@ -6,11 +6,11 @@ use serde_json::{Value, json};
 
 use super::{
     CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, Usage,
-    action_from_tool_call, action_text, merge_adjacent_messages, tool_definitions,
+    action_batch_text, action_from_tool_call, merge_adjacent_messages, tool_definitions,
 };
 use crate::config::ModelConfig;
 use crate::context::Role;
-use crate::model::http::{SseEvent, send_json, send_sse};
+use crate::model::http::{RetryPolicy, SseEvent, send_json, send_sse};
 
 pub struct GeminiModel {
     config: ModelConfig,
@@ -94,6 +94,7 @@ impl RawModel for GeminiModel {
             &url,
             headers,
             &self.body(request),
+            RetryPolicy::from_config(&self.config),
         )
         .await?;
         parse_response(value)
@@ -126,6 +127,7 @@ impl GeminiModel {
             &url,
             headers,
             &self.body(request),
+            RetryPolicy::from_config(&self.config),
             |event| ingest_stream_event(event, stream, &mut state),
         )
         .await?;
@@ -136,32 +138,29 @@ impl GeminiModel {
 #[derive(Default)]
 struct GeminiStreamState {
     text: String,
-    tool_name: String,
-    tool_arguments: Option<Value>,
+    tool_calls: Vec<(String, Value)>,
     usage: Usage,
 }
 
 impl GeminiStreamState {
     fn finish(self) -> Result<ModelResponse> {
-        let action = if self.tool_name.is_empty() {
-            None
-        } else {
-            Some(action_from_tool_call(
-                &self.tool_name,
-                self.tool_arguments.unwrap_or_else(|| json!({})),
-            )?)
-        };
+        let mut actions = self
+            .tool_calls
+            .into_iter()
+            .map(|(name, arguments)| action_from_tool_call(&name, arguments))
+            .collect::<Result<Vec<_>>>()?;
         let text = if self.text.is_empty() {
-            action
-                .as_ref()
-                .map(action_text)
+            (!actions.is_empty())
+                .then(|| action_batch_text(&actions))
                 .context("Gemini stream contained neither text nor a tool call")?
         } else {
             self.text
         };
+        let action = (!actions.is_empty()).then(|| actions.remove(0));
         Ok(ModelResponse {
             text,
             action,
+            additional_actions: actions,
             usage: self.usage,
             cache_hit: false,
         })
@@ -209,12 +208,16 @@ fn ingest_stream_event(
             }
         }
         if let Some(call) = part.get("functionCall") {
-            state.tool_name = call
+            let name = call
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            state.tool_arguments = call.get("args").cloned();
+            if !name.is_empty() {
+                state
+                    .tool_calls
+                    .push((name, call.get("args").cloned().unwrap_or_else(|| json!({}))));
+            }
         }
     }
     Ok(())
@@ -233,12 +236,12 @@ fn emit_delta(stream: &dyn ModelStream, event: ModelStreamEvent) -> Result<()> {
 }
 
 fn parse_response(value: Value) -> Result<ModelResponse> {
-    let action = value
+    let mut actions = value
         .pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find_map(|part| part.get("functionCall"))
+        .filter_map(|part| part.get("functionCall"))
         .map(|call| {
             let name = call
                 .get("name")
@@ -246,7 +249,7 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
                 .context("Gemini functionCall did not contain a name")?;
             action_from_tool_call(name, call.get("args").cloned().unwrap_or_else(|| json!({})))
         })
-        .transpose()?;
+        .collect::<Result<Vec<_>>>()?;
     let mut text = value
         .pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
@@ -254,17 +257,17 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
         .flatten()
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect::<String>();
-    if text.is_empty()
-        && let Some(action) = &action
-    {
-        text = action_text(action);
+    if text.is_empty() && !actions.is_empty() {
+        text = action_batch_text(&actions);
     }
     if text.is_empty() {
         anyhow::bail!("Gemini response contained neither text nor a supported tool call");
     }
+    let action = (!actions.is_empty()).then(|| actions.remove(0));
     Ok(ModelResponse {
         text,
         action,
+        additional_actions: actions,
         usage: Usage {
             input_tokens: at(&value, "/usageMetadata/promptTokenCount"),
             output_tokens: at(&value, "/usageMetadata/candidatesTokenCount"),
@@ -319,6 +322,30 @@ mod tests {
             })
         );
         assert_eq!(response.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn preserves_multiple_gemini_function_calls() {
+        let mut response = parse_response(json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "list_files", "args": {"path": "."}}},
+                        {"functionCall": {"name": "grep", "args": {"pattern": "TODO"}}}
+                    ]
+                }
+            }],
+            "usageMetadata": {}
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.take_actions().as_slice(),
+            [
+                crate::protocol::Action::ListFiles { .. },
+                crate::protocol::Action::Grep { .. }
+            ]
+        ));
     }
 
     #[test]

@@ -36,6 +36,7 @@ impl Model for FakeModel {
         Ok(ModelResponse {
             text,
             action: None,
+            additional_actions: Vec::new(),
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -48,6 +49,11 @@ impl Model for FakeModel {
 
 struct NativeFakeModel {
     responses: Mutex<VecDeque<Action>>,
+}
+
+struct BatchFakeModel {
+    requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    responses: Mutex<VecDeque<Vec<Action>>>,
 }
 
 struct CapturingModel {
@@ -72,6 +78,7 @@ impl Model for CapturingModel {
         Ok(ModelResponse {
             text: String::new(),
             action: Some(action),
+            additional_actions: Vec::new(),
             usage: Usage::default(),
             cache_hit: false,
         })
@@ -94,11 +101,37 @@ impl Model for NativeFakeModel {
         Ok(ModelResponse {
             text: String::new(),
             action: Some(action),
+            additional_actions: Vec::new(),
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,
                 ..Default::default()
             },
+            cache_hit: false,
+        })
+    }
+}
+
+#[async_trait]
+impl Model for BatchFakeModel {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
+        self.requests.lock().expect("request capture").push(request);
+        let mut actions = self
+            .responses
+            .lock()
+            .expect("fake model lock")
+            .pop_front()
+            .expect("fake model response");
+        let action = (!actions.is_empty()).then(|| actions.remove(0));
+        Ok(ModelResponse {
+            text: String::new(),
+            action,
+            additional_actions: actions,
+            usage: Usage::default(),
             cache_hit: false,
         })
     }
@@ -145,6 +178,7 @@ impl Model for SteeringGateModel {
                     "steering applied".into()
                 },
             }),
+            additional_actions: Vec::new(),
             usage: Usage::default(),
             cache_hit: false,
         })
@@ -340,6 +374,83 @@ async fn first_class_file_tools_feed_bounded_observations_back_to_the_model() {
                 .any(|event| matches!(event, Event::Action { kind, .. } if kind == expected))
         );
     }
+}
+
+#[tokio::test]
+async fn independent_read_tools_share_one_parallel_model_step() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("src/alpha.rs"),
+        "pub const ALPHA: &str = \"parallel-alpha\";\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("src/beta.rs"),
+        "pub const BETA: &str = \"parallel-beta\";\n",
+    )
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let sink = CapturingSink::default();
+    let events = sink.events.clone();
+    let model = BatchFakeModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            vec![
+                Action::ReadFile {
+                    path: "src/alpha.rs".into(),
+                    offset: None,
+                    limit: None,
+                },
+                Action::Grep {
+                    pattern: "parallel-beta".into(),
+                    path: "src".into(),
+                    glob: Some("**/*.rs".into()),
+                    literal: true,
+                    ignore_case: false,
+                    context: None,
+                    limit: None,
+                },
+            ],
+            vec![Action::Finish {
+                summary: "parallel inspection complete".into(),
+            }],
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(model),
+        Box::new(sink),
+        temp.path().canonicalize().unwrap(),
+    );
+
+    let result = agent
+        .run("inspect both fixtures", RunOptions::default())
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.steps, 2);
+    let requests = requests.lock().unwrap();
+    let observation = &requests[1].messages.last().unwrap().content;
+    assert!(observation.contains("TOOL RESULT 1/2 [read_file"));
+    assert!(observation.contains("parallel-alpha"));
+    assert!(observation.contains("TOOL RESULT 2/2 [grep"));
+    assert!(observation.contains("parallel-beta"));
+    let actions = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            Event::Action { step, kind, .. } if *step == 1 => Some(kind.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions, ["read_file", "grep"]);
 }
 
 #[tokio::test]

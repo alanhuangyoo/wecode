@@ -149,6 +149,10 @@ printf '%s' "定位并修复解析器错误。" | \
 `.gitignore`、避开二进制和超大文件，并限制遍历量、行数、匹配数和输出字节。输出顺序
 确定，适合 Benchmark 轨迹复现。构建、测试、版本控制和仓库特有工作流仍可使用 `shell`。
 
+最多八个相互独立的仓库读取可共用一个模型轮次并发执行；Shell、补丁和完成动作保持独占。
+遇到临时网络故障、限流、过载或服务端错误时，会进行有界的抖动退避并遵循标准重试响应头；
+流式输出一旦开始就不会重放请求，避免重复文本或工具调用。
+
 ## 项目规则
 
 WeCode 会自动加载仓库指令，并同时应用于交互任务和 Benchmark 任务。全局规则最先加载，
@@ -193,6 +197,8 @@ prompt_cache = "auto"
 send_prompt_cache_key = false
 native_tools = true
 streaming = true
+request_max_retries = 3
+max_retry_delay_seconds = 60
 
 [agent]
 max_steps = 40

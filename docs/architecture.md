@@ -6,10 +6,13 @@ WeCode keeps the runtime deliberately small and separates model access from repo
 CLI / benchmark manifest -> project instruction discovery
         |
         v
-Agent loop -> Context window -> Model trait -> Provider protocol -> HTTP
+Agent loop -> Context window -> Model trait -> Provider protocol -> retrying HTTP
         |                           |
         v                           v
-Executor -> isolated process      exact-response cache
+Tool registry -> Executor         exact-response cache
+        |
+        v
+parallel reads / exclusive writes
         |
         v
 Git patch + JSONL trajectory
@@ -25,8 +28,10 @@ Approval broker -> allow once / session grant / deny with feedback
 
 ## Runtime boundaries
 
-- One model call produces one native tool call or one text fallback action.
-- Tool actions execute serially, so repository state changes are deterministic.
+- One model call produces one or more native tool calls, or one text fallback action.
+- The registry allows up to eight independent repository reads to execute concurrently. Shell,
+  patch, and finish actions are exclusive and execute one at a time, so mutations remain
+  deterministic.
 - Shell processes are independent and do not retain hidden session state.
 - Provider implementations cannot mutate the repository directly.
 - Model responses may be cached; command results and filesystem reads are never cached across
@@ -49,12 +54,14 @@ Approval broker -> allow once / session grant / deny with feedback
 
 ## Agent loop
 
-The agent starts from a task and workspace description, then repeatedly requests one of three
+The agent starts from a task and workspace description, then repeatedly requests one of seven
 actions:
 
-1. `shell` inspects the workspace or runs build and test commands.
-2. `apply_patch` performs a bounded, path-checked file change.
-3. `finish` returns the final summary after optional verification succeeds.
+1. `read_file`, `list_files`, `glob`, and `grep` inspect the workspace through bounded native
+   handlers. Independent calls can share a model step and run concurrently.
+2. `shell` runs build, test, version-control, and repository-specific commands.
+3. `apply_patch` performs a bounded, path-checked file change.
+4. `finish` returns the final summary after optional verification succeeds.
 
 Every turn emits typed events. Human mode opts into model deltas and renders compact live progress
 in the terminal. JSONL and benchmark sinks do not request deltas, so they retain the buffered
@@ -90,6 +97,11 @@ keeps the agent loop independent of HTTP wire formats and allows provider-specif
 without changing repository behavior. OpenAI Chat Completions, OpenAI Responses, Anthropic
 Messages, and Gemini `streamGenerateContent` SSE events are reconstructed into the same completed
 response before the agent parses an action or writes to the exact-response cache.
+
+Transient connection failures, HTTP 408/409/425/429/529 responses, and provider 5xx responses use
+bounded exponential backoff with jitter. `Retry-After`, `retry-after-ms`, and `x-should-retry`
+headers take precedence. Streams are retried only before the first event; once output starts, WeCode
+will not replay the request and duplicate model output or tool calls.
 
 ## Output and replay
 

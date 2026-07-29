@@ -162,6 +162,11 @@ respect `.gitignore`, avoid binary and oversized files, and bound traversal, lin
 bytes. Their output is deterministic for benchmark trajectories. `shell` remains available for
 builds, tests, version control, and repository-specific workflows.
 
+Up to eight independent repository reads can share one model turn and execute concurrently, while
+shell commands, patches, and finish actions remain exclusive. Provider requests retry transient
+network, rate-limit, overload, and server failures with bounded jittered backoff and honor standard
+retry headers without replaying a stream after output begins.
+
 ## Project instructions
 
 WeCode loads repository instructions automatically and injects them into both interactive and
@@ -208,6 +213,8 @@ prompt_cache = "auto"
 send_prompt_cache_key = false
 native_tools = true
 streaming = true
+request_max_retries = 3
+max_retry_delay_seconds = 60
 
 [agent]
 max_steps = 40

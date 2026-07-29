@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -5,11 +7,11 @@ use serde_json::{Value, json};
 
 use super::{
     CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, Usage,
-    action_from_tool_call, action_text, tool_definitions,
+    action_batch_text, action_from_tool_call, tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode, WireApi};
 use crate::context::Role;
-use crate::model::http::{SseEvent, send_json, send_sse};
+use crate::model::http::{RetryPolicy, SseEvent, send_json, send_sse};
 
 pub struct OpenAiModel {
     config: ModelConfig,
@@ -74,7 +76,7 @@ impl OpenAiModel {
                     .collect(),
             );
             body["tool_choice"] = json!("auto");
-            body["parallel_tool_calls"] = json!(false);
+            body["parallel_tool_calls"] = json!(true);
         }
         body
     }
@@ -120,7 +122,7 @@ impl OpenAiModel {
                     .collect(),
             );
             body["tool_choice"] = json!("auto");
-            body["parallel_tool_calls"] = json!(false);
+            body["parallel_tool_calls"] = json!(true);
         }
         body
     }
@@ -156,6 +158,7 @@ impl RawModel for OpenAiModel {
             &url,
             self.headers()?,
             &body,
+            RetryPolicy::from_config(&self.config),
         )
         .await?;
         match self.config.wire_api {
@@ -185,6 +188,7 @@ impl OpenAiModel {
             &url,
             self.headers()?,
             &body,
+            RetryPolicy::from_config(&self.config),
             |event| ingest_chat_event(event, stream, &mut state),
         )
         .await?;
@@ -207,6 +211,7 @@ impl OpenAiModel {
             &url,
             self.headers()?,
             &body,
+            RetryPolicy::from_config(&self.config),
             |event| ingest_responses_event(event, stream, &mut state, &mut completed),
         )
         .await?;
@@ -220,31 +225,40 @@ impl OpenAiModel {
 #[derive(Default)]
 struct OpenAiStreamState {
     text: String,
-    tool_name: String,
-    tool_arguments: String,
+    tool_calls: BTreeMap<usize, PartialToolCall>,
     usage: Usage,
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    name: String,
+    arguments: String,
 }
 
 impl OpenAiStreamState {
     fn finish(self, source: &str) -> Result<ModelResponse> {
-        let action = if self.tool_name.is_empty() {
-            None
-        } else {
-            let arguments = serde_json::from_str(&self.tool_arguments)
-                .with_context(|| format!("{source} returned invalid tool arguments"))?;
-            Some(action_from_tool_call(&self.tool_name, arguments)?)
-        };
+        let mut actions = self
+            .tool_calls
+            .into_values()
+            .filter(|call| !call.name.is_empty())
+            .map(|call| {
+                let arguments = serde_json::from_str(&call.arguments)
+                    .with_context(|| format!("{source} returned invalid tool arguments"))?;
+                action_from_tool_call(&call.name, arguments)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let text = if self.text.is_empty() {
-            action
-                .as_ref()
-                .map(action_text)
+            (!actions.is_empty())
+                .then(|| action_batch_text(&actions))
                 .with_context(|| format!("{source} contained neither text nor a tool call"))?
         } else {
             self.text
         };
+        let action = (!actions.is_empty()).then(|| actions.remove(0));
         Ok(ModelResponse {
             text,
             action,
+            additional_actions: actions,
             usage: self.usage,
             cache_hit: false,
         })
@@ -292,17 +306,16 @@ fn ingest_chat_event(
     }
     if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
         for tool_call in tool_calls {
-            if tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) != 0 {
-                continue;
-            }
+            let index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             let Some(function) = tool_call.get("function") else {
                 continue;
             };
+            let call = state.tool_calls.entry(index).or_default();
             if let Some(name) = function.get("name").and_then(Value::as_str) {
-                state.tool_name.push_str(name);
+                call.name.push_str(name);
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                state.tool_arguments.push_str(arguments);
+                call.arguments.push_str(arguments);
             }
         }
     }
@@ -341,20 +354,34 @@ fn ingest_responses_event(
         }
         "response.function_call_arguments.delta" => {
             if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                state.tool_arguments.push_str(delta);
+                let index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                state
+                    .tool_calls
+                    .entry(index)
+                    .or_default()
+                    .arguments
+                    .push_str(delta);
             }
         }
         "response.output_item.added" | "response.output_item.done" => {
             if let Some(item) = value.get("item")
                 && item.get("type").and_then(Value::as_str) == Some("function_call")
             {
+                let index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let call = state.tool_calls.entry(index).or_default();
                 if let Some(name) = item.get("name").and_then(Value::as_str) {
-                    state.tool_name = name.to_owned();
+                    call.name = name.to_owned();
                 }
                 if kind.ends_with(".done")
                     && let Some(arguments) = item.get("arguments").and_then(Value::as_str)
                 {
-                    state.tool_arguments = arguments.to_owned();
+                    call.arguments = arguments.to_owned();
                 }
             }
         }
@@ -379,19 +406,21 @@ fn emit_nonempty(stream: &dyn ModelStream, event: ModelStreamEvent) -> Result<()
 }
 
 fn parse_chat_response(value: Value) -> Result<ModelResponse> {
-    let action = value
-        .pointer("/choices/0/message/tool_calls/0/function")
-        .and_then(parse_openai_tool_call)
-        .transpose()?;
+    let mut actions = value
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| call.get("function"))
+        .filter_map(parse_openai_tool_call)
+        .collect::<Result<Vec<_>>>()?;
     let mut text = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    if text.is_empty()
-        && let Some(action) = &action
-    {
-        text = action_text(action);
+    if text.is_empty() && !actions.is_empty() {
+        text = action_batch_text(&actions);
     }
     if text.is_empty() {
         bail!("OpenAI-compatible response contained neither text nor a supported tool call");
@@ -402,16 +431,18 @@ fn parse_chat_response(value: Value) -> Result<ModelResponse> {
         cache_read_tokens: u64_at(&value, "/usage/prompt_tokens_details/cached_tokens"),
         cache_write_tokens: 0,
     };
+    let action = (!actions.is_empty()).then(|| actions.remove(0));
     Ok(ModelResponse {
         text,
         action,
+        additional_actions: actions,
         usage,
         cache_hit: false,
     })
 }
 
 fn parse_responses_response(value: Value) -> Result<ModelResponse> {
-    let mut action = None;
+    let mut actions = Vec::new();
     let mut text = value
         .get("output_text")
         .and_then(Value::as_str)
@@ -421,9 +452,10 @@ fn parse_responses_response(value: Value) -> Result<ModelResponse> {
         && let Some(output) = value.get("output").and_then(Value::as_array)
     {
         for item in output {
-            if action.is_none() && item.get("type").and_then(Value::as_str) == Some("function_call")
+            if item.get("type").and_then(Value::as_str) == Some("function_call")
+                && let Some(action) = parse_openai_tool_call(item)
             {
-                action = parse_openai_tool_call(item).transpose()?;
+                actions.push(action?);
             }
             if let Some(content) = item.get("content").and_then(Value::as_array) {
                 for part in content {
@@ -434,10 +466,8 @@ fn parse_responses_response(value: Value) -> Result<ModelResponse> {
             }
         }
     }
-    if text.is_empty()
-        && let Some(action) = &action
-    {
-        text = action_text(action);
+    if text.is_empty() && !actions.is_empty() {
+        text = action_batch_text(&actions);
     }
     if text.is_empty() {
         bail!("OpenAI Responses result contained neither text nor a supported tool call");
@@ -448,9 +478,11 @@ fn parse_responses_response(value: Value) -> Result<ModelResponse> {
         cache_read_tokens: u64_at(&value, "/usage/input_tokens_details/cached_tokens"),
         cache_write_tokens: 0,
     };
+    let action = (!actions.is_empty()).then(|| actions.remove(0));
     Ok(ModelResponse {
         text,
         action,
+        additional_actions: actions,
         usage,
         cache_hit: false,
     })
@@ -549,6 +581,43 @@ mod tests {
                 summary: "all checks pass".into(),
             })
         );
+    }
+
+    #[test]
+    fn preserves_multiple_native_tool_calls_in_provider_order() {
+        let mut response = parse_chat_response(json!({
+            "choices": [{"message": {
+                "content": null,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/lib.rs\"}"
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "grep",
+                            "arguments": "{\"pattern\":\"pub mod\",\"path\":\"src\"}"
+                        }
+                    }
+                ]
+            }}],
+            "usage": {}
+        }))
+        .unwrap();
+
+        let actions = response.take_actions();
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                crate::protocol::Action::ReadFile { .. },
+                crate::protocol::Action::Grep { .. }
+            ]
+        ));
+        assert!(response.text.starts_with("[{\"action\":\"read_file\""));
     }
 
     #[test]

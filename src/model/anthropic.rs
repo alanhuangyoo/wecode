@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -5,11 +7,11 @@ use serde_json::{Value, json};
 
 use super::{
     CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, Usage,
-    action_from_tool_call, action_text, merge_adjacent_messages, tool_definitions,
+    action_batch_text, action_from_tool_call, merge_adjacent_messages, tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode};
 use crate::context::Role;
-use crate::model::http::{SseEvent, send_json, send_sse};
+use crate::model::http::{RetryPolicy, SseEvent, send_json, send_sse};
 
 pub struct AnthropicModel {
     config: ModelConfig,
@@ -121,6 +123,7 @@ impl RawModel for AnthropicModel {
             &url,
             self.headers()?,
             &self.body(request),
+            RetryPolicy::from_config(&self.config),
         )
         .await?;
         parse_response(value)
@@ -143,6 +146,7 @@ impl AnthropicModel {
             &url,
             self.headers()?,
             &body,
+            RetryPolicy::from_config(&self.config),
             |event| ingest_stream_event(event, stream, &mut state),
         )
         .await?;
@@ -153,35 +157,44 @@ impl AnthropicModel {
 #[derive(Default)]
 struct AnthropicStreamState {
     text: String,
-    tool_name: String,
-    tool_input: String,
+    tool_calls: BTreeMap<usize, PartialToolUse>,
     usage: Usage,
+}
+
+#[derive(Default)]
+struct PartialToolUse {
+    name: String,
+    input: String,
 }
 
 impl AnthropicStreamState {
     fn finish(self) -> Result<ModelResponse> {
-        let action = if self.tool_name.is_empty() {
-            None
-        } else {
-            let input = if self.tool_input.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&self.tool_input)
-                    .context("Anthropic stream returned invalid tool input")?
-            };
-            Some(action_from_tool_call(&self.tool_name, input)?)
-        };
+        let mut actions = self
+            .tool_calls
+            .into_values()
+            .filter(|call| !call.name.is_empty())
+            .map(|call| {
+                let input = if call.input.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str(&call.input)
+                        .context("Anthropic stream returned invalid tool input")?
+                };
+                action_from_tool_call(&call.name, input)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let text = if self.text.is_empty() {
-            action
-                .as_ref()
-                .map(action_text)
+            (!actions.is_empty())
+                .then(|| action_batch_text(&actions))
                 .context("Anthropic stream contained neither text nor a tool call")?
         } else {
             self.text
         };
+        let action = (!actions.is_empty()).then(|| actions.remove(0));
         Ok(ModelResponse {
             text,
             action,
+            additional_actions: actions,
             usage: self.usage,
             cache_hit: false,
         })
@@ -224,7 +237,10 @@ fn ingest_stream_event(
                         }
                     }
                     Some("tool_use") => {
-                        state.tool_name = block
+                        let index =
+                            value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        let call = state.tool_calls.entry(index).or_default();
+                        call.name = block
                             .get("name")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
@@ -232,7 +248,7 @@ fn ingest_stream_event(
                         if let Some(input) = block.get("input").filter(|input| {
                             input.as_object().is_some_and(|object| !object.is_empty())
                         }) {
-                            state.tool_input = serde_json::to_string(input)?;
+                            call.input = serde_json::to_string(input)?;
                         }
                     }
                     _ => {}
@@ -255,7 +271,14 @@ fn ingest_stream_event(
                     }
                     Some("input_json_delta") => {
                         if let Some(json) = delta.get("partial_json").and_then(Value::as_str) {
-                            state.tool_input.push_str(json);
+                            let index =
+                                value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            state
+                                .tool_calls
+                                .entry(index)
+                                .or_default()
+                                .input
+                                .push_str(json);
                         }
                     }
                     _ => {}
@@ -283,12 +306,12 @@ fn emit_delta(stream: &dyn ModelStream, event: ModelStreamEvent) -> Result<()> {
 }
 
 fn parse_response(value: Value) -> Result<ModelResponse> {
-    let action = value
+    let mut actions = value
         .get("content")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
         .map(|block| {
             let name = block
                 .get("name")
@@ -299,7 +322,7 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
                 block.get("input").cloned().unwrap_or_else(|| json!({})),
             )
         })
-        .transpose()?;
+        .collect::<Result<Vec<_>>>()?;
     let mut text = value
         .get("content")
         .and_then(Value::as_array)
@@ -307,17 +330,17 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
         .flatten()
         .filter_map(|block| block.get("text").and_then(Value::as_str))
         .collect::<String>();
-    if text.is_empty()
-        && let Some(action) = &action
-    {
-        text = action_text(action);
+    if text.is_empty() && !actions.is_empty() {
+        text = action_batch_text(&actions);
     }
     if text.is_empty() {
         anyhow::bail!("Anthropic response contained neither text nor a supported tool call");
     }
+    let action = (!actions.is_empty()).then(|| actions.remove(0));
     Ok(ModelResponse {
         text,
         action,
+        additional_actions: actions,
         usage: Usage {
             input_tokens: at(&value, "/usage/input_tokens"),
             output_tokens: at(&value, "/usage/output_tokens"),
@@ -369,6 +392,36 @@ mod tests {
             Some(crate::protocol::Action::Patch { .. })
         ));
         assert_eq!(response.usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn preserves_multiple_anthropic_tool_uses() {
+        let mut response = parse_response(json!({
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "read_file",
+                    "input": {"path": "Cargo.toml"}
+                },
+                {
+                    "type": "tool_use",
+                    "id": "tool_2",
+                    "name": "glob",
+                    "input": {"pattern": "**/*.rs"}
+                }
+            ],
+            "usage": {}
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.take_actions().as_slice(),
+            [
+                crate::protocol::Action::ReadFile { .. },
+                crate::protocol::Action::Glob { .. }
+            ]
+        ));
     }
 
     #[test]

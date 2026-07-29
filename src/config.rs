@@ -108,6 +108,8 @@ pub struct ModelConfig {
     pub send_prompt_cache_key: bool,
     pub native_tools: bool,
     pub streaming: bool,
+    pub request_max_retries: usize,
+    pub max_retry_delay_seconds: u64,
 }
 
 impl Default for ModelConfig {
@@ -214,6 +216,12 @@ impl Config {
         if self.model.base_url.trim().is_empty() {
             bail!("model base_url cannot be empty");
         }
+        if self.model.request_max_retries > 10 {
+            bail!("model.request_max_retries cannot exceed 10");
+        }
+        if self.model.max_retry_delay_seconds > 300 {
+            bail!("model.max_retry_delay_seconds cannot exceed 300");
+        }
         if self.agent.max_steps == 0 {
             bail!("agent.max_steps must be greater than zero");
         }
@@ -274,6 +282,8 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             send_prompt_cache_key: true,
             native_tools: true,
             streaming: true,
+            request_max_retries: 3,
+            max_retry_delay_seconds: 60,
         },
         "anthropic" => ModelConfig {
             provider: key,
@@ -289,6 +299,8 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             send_prompt_cache_key: false,
             native_tools: true,
             streaming: true,
+            request_max_retries: 3,
+            max_retry_delay_seconds: 60,
         },
         "gemini" | "google" => ModelConfig {
             provider: "gemini".into(),
@@ -304,6 +316,8 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             send_prompt_cache_key: false,
             native_tools: true,
             streaming: true,
+            request_max_retries: 3,
+            max_retry_delay_seconds: 60,
         },
         "openrouter" => openai_compatible(
             key,
@@ -374,6 +388,8 @@ fn openai_compatible(
         send_prompt_cache_key: false,
         native_tools: true,
         streaming: true,
+        request_max_retries: 3,
+        max_retry_delay_seconds: 60,
     }
 }
 
