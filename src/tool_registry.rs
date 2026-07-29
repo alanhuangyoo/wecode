@@ -67,7 +67,8 @@ impl ToolRegistry {
             Action::Shell { .. }
             | Action::Patch { .. }
             | Action::UpdatePlan { .. }
-            | Action::RequestUserInput { .. } => ToolConcurrency::Exclusive,
+            | Action::RequestUserInput { .. }
+            | Action::McpCall { .. } => ToolConcurrency::Exclusive,
             Action::Finish { .. } => ToolConcurrency::Terminal,
         }
     }
@@ -170,6 +171,20 @@ impl ToolRegistry {
             "finish" => Action::Finish {
                 summary: get_string("summary"),
             },
+            _ if name.starts_with("mcp__") => {
+                let mut parts = name.splitn(3, "__");
+                let prefix = parts.next();
+                let server = parts.next().unwrap_or_default();
+                let tool = parts.next().unwrap_or_default();
+                if prefix != Some("mcp") || server.is_empty() || tool.is_empty() {
+                    bail!("provider returned malformed MCP tool call {name:?}");
+                }
+                Action::McpCall {
+                    server: server.to_owned(),
+                    tool: tool.to_owned(),
+                    arguments,
+                }
+            }
             _ => bail!("provider returned unknown tool call {name:?}"),
         };
         validate_action(&action)?;
@@ -419,5 +434,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["update_plan", "request_user_input"]
         );
+    }
+
+    #[test]
+    fn namespaced_mcp_calls_preserve_server_tool_and_arguments() {
+        let arguments = json!({"path": "README.md"});
+        let action = ToolRegistry::parse_call("mcp__files__read_text", arguments.clone()).unwrap();
+        assert_eq!(
+            action,
+            Action::McpCall {
+                server: "files".into(),
+                tool: "read_text".into(),
+                arguments,
+            }
+        );
+        assert!(ToolRegistry::parse_call("mcp__broken", json!({})).is_err());
     }
 }

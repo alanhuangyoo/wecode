@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -177,31 +178,74 @@ impl Default for CacheConfig {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
+pub struct McpConfig {
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub enabled: bool,
+    pub startup_timeout_seconds: u64,
+    pub tool_timeout_seconds: u64,
+    pub max_output_bytes: usize,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            enabled: true,
+            startup_timeout_seconds: 10,
+            tool_timeout_seconds: 60,
+            max_output_bytes: 64 * 1_024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Config {
     pub model: ModelConfig,
     pub agent: AgentConfig,
     pub cache: CacheConfig,
+    pub mcp: McpConfig,
 }
 
 impl Config {
     pub fn load(workspace: &Path, explicit: Option<&Path>) -> Result<Self> {
-        let path = explicit
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                let project = workspace.join(".wecode.toml");
-                project.is_file().then_some(project)
-            })
-            .or_else(|| {
-                let user = default_config_path();
-                user.is_file().then_some(user)
-            });
+        let project = workspace.join(".wecode.toml");
+        let (path, automatically_loaded_project) = if let Some(explicit) = explicit {
+            (Some(explicit.to_path_buf()), false)
+        } else if project.is_file() {
+            (Some(project), true)
+        } else {
+            let user = default_config_path();
+            (user.is_file().then_some(user), false)
+        };
 
         let Some(path) = path else {
             return Ok(Self::default());
         };
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("failed to parse config {}", path.display()))
+        let config: Self = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse config {}", path.display()))?;
+        if automatically_loaded_project && config.mcp.servers.values().any(|server| server.enabled)
+        {
+            bail!(
+                "refusing to auto-start MCP commands from {}; review it, then pass --config {} explicitly or move trusted MCP configuration to {}",
+                path.display(),
+                path.display(),
+                default_config_path().display()
+            );
+        }
+        Ok(config)
     }
 
     pub fn apply_provider(&mut self, provider: &str) -> Result<()> {
@@ -227,6 +271,40 @@ impl Config {
         }
         if self.agent.command_output_bytes < 1_024 {
             bail!("agent.command_output_bytes must be at least 1024");
+        }
+        if self.mcp.servers.len() > 16 {
+            bail!("mcp cannot configure more than 16 servers");
+        }
+        for (name, server) in &self.mcp.servers {
+            validate_mcp_name(name, "server")?;
+            if server.command.trim().is_empty() || server.command.len() > 4_096 {
+                bail!("mcp server {name:?} command must contain between 1 and 4096 bytes");
+            }
+            if server.args.len() > 128
+                || server
+                    .args
+                    .iter()
+                    .any(|argument| argument.len() > 16 * 1_024)
+            {
+                bail!("mcp server {name:?} arguments exceed the configured limits");
+            }
+            if server.env.len() > 128 || server.env.values().any(|value| value.len() > 16 * 1_024) {
+                bail!("mcp server {name:?} environment exceeds the configured limits");
+            }
+            if server.startup_timeout_seconds == 0 || server.startup_timeout_seconds > 300 {
+                bail!("mcp server {name:?} startup_timeout_seconds must be between 1 and 300");
+            }
+            if server.tool_timeout_seconds == 0 || server.tool_timeout_seconds > 1_800 {
+                bail!("mcp server {name:?} tool_timeout_seconds must be between 1 and 1800");
+            }
+            if !(1_024..=16 * 1_024 * 1_024).contains(&server.max_output_bytes) {
+                bail!("mcp server {name:?} max_output_bytes must be between 1024 and 16777216");
+            }
+            for env_name in server.env.keys() {
+                if !valid_env_name(env_name) {
+                    bail!("mcp server {name:?} has invalid environment variable {env_name:?}");
+                }
+            }
         }
         Ok(())
     }
@@ -263,6 +341,29 @@ impl Config {
     pub fn command_timeout(&self) -> Duration {
         Duration::from_secs(self.agent.command_timeout_seconds)
     }
+}
+
+fn validate_mcp_name(name: &str, kind: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 32
+        || name.contains("__")
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        bail!(
+            "mcp {kind} name {name:?} must be 1-32 ASCII letters, digits, underscores, or hyphens and cannot contain \"__\""
+        );
+    }
+    Ok(())
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<ModelConfig> {
@@ -482,6 +583,48 @@ mod tests {
         assert_eq!(default_state_dir(), home.join("sessions"));
         assert_eq!(default_credentials_path(), home.join("credentials"));
         assert_eq!(default_history_path(), home.join("history"));
+    }
+
+    #[test]
+    fn mcp_config_rejects_unsafe_names_and_unbounded_limits() {
+        let mut config = Config::default();
+        config.mcp.servers.insert(
+            "bad.name".into(),
+            McpServerConfig {
+                command: "server".into(),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_err());
+
+        config.mcp.servers.clear();
+        config.mcp.servers.insert(
+            "safe".into(),
+            McpServerConfig {
+                command: "server".into(),
+                tool_timeout_seconds: 0,
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn project_mcp_requires_explicit_config_trust() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".wecode.toml");
+        std::fs::write(
+            &path,
+            r#"
+[mcp.servers.fixture]
+command = "fixture-server"
+"#,
+        )
+        .unwrap();
+        let error = Config::load(temp.path(), None).unwrap_err();
+        assert!(error.to_string().contains("refusing to auto-start MCP"));
+        let explicit = Config::load(temp.path(), Some(&path)).unwrap();
+        assert_eq!(explicit.mcp.servers["fixture"].command, "fixture-server");
     }
 
     #[cfg(unix)]

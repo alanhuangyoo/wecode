@@ -125,6 +125,7 @@ Agent 工作时仍可继续编辑。
              本会话允许相同操作
 /deny        拒绝操作并可提供原因
 /status      查看模型、工作区、缓存和上下文
+/mcp         查看 MCP 服务器和工具状态
 /rules       查看已加载的项目规则
 /config      查看当前配置文件
 /history     查看输入历史文件
@@ -240,6 +241,14 @@ trajectory_directory = "/path/to/wecode/sessions"
 [cache]
 mode = "read-write"
 max_megabytes = 2048
+
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
+enabled = true
+startup_timeout_seconds = 10
+tool_timeout_seconds = 60
+max_output_bytes = 65536
 ```
 
 支持 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY` 等服务商变量。
@@ -254,6 +263,24 @@ wecode run -C /path/to/repository \
 ```
 
 在 Unix 系统上，密钥文件不能允许用户组或其他用户读取，并且必须位于 Agent 工作区之外。
+
+### MCP 工具
+
+交互会话可以连接配置在 `[mcp.servers.<名称>]` 下的轻量 stdio
+[Model Context Protocol](https://modelcontextprotocol.io/) 服务器。WeCode 会完成初始化握手、
+分页发现工具，并把它们注册为确定的 `mcp__服务器__工具` 函数。使用 `/mcp` 可以查看连接
+错误和已发现的工具。
+
+服务器启动、调用、协议行、stderr 捕获、工具数量和返回给模型的观察结果都有硬上限；
+会话关闭时子进程会被回收。声明 MCP `readOnlyHint` 的工具可以直接执行，其他 MCP 工具
+会进入现有审批界面，因为它们可能修改外部状态。可在 `[mcp.servers.<名称>.env]` 下添加
+环境变量；密钥只应放在用户级 `~/.wecode/config.toml`，不要写进仓库配置。为防止恶意仓库
+在进入目录时自动执行命令，WeCode 不会从隐式发现的 `.wecode.toml` 启动已启用的 MCP；
+请先检查文件，再通过 `--config` 显式传入，或把可信 MCP 配置移到
+`~/.wecode/config.toml`。
+
+MCP 在 `wecode run`、JSONL 输出和 `wecode bench` 中默认完全禁用。这些路径继续使用原来的
+七个工具、系统提示词和缓存命名空间，交互扩展不会悄悄改变 Benchmark 结果。
 
 ## 权限审批
 

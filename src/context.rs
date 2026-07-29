@@ -249,6 +249,14 @@ fn ingest_actions(content: &str, result: Option<&str>, facts: &mut SummaryFacts)
                     );
                 }
             }
+            Action::McpCall { server, tool, .. } => {
+                let fact = format!("Called MCP tool `{server}::{tool}`.");
+                if result.is_some_and(|result| result.contains("MCP TOOL ERROR")) {
+                    push_fact(&mut facts.failures, fact, 10);
+                } else {
+                    push_fact(&mut facts.other, fact, 10);
+                }
+            }
             Action::Finish { summary } => {
                 push_fact(
                     &mut facts.other,

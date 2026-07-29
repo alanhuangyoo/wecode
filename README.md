@@ -133,6 +133,7 @@ composer remains editable while the agent works.
              Allow matching actions for this session
 /deny        Deny the pending action with optional feedback
 /status      Show model, workspace, cache, and context
+/mcp         Show connected MCP servers and tools
 /rules       Show loaded project instruction files
 /config      Show the active config path
 /history     Show the history file
@@ -259,6 +260,14 @@ trajectory_directory = "/path/to/wecode/sessions"
 [cache]
 mode = "read-write"
 max_megabytes = 2048
+
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
+enabled = true
+startup_timeout_seconds = 10
+tool_timeout_seconds = 60
+max_output_bytes = 65536
 ```
 
 Provider-specific variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`
@@ -275,6 +284,27 @@ wecode run -C /path/to/repository \
 
 On Unix, key files must not be accessible by group or other users and must be located outside the
 agent workspace.
+
+### MCP tools
+
+Interactive sessions can connect to lightweight stdio
+[Model Context Protocol](https://modelcontextprotocol.io/) servers configured under
+`[mcp.servers.<name>]`. WeCode performs the initialize handshake, discovers paginated tools, and
+registers them as deterministic `mcp__server__tool` functions. Use `/mcp` to inspect connection
+errors and discovered tools.
+
+Server startup, calls, protocol lines, stderr capture, tool count, and returned observations all
+have hard bounds. Servers are killed when the session closes. Tools declaring the MCP
+`readOnlyHint` run directly; other MCP tools use the normal approval UI because they may change
+external state. Optional environment values can be added under
+`[mcp.servers.<name>.env]`; keep secrets in the user-level `~/.wecode/config.toml`, never in a
+repository config. To prevent repository checkout attacks, WeCode refuses to auto-start enabled
+MCP commands from an implicitly discovered `.wecode.toml`; review the file and pass it explicitly
+with `--config`, or move trusted MCP configuration to `~/.wecode/config.toml`.
+
+MCP is deliberately disabled for `wecode run`, JSONL output, and `wecode bench`. Those paths retain
+the original seven tools, system prompt, and cache namespace, so adding interactive extensions
+cannot silently change benchmark results.
 
 ## Approvals
 

@@ -9,11 +9,12 @@ use tokio::sync::Notify;
 use wecode::agent::{Agent, Conversation, RunOptions};
 use wecode::approval::{ApprovalClient, ApprovalDecision};
 use wecode::cache::ResponseCache;
-use wecode::config::{ApprovalPolicy, CacheConfig, Config};
+use wecode::config::{ApprovalPolicy, CacheConfig, Config, McpServerConfig};
 use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
 use wecode::input_queue::InputQueue;
 use wecode::interaction::{PlanState, UserInputClient, UserInputResponse, resolve_answers};
+use wecode::mcp::McpManager;
 use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, ToolProfile, Usage};
 use wecode::protocol::{Action, PlanItem, PlanStatus, QuestionOption, UserQuestion};
 
@@ -904,6 +905,87 @@ async fn denied_elevated_command_is_returned_to_the_model() {
             .content
             .contains("PERMISSION DENIED: network access is not allowed")
     }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interactive_agent_executes_a_discovered_read_only_mcp_tool() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let script = temp.path().join("mcp-fixture.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"inspect","description":"Inspect fixture","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"mcp-observation"}]}}'
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::McpCall {
+                server: "fixture".into(),
+                tool: "inspect".into(),
+                arguments: serde_json::json!({}),
+            },
+            Action::Finish {
+                summary: "MCP result used".into(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    config.mcp.servers.insert(
+        "fixture".into(),
+        McpServerConfig {
+            command: script.display().to_string(),
+            ..Default::default()
+        },
+    );
+    let workspace = temp.path().canonicalize().unwrap();
+    let manager = McpManager::connect(&config.mcp, &workspace).await;
+    let mut agent = Agent::new_with_mcp(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        workspace,
+        ToolProfile::Interactive,
+        manager.clone(),
+    );
+
+    let result = agent
+        .run("use the MCP fixture", RunOptions::default())
+        .await
+        .unwrap();
+    assert!(result.success);
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("mcp-observation"))
+        );
+    }
+    manager.shutdown().await;
 }
 
 #[tokio::test]

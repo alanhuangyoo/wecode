@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 pub enum ApprovalKind {
     Shell,
     Patch,
+    Mcp,
 }
 
 impl ApprovalKind {
@@ -15,6 +16,7 @@ impl ApprovalKind {
         match self {
             Self::Shell => "shell",
             Self::Patch => "patch",
+            Self::Mcp => "mcp",
         }
     }
 }

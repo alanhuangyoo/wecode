@@ -17,6 +17,7 @@ pub struct GeminiModel {
     api_key: Option<String>,
     client: reqwest::Client,
     tool_profile: ToolProfile,
+    extra_tools: Vec<Value>,
 }
 
 impl GeminiModel {
@@ -25,12 +26,14 @@ impl GeminiModel {
         api_key: Option<String>,
         client: reqwest::Client,
         tool_profile: ToolProfile,
+        extra_tools: Vec<Value>,
     ) -> Self {
         Self {
             config,
             api_key,
             client,
             tool_profile,
+            extra_tools,
         }
     }
 
@@ -60,7 +63,7 @@ impl GeminiModel {
         });
         if self.config.native_tools {
             body["tools"] = json!([{
-                "functionDeclarations": tool_definitions(self.tool_profile)
+                "functionDeclarations": tool_definitions(self.tool_profile, &self.extra_tools)
             }]);
             body["toolConfig"] = json!({
                 "functionCallingConfig": {"mode": "AUTO"}

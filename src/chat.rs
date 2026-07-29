@@ -19,6 +19,7 @@ use crate::config::{
 use crate::input_queue::QueueSnapshot;
 use crate::instructions::InstructionSet;
 use crate::interaction::{PlanSnapshot, UserInputRequest};
+use crate::mcp::{McpServerReport, McpServerState};
 use crate::protocol::PlanStatus;
 use crate::session::{SessionCheckpoint, SessionSummary};
 use crate::tui::{self, TuiHandle, TuiMessage, TuiTone};
@@ -36,6 +37,7 @@ pub enum ChatCommand {
     Deny(String),
     Help,
     History,
+    Mcp,
     Fork(Option<String>),
     New,
     Plan,
@@ -262,6 +264,7 @@ impl ChatView {
              \n  {:12} Allow matching actions for this session\
              \n  {:12} Deny a pending action with optional feedback\
              \n  {:12} Show model, workspace, cache, and context\
+             \n  {:12} Show MCP server and tool status\
              \n  {:12} Show loaded project instruction files\
              \n  {:12} Show the active config path\
              \n  {:12} Show the history file\
@@ -288,6 +291,7 @@ impl ChatView {
             "/approve-session",
             "/deny [reason]",
             "/status",
+            "/mcp",
             "/rules",
             "/config",
             "/history",
@@ -343,6 +347,36 @@ impl ChatView {
                 file.path.display(),
                 xai_token_estimation::estimate_tokens(&file.content)
             ));
+        }
+        output.push('\n');
+        self.output.print(output)
+    }
+
+    pub fn show_mcp(&self, reports: &[McpServerReport]) -> Result<()> {
+        let mut output = format!("\n{}\n", Style::new().cyan().bold().apply_to("MCP servers"));
+        if reports.is_empty() {
+            output.push_str("  No MCP servers configured.\n\n");
+            return self.output.print(output);
+        }
+        for report in reports {
+            let state = match report.state {
+                McpServerState::Connected => "connected",
+                McpServerState::Disabled => "disabled",
+                McpServerState::Failed => "failed",
+            };
+            output.push_str(&format!(
+                "  {:16} {:10} {} tool{}\n",
+                report.name,
+                state,
+                report.tools.len(),
+                if report.tools.len() == 1 { "" } else { "s" }
+            ));
+            for tool in &report.tools {
+                output.push_str(&format!("    · {tool}\n"));
+            }
+            if let Some(error) = &report.error {
+                output.push_str(&format!("    ! {}\n", one_line(error)));
+            }
         }
         output.push('\n');
         self.output.print(output)
@@ -764,6 +798,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/followup" | "/follow-up" | "/later" => ChatInput::FollowUp(argument.to_owned()),
         "/help" | "/?" => ChatInput::Command(ChatCommand::Help),
         "/history" => ChatInput::Command(ChatCommand::History),
+        "/mcp" => ChatInput::Command(ChatCommand::Mcp),
         "/fork" | "/branch" => ChatInput::Command(ChatCommand::Fork(
             (!argument.is_empty()).then(|| argument.to_owned()),
         )),
@@ -856,6 +891,7 @@ mod tests {
             ChatInput::Command(ChatCommand::Rewind(None))
         );
         assert_eq!(parse_input("/plan"), ChatInput::Command(ChatCommand::Plan));
+        assert_eq!(parse_input("/mcp"), ChatInput::Command(ChatCommand::Mcp));
         assert_eq!(
             parse_input("/model"),
             ChatInput::Command(ChatCommand::Status)

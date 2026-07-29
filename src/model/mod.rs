@@ -136,7 +136,18 @@ pub fn create_model_with_profile(
     cache: ResponseCache,
     tool_profile: ToolProfile,
 ) -> Result<Box<dyn Model>> {
-    let namespace = cache_namespace(config, api_key.as_deref(), tool_profile)?;
+    create_model_with_tools(config, api_key, cache, tool_profile, Vec::new())
+}
+
+pub fn create_model_with_tools(
+    config: &ModelConfig,
+    api_key: Option<String>,
+    cache: ResponseCache,
+    tool_profile: ToolProfile,
+    extra_tools: Vec<serde_json::Value>,
+) -> Result<Box<dyn Model>> {
+    let namespace =
+        cache_namespace_with_tools(config, api_key.as_deref(), tool_profile, &extra_tools)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .user_agent(concat!("wecode/", env!("CARGO_PKG_VERSION")))
@@ -147,18 +158,21 @@ pub fn create_model_with_profile(
             api_key,
             client,
             tool_profile,
+            extra_tools,
         )),
         ProviderFamily::Anthropic => Arc::new(anthropic::AnthropicModel::new(
             config.clone(),
             api_key,
             client,
             tool_profile,
+            extra_tools,
         )),
         ProviderFamily::Gemini => Arc::new(gemini::GeminiModel::new(
             config.clone(),
             api_key,
             client,
             tool_profile,
+            extra_tools,
         )),
     };
     Ok(Box::new(CachedModel {
@@ -166,6 +180,20 @@ pub fn create_model_with_profile(
         cache,
         namespace,
     }))
+}
+
+fn cache_namespace_with_tools(
+    config: &ModelConfig,
+    api_key: Option<&str>,
+    tool_profile: ToolProfile,
+    extra_tools: &[serde_json::Value],
+) -> Result<String> {
+    let namespace = cache_namespace(config, api_key, tool_profile)?;
+    if extra_tools.is_empty() {
+        return Ok(namespace);
+    }
+    let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(extra_tools)?));
+    Ok(format!("{namespace}:tools:{}", &digest[..16]))
 }
 
 fn cache_namespace(
@@ -203,8 +231,13 @@ fn merge_adjacent_messages(messages: &[Message]) -> Vec<Message> {
     result
 }
 
-pub(crate) fn tool_definitions(profile: ToolProfile) -> Vec<serde_json::Value> {
-    ToolRegistry::for_profile(profile).definitions()
+pub(crate) fn tool_definitions(
+    profile: ToolProfile,
+    extra_tools: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut definitions = ToolRegistry::for_profile(profile).definitions();
+    definitions.extend_from_slice(extra_tools);
+    definitions
 }
 
 pub(crate) fn action_from_tool_call(name: &str, arguments: serde_json::Value) -> Result<Action> {
@@ -314,7 +347,7 @@ mod tests {
 
     #[test]
     fn native_tool_definitions_map_to_actions() {
-        assert_eq!(tool_definitions(ToolProfile::Coding).len(), 7);
+        assert_eq!(tool_definitions(ToolProfile::Coding, &[]).len(), 7);
         assert_eq!(
             action_from_tool_call(
                 "shell",
@@ -353,5 +386,30 @@ mod tests {
             }
         );
         assert!(action_from_tool_call("unknown", json!({})).is_err());
+    }
+
+    #[test]
+    fn dynamic_tools_change_only_the_extended_cache_namespace() {
+        let config = ModelConfig::default();
+        let base =
+            cache_namespace_with_tools(&config, Some("test-key"), ToolProfile::Interactive, &[])
+                .unwrap();
+        assert_eq!(
+            base,
+            cache_namespace(&config, Some("test-key"), ToolProfile::Interactive).unwrap()
+        );
+        let extended = cache_namespace_with_tools(
+            &config,
+            Some("test-key"),
+            ToolProfile::Interactive,
+            &[json!({
+                "name": "mcp__fixture__echo",
+                "description": "echo",
+                "parameters": {"type": "object"}
+            })],
+        )
+        .unwrap();
+        assert_ne!(base, extended);
+        assert!(extended.contains(":tools:"));
     }
 }

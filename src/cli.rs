@@ -20,7 +20,8 @@ use crate::instructions;
 use crate::interaction::{
     PlanState, UserInputClient, UserInputEnvelope, UserInputResponse, resolve_answers,
 };
-use crate::model::{ToolProfile, create_model, create_model_with_profile};
+use crate::mcp::McpManager;
+use crate::model::{ToolProfile, create_model, create_model_with_tools};
 use crate::session::ChatSession;
 use crate::setup::{SetupOptions, run as run_setup};
 use crate::ui::TerminalUi;
@@ -383,6 +384,34 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let mut plan = PlanState::restore(conversation.messages());
     view.welcome(&config, &workspace, session.summary(), &instruction_set)?;
     view.sync_plan(&plan.current());
+    if !config.mcp.servers.is_empty() {
+        view.notice(format!(
+            "Connecting {} configured MCP server{}…",
+            config.mcp.servers.len(),
+            if config.mcp.servers.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ))?;
+    }
+    let mcp = McpManager::connect_with_secret_env(
+        &config.mcp,
+        &workspace,
+        Some(&config.model.api_key_env),
+    )
+    .await;
+    for report in mcp
+        .reports()
+        .into_iter()
+        .filter(|report| report.error.is_some())
+    {
+        view.warning(format!(
+            "MCP server {:?} could not connect: {}",
+            report.name,
+            report.error.as_deref().unwrap_or("unknown error")
+        ))?;
+    }
     let mut inputs = shell.into_input_stream();
 
     loop {
@@ -433,6 +462,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
             ChatInput::Command(ChatCommand::Help) => view.show_help()?,
             ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
+            ChatInput::Command(ChatCommand::Mcp) => view.show_mcp(&mcp.reports())?,
             ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
             ChatInput::Command(ChatCommand::Fork(selector)) => {
                 let source_id = session.summary().id.clone();
@@ -554,18 +584,20 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         }
                     };
                     let cache = ResponseCache::new(config.cache.clone())?;
-                    let model = create_model_with_profile(
+                    let model = create_model_with_tools(
                         &config.model,
                         api_key,
                         cache,
                         ToolProfile::Interactive,
+                        mcp.definitions(),
                     )?;
-                    agent = Some(Agent::new_with_profile(
+                    agent = Some(Agent::new_with_mcp(
                         config.clone(),
                         model,
                         Box::new(TerminalUi::chat(view.output())),
                         workspace.clone(),
                         ToolProfile::Interactive,
+                        mcp.clone(),
                     ));
                 }
 
@@ -585,6 +617,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &plan,
                         &user_input,
                         &mut user_input_requests,
+                        &mcp,
                         &mut inputs,
                         &view,
                     )
@@ -611,6 +644,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
         }
     }
+    mcp.shutdown().await;
     Ok(())
 }
 
@@ -634,6 +668,7 @@ async fn run_active_chat_task(
     plan: &PlanState,
     user_input: &UserInputClient,
     user_input_requests: &mut tokio::sync::mpsc::UnboundedReceiver<UserInputEnvelope>,
+    mcp: &McpManager,
     inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
     view: &ChatView,
 ) -> Result<ActiveChatResult> {
@@ -792,6 +827,10 @@ async fn run_active_chat_task(
                             view.show_plan(&plan.current())?;
                             continue;
                         }
+                        ChatInput::Command(ChatCommand::Mcp) => {
+                            view.show_mcp(&mcp.reports())?;
+                            continue;
+                        }
                         _ => {
                             view.warning(
                                 "Answer the pending question, or use /cancel to stop the task.",
@@ -852,6 +891,9 @@ async fn run_active_chat_task(
                     }
                     ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
                     ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
+                    ChatInput::Command(ChatCommand::Mcp) => {
+                        view.show_mcp(&mcp.reports())?;
+                    }
                     ChatInput::Command(ChatCommand::Rules) => view.show_rules(instruction_set)?,
                     ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
                     ChatInput::Command(ChatCommand::Checkpoints) => {

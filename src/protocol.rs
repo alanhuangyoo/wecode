@@ -101,6 +101,12 @@ pub enum Action {
     RequestUserInput {
         questions: Vec<UserQuestion>,
     },
+    McpCall {
+        server: String,
+        tool: String,
+        #[serde(default)]
+        arguments: serde_json::Value,
+    },
     Finish {
         summary: String,
     },
@@ -117,6 +123,7 @@ impl Action {
             Self::Patch { .. } => "patch",
             Self::UpdatePlan { .. } => "update_plan",
             Self::RequestUserInput { .. } => "request_user_input",
+            Self::McpCall { .. } => "mcp_call",
             Self::Finish { .. } => "finish",
         }
     }
@@ -156,6 +163,7 @@ impl Action {
                     "questions for user"
                 }
             }
+            Self::McpCall { tool, .. } => tool,
             Self::Finish { summary } => summary,
         }
     }
@@ -189,11 +197,36 @@ pub(crate) fn validate_action(action: &Action) -> Result<()> {
         Action::Patch { patch, .. } if patch.trim().is_empty() => bail!("patch cannot be empty"),
         Action::UpdatePlan { plan, .. } => validate_plan(plan),
         Action::RequestUserInput { questions } => validate_questions(questions),
+        Action::McpCall {
+            server,
+            tool,
+            arguments,
+        } => {
+            validate_mcp_component(server, "server")?;
+            validate_mcp_component(tool, "tool")?;
+            if !arguments.is_object() {
+                bail!("mcp arguments must be a JSON object");
+            }
+            Ok(())
+        }
         Action::Finish { summary } if summary.trim().is_empty() => {
             bail!("finish summary cannot be empty")
         }
         _ => Ok(()),
     }
+}
+
+fn validate_mcp_component(value: &str, kind: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || value.contains("__")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        bail!("mcp {kind} name is invalid");
+    }
+    Ok(())
 }
 
 fn validate_plan(plan: &[PlanItem]) -> Result<()> {

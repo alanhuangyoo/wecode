@@ -18,6 +18,7 @@ pub struct OpenAiModel {
     api_key: Option<String>,
     client: reqwest::Client,
     tool_profile: ToolProfile,
+    extra_tools: Vec<Value>,
 }
 
 impl OpenAiModel {
@@ -26,12 +27,14 @@ impl OpenAiModel {
         api_key: Option<String>,
         client: reqwest::Client,
         tool_profile: ToolProfile,
+        extra_tools: Vec<Value>,
     ) -> Self {
         Self {
             config,
             api_key,
             client,
             tool_profile,
+            extra_tools,
         }
     }
 
@@ -77,7 +80,7 @@ impl OpenAiModel {
         }
         if self.config.native_tools {
             body["tools"] = Value::Array(
-                tool_definitions(self.tool_profile)
+                tool_definitions(self.tool_profile, &self.extra_tools)
                     .into_iter()
                     .map(|definition| json!({"type": "function", "function": definition}))
                     .collect(),
@@ -120,7 +123,7 @@ impl OpenAiModel {
         }
         if self.config.native_tools {
             body["tools"] = Value::Array(
-                tool_definitions(self.tool_profile)
+                tool_definitions(self.tool_profile, &self.extra_tools)
                     .into_iter()
                     .map(|mut definition| {
                         definition["type"] = json!("function");
