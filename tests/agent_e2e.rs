@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -10,6 +11,7 @@ use wecode::cache::ResponseCache;
 use wecode::config::{CacheConfig, Config};
 use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
+use wecode::input_queue::InputQueue;
 use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, Usage};
 use wecode::protocol::Action;
 
@@ -111,6 +113,41 @@ impl EventSink for NullSink {
 
 struct BlockingModel {
     started: Arc<Notify>,
+}
+
+struct SteeringGateModel {
+    calls: AtomicUsize,
+    requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for SteeringGateModel {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
+        self.requests.lock().unwrap().push(request);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Ok(ModelResponse {
+            text: String::new(),
+            action: Some(Action::Finish {
+                summary: if call == 0 {
+                    "premature finish".into()
+                } else {
+                    "steering applied".into()
+                },
+            }),
+            usage: Usage::default(),
+            cache_hit: false,
+        })
+    }
 }
 
 #[async_trait]
@@ -397,6 +434,73 @@ async fn cancellation_stops_a_model_call_and_preserves_the_user_task() {
             ..
         } if reason == "cancelled"
     )));
+}
+
+#[tokio::test]
+async fn steering_arriving_during_sampling_reopens_the_active_run() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let sink = CapturingSink::default();
+    let events = sink.events.clone();
+    let queue = InputQueue::new();
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(SteeringGateModel {
+            calls: AtomicUsize::new(0),
+            requests: requests.clone(),
+            started: started.clone(),
+            release: release.clone(),
+        }),
+        Box::new(sink),
+        temp.path().canonicalize().unwrap(),
+    );
+    let enqueue = tokio::spawn({
+        let queue = queue.clone();
+        async move {
+            started.notified().await;
+            queue.steer("also explain the result");
+            release.notify_one();
+        }
+    });
+    let mut conversation = Conversation::default();
+
+    let result = agent
+        .run_in_conversation(
+            "inspect the repository",
+            RunOptions {
+                input_queue: Some(queue),
+                ..Default::default()
+            },
+            &mut conversation,
+        )
+        .await
+        .unwrap();
+    enqueue.await.unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.steps, 2);
+    assert_eq!(result.summary, "steering applied");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("also explain the result"))
+    );
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, Event::SteeringDelivered { step: 1, count: 1 }))
+    );
 }
 
 fn init_fixture(directory: &std::path::Path) {

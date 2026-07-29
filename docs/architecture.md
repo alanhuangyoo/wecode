@@ -15,6 +15,9 @@ Executor -> isolated process      exact-response cache
 Git patch + JSONL trajectory
 
 Interactive shell -> append-only session log -> resume / follow-up context
+        |
+        v
+Composer -> steer queue (next model boundary) / follow-up queue (next turn)
 ```
 
 ## Runtime boundaries
@@ -29,6 +32,10 @@ Interactive shell -> append-only session log -> resume / follow-up context
 - Project instructions are ordered, content-deduplicated, and bounded before entering context.
 - Interactive conversations use an append-only JSONL session log and a stable provider cache key.
 - Interactive model calls can stream normalized text/reasoning deltas into the terminal renderer.
+- A dedicated input thread keeps line editing and history responsive while the Tokio agent loop
+  runs. Rustyline's external-printer path redraws the composer around asynchronous agent events.
+- Steering and follow-up queues are ordered and independent. Queue modes can deliver one message at
+  a time or coalesce all currently pending messages while preserving their order.
 - Each active run owns a cancellation token. Cancelling drops in-flight HTTP or shell futures;
   patch application remains an atomic boundary and already-applied changes are preserved.
 - Runtime trajectories and caches are stored outside the target repository unless explicitly
@@ -45,7 +52,19 @@ actions:
 
 Every turn emits typed events. Human mode opts into model deltas and renders compact live progress
 in the terminal. JSONL and benchmark sinks do not request deltas, so they retain the buffered
-provider path and stable machine-readable event stream.
+provider path and stable machine-readable event stream. Benchmark runs also omit the input queue,
+so interactive steering cannot change evaluation prompts or tool trajectories.
+
+## Live input boundaries
+
+The composer accepts input continuously:
+
+1. A steering message is queued during sampling or tool execution.
+2. The agent finishes the current atomic operation and injects ordered steering input before its
+   next model request.
+3. A pending steer prevents a just-produced `finish` action from ending the run prematurely.
+4. Follow-up input stays separate and starts a new turn only after the active run finishes.
+5. Cancellation preserves both applied workspace changes and undelivered queued input.
 
 ## Provider layer
 

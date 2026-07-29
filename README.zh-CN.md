@@ -20,7 +20,7 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
 - **工具调用可靠**：原生提供 `shell`、`apply_patch`、`finish`，不支持工具调用的网关可用
   JSON 文本动作协议兜底。
 - **专门设计的终端交互**：支持对话历史、多轮上下文、工具与输出卡片、模型实时流式状态、
-  可取消任务和斜杠命令，同时避免笨重的全屏 TUI。
+  运行中修正方向、后续任务队列、可取消任务和斜杠命令，同时避免笨重的全屏 TUI。
 - **持久化会话**：对话自动保存为可读的 JSONL，可列出和恢复；多轮对话使用稳定的服务端
   缓存标识，避免每轮破坏 Prompt Cache。
 - **理解仓库规范**：从仓库根目录到当前工作区分层加载受限大小的 `AGENTS.md`、
@@ -107,6 +107,11 @@ printf '%s' "定位并修复解析器错误。" | \
 /resume [id] 恢复最近或指定会话
 /sessions    列出当前工作区的最近会话
 /rename      设置当前会话标题
+/steer       在下一个模型边界修正当前任务
+/followup    将任务排到当前任务结束之后
+/queue       查看待处理的 steer 和 follow-up
+/clear-queue 清空待处理消息
+/cancel      取消当前模型请求或命令
 /status      查看模型、工作区、缓存和上下文
 /rules       查看已加载的项目规则
 /config      查看当前配置文件
@@ -118,7 +123,10 @@ printf '%s' "定位并修复解析器错误。" | \
 会话自动保存在 `~/.wecode/sessions/chat/`。也可以在终端使用 `wecode resume [会话ID]`
 恢复会话，或用 `wecode sessions` 查看最近会话。输入历史保存在 `~/.wecode/history`。
 任务运行中按一次 `Ctrl-C` 会取消当前模型请求或 Shell 命令并返回输入框；已经应用的修改
-会保留。交互渲染和模型流式事件与 `wecode run --output jsonl`、`wecode bench`
+会保留。Agent 工作时输入框仍然可编辑：普通 `Enter` 会 steer 当前任务，`Alt-Enter` 会把
+消息放入 follow-up 队列；不支持组合键的终端可使用 `/steer` 和 `/followup`。Steer 只在
+安全的模型边界注入，不会在 Patch 应用到一半时中断。交互渲染和模型流式事件与
+`wecode run --output jsonl`、`wecode bench`
 完全分离，因此 Benchmark 的事件输出和 Agent 执行不依赖终端 UI 或流式增量事件。
 
 ## 项目规则
@@ -176,6 +184,8 @@ context_max_tokens = 90000
 context_keep_messages = 12
 verify_retries = 2
 deny_dangerous_commands = true
+steering_mode = "one-at-a-time"
+follow_up_mode = "one-at-a-time"
 trajectory_directory = "/path/to/wecode/sessions"
 
 [cache]
@@ -266,7 +276,8 @@ printf '%s' "$SWE_TASK" | wecode run \
 ```
 
 JSONL 和 Benchmark 输出会有意使用完整模型响应，并且不输出 UI 流式增量事件，即使配置中
-`streaming = true`，也能保持轨迹稳定且便于机器解析。
+`streaming = true`；Benchmark 运行也不会创建交互输入队列，因此 Prompt、轨迹和执行结果
+保持稳定且便于机器解析。
 
 WeCode 不会重置或清理工作树。仓库检出、任务隔离和评分应由 Benchmark Harness 负责。
 更完整的建议见 [docs/benchmarking.md](docs/benchmarking.md)。

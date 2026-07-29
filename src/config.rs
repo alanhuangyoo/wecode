@@ -52,6 +52,20 @@ pub enum PromptCacheMode {
     Long,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueueMode {
+    All,
+    #[default]
+    OneAtATime,
+}
+
+impl QueueMode {
+    pub fn take_all(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ModelConfig {
@@ -89,6 +103,8 @@ pub struct AgentConfig {
     pub context_keep_messages: usize,
     pub verify_retries: usize,
     pub deny_dangerous_commands: bool,
+    pub steering_mode: QueueMode,
+    pub follow_up_mode: QueueMode,
     pub trajectory_directory: PathBuf,
 }
 
@@ -104,6 +120,8 @@ impl Default for AgentConfig {
             context_keep_messages: 12,
             verify_retries: 2,
             deny_dangerous_commands: true,
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
             trajectory_directory: default_state_dir(),
         }
     }

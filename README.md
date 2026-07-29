@@ -22,8 +22,8 @@ runtime.
 - **Reliable tools** — native `shell`, `apply_patch`, and `finish` function calls, plus a JSON
   text-action fallback for gateways without tool-call support.
 - **Purpose-built terminal UX** — conversation history, persistent follow-up context, structured
-  tool/output panels, live provider streaming, cancellable runs, and slash commands without a
-  full-screen TUI.
+  tool/output panels, live provider streaming, mid-run steering, queued follow-ups, cancellable
+  runs, and slash commands without a full-screen TUI.
 - **Durable sessions** — conversations auto-save as inspectable JSONL, can be listed or resumed,
   and retain one stable provider cache identity across follow-up turns.
 - **Repository-aware** — bounded global and hierarchical `AGENTS.md`, `CLAUDE.md`, and rules
@@ -114,6 +114,11 @@ the final response into compact terminal panels.
 /resume [id] Resume the latest or selected session
 /sessions    List recent sessions for this workspace
 /rename      Give the current session a title
+/steer       Steer the active task at the next model boundary
+/followup    Queue work for after the active task
+/queue       Show pending steer and follow-up messages
+/clear-queue Clear all pending messages
+/cancel      Cancel the active request or command
 /status      Show model, workspace, cache, and context
 /rules       Show loaded project instruction files
 /config      Show the active config path
@@ -126,6 +131,10 @@ Sessions auto-save under `~/.wecode/sessions/chat/`. Resume outside the interact
 `wecode resume [session-id]`, or inspect recent sessions with `wecode sessions`. Input history is
 stored at `~/.wecode/history`. During a running turn, press `Ctrl-C` once to cancel the active
 model request or shell command and return to the prompt; edits already applied are preserved.
+The composer remains editable while the agent works: regular `Enter` steers the active task,
+`Alt-Enter` queues a follow-up, and the explicit `/steer` and `/followup` commands provide the same
+behavior in terminals that do not transmit modified Enter keys. Steering is delivered only at a
+safe model boundary; patch application is never interrupted halfway through.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
 depend on terminal rendering or delta events.
@@ -187,6 +196,8 @@ context_max_tokens = 90000
 context_keep_messages = 12
 verify_retries = 2
 deny_dangerous_commands = true
+steering_mode = "one-at-a-time"
+follow_up_mode = "one-at-a-time"
 trajectory_directory = "/path/to/wecode/sessions"
 
 [cache]
@@ -281,7 +292,8 @@ printf '%s' "$SWE_TASK" | wecode run \
 ```
 
 JSONL and benchmark sinks intentionally use buffered model responses and emit no UI delta events,
-even when `streaming = true`. This keeps benchmark trajectories stable and machine-readable.
+even when `streaming = true`. Benchmark runs do not create an interactive input queue. This keeps
+their prompts, trajectories, and execution deterministic and machine-readable.
 
 WeCode never resets or cleans a worktree. The benchmark harness is responsible for repository
 checkout, task isolation, and grading. See [docs/benchmarking.md](docs/benchmarking.md) for a

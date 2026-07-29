@@ -12,6 +12,7 @@ use crate::control::CancellationToken;
 use crate::events::{Event, EventSink, JsonlSink};
 use crate::executor::{ExecutionResult, Executor};
 use crate::git::{collect_patch, head_id};
+use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
 use crate::model::{CompletionRequest, Model, ModelStream, ModelStreamEvent, Usage, action_text};
 use crate::protocol::{Action, parse_action};
@@ -26,6 +27,7 @@ pub struct RunOptions {
     pub task_id: Option<String>,
     pub session_id: Option<String>,
     pub cancellation: Option<CancellationToken>,
+    pub input_queue: Option<InputQueue>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -159,6 +161,7 @@ impl Agent {
         let mut success = false;
         let mut steps = 0;
         let cancellation = options.cancellation.clone();
+        let input_queue = options.input_queue.clone();
 
         for step in 1..=self.config.agent.max_steps {
             if cancellation
@@ -175,6 +178,7 @@ impl Agent {
                 break;
             }
             steps = step;
+            self.deliver_steering(step, &input_queue, &recorder, &mut messages)?;
             let removed = context.compact(&mut messages);
             if removed > 0 {
                 self.emit(
@@ -316,6 +320,9 @@ impl Agent {
                 Action::Finish {
                     summary: proposed_summary,
                 } => {
+                    if self.deliver_steering(step, &input_queue, &recorder, &mut messages)? > 0 {
+                        continue;
+                    }
                     if let Some(verify) = &options.verify {
                         let verification = executor.shell(verify);
                         let result = if let Some(cancellation) = &cancellation {
@@ -458,6 +465,26 @@ impl Agent {
         Ok(())
     }
 
+    fn deliver_steering(
+        &self,
+        step: usize,
+        input_queue: &Option<InputQueue>,
+        recorder: &JsonlSink,
+        messages: &mut Vec<Message>,
+    ) -> Result<usize> {
+        let Some(input_queue) = input_queue else {
+            return Ok(0);
+        };
+        let inputs = input_queue.take_steering(self.config.agent.steering_mode.take_all());
+        if inputs.is_empty() {
+            return Ok(0);
+        }
+        let count = inputs.len();
+        messages.push(Message::user(steering_prompt(&inputs)));
+        self.emit(recorder, Event::SteeringDelivered { step, count })?;
+        Ok(count)
+    }
+
     async fn session_id(&self, task: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.workspace.to_string_lossy().as_bytes());
@@ -537,6 +564,17 @@ fn follow_up_prompt(task: &str, verify: Option<&str>) -> String {
         prompt.push_str("\nThe controller will require this final verification command to pass:\n");
         prompt.push_str(verify);
         prompt.push('\n');
+    }
+    prompt
+}
+
+fn steering_prompt(inputs: &[QueuedInput]) -> String {
+    let mut prompt = String::from(
+        "The user sent this steering update while the current task was running. Apply it to the current work:\n",
+    );
+    for input in inputs {
+        prompt.push_str("\n- ");
+        prompt.push_str(input.text.trim());
     }
     prompt
 }

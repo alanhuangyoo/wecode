@@ -53,6 +53,10 @@ pub enum Event {
     ContextCompacted {
         removed_messages: usize,
     },
+    SteeringDelivered {
+        step: usize,
+        count: usize,
+    },
     RunCancelled {
         step: usize,
     },

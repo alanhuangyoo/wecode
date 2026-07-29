@@ -9,6 +9,7 @@ pub mod control;
 pub mod events;
 pub mod executor;
 pub mod git;
+pub mod input_queue;
 pub mod instructions;
 pub mod model;
 pub mod patch;

@@ -69,7 +69,7 @@ pub async fn run_manifest(options: BenchOptions) -> Result<()> {
         }
         let cache = ResponseCache::new(config.cache.clone())?;
         let model = create_model(&config.model, config.api_key()?, cache)?;
-        let mut agent = Agent::new(config, model, Box::new(TerminalUi::new()), workspace);
+        let mut agent = Agent::new(config, model, Box::new(TerminalUi::benchmark()), workspace);
         let record = match agent
             .run(
                 &task.task,

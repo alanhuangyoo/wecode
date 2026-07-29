@@ -1,9 +1,10 @@
-use std::io::{self, IsTerminal};
-use std::sync::Mutex;
+use std::io::{self, IsTerminal, Write};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use console::{Style, Term, strip_ansi_codes};
 use indicatif::{ProgressBar, ProgressStyle};
+use rustyline::ExternalPrinter;
 
 use crate::events::{Event, EventSink};
 
@@ -14,28 +15,94 @@ pub enum UiMode {
     Chat,
 }
 
+#[derive(Clone)]
+pub struct TerminalOutput {
+    inner: Arc<TerminalOutputInner>,
+}
+
+enum TerminalOutputInner {
+    Stdout,
+    Stderr,
+    External(Mutex<Box<dyn ExternalPrinter + Send>>),
+}
+
+impl TerminalOutput {
+    pub fn stdout() -> Self {
+        Self {
+            inner: Arc::new(TerminalOutputInner::Stdout),
+        }
+    }
+
+    pub fn stderr() -> Self {
+        Self {
+            inner: Arc::new(TerminalOutputInner::Stderr),
+        }
+    }
+
+    pub fn external(printer: Box<dyn ExternalPrinter + Send>) -> Self {
+        Self {
+            inner: Arc::new(TerminalOutputInner::External(Mutex::new(printer))),
+        }
+    }
+
+    pub fn print(&self, message: impl Into<String>) -> Result<()> {
+        let message = message.into();
+        match self.inner.as_ref() {
+            TerminalOutputInner::Stdout => {
+                let mut output = io::stdout().lock();
+                output.write_all(message.as_bytes())?;
+                output.flush()?;
+            }
+            TerminalOutputInner::Stderr => {
+                let mut output = io::stderr().lock();
+                output.write_all(message.as_bytes())?;
+                output.flush()?;
+            }
+            TerminalOutputInner::External(printer) => {
+                printer
+                    .lock()
+                    .expect("terminal output lock poisoned")
+                    .print(message)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_external(&self) -> bool {
+        matches!(self.inner.as_ref(), TerminalOutputInner::External(_))
+    }
+}
+
 pub struct TerminalUi {
     spinner: Mutex<Option<ProgressBar>>,
     stream_preview: Mutex<String>,
     interactive: bool,
+    allow_deltas: bool,
     mode: UiMode,
+    output: TerminalOutput,
 }
 
 impl TerminalUi {
     pub fn new() -> Self {
-        Self::with_mode(UiMode::Run)
+        Self::with_mode(UiMode::Run, TerminalOutput::stderr(), true)
     }
 
-    pub fn chat() -> Self {
-        Self::with_mode(UiMode::Chat)
+    pub fn benchmark() -> Self {
+        Self::with_mode(UiMode::Run, TerminalOutput::stderr(), false)
     }
 
-    fn with_mode(mode: UiMode) -> Self {
+    pub fn chat(output: TerminalOutput) -> Self {
+        Self::with_mode(UiMode::Chat, output, true)
+    }
+
+    fn with_mode(mode: UiMode, output: TerminalOutput, allow_deltas: bool) -> Self {
         Self {
             spinner: Mutex::new(None),
             stream_preview: Mutex::new(String::new()),
             interactive: io::stderr().is_terminal(),
+            allow_deltas,
             mode,
+            output,
         }
     }
 
@@ -45,13 +112,15 @@ impl TerminalUi {
         }
     }
 
-    fn start_spinner(&self, step: usize) {
+    fn start_spinner(&self, step: usize) -> Result<()> {
         self.stop_spinner();
         self.stream_preview
             .lock()
             .expect("stream preview lock poisoned")
             .clear();
-        if self.interactive {
+        if self.output.is_external() {
+            self.output.print(format!("  ⠋ Thinking · step {step}\n"))?;
+        } else if self.interactive {
             let spinner = ProgressBar::new_spinner();
             spinner.set_style(
                 ProgressStyle::with_template("  {spinner:.cyan} {msg}")
@@ -62,12 +131,13 @@ impl TerminalUi {
             spinner.enable_steady_tick(std::time::Duration::from_millis(90));
             *self.spinner.lock().expect("spinner lock poisoned") = Some(spinner);
         } else {
-            eprintln!("  Thinking · step {step}");
+            self.output.print(format!("  Thinking · step {step}\n"))?;
         }
+        Ok(())
     }
 
     fn show_delta(&self, text: &str, reasoning: bool) {
-        if !self.interactive || text.is_empty() {
+        if !self.interactive || self.output.is_external() || text.is_empty() {
             return;
         }
         let mut preview = self
@@ -109,15 +179,15 @@ impl EventSink for TerminalUi {
                 ..
             } => {
                 if self.mode == UiMode::Run {
-                    print_panel(
+                    self.output.print(render_panel(
                         "WeCode",
                         &format!("{provider} / {model}\n{workspace}"),
                         PanelTone::Cyan,
                         4,
-                    );
+                    ))?;
                 }
             }
-            Event::ModelStarted { step } => self.start_spinner(*step),
+            Event::ModelStarted { step } => self.start_spinner(*step)?,
             Event::ModelDelta {
                 text, reasoning, ..
             } => self.show_delta(text, *reasoning),
@@ -134,13 +204,13 @@ impl EventSink for TerminalUi {
                 } else {
                     ""
                 };
-                eprintln!(
-                    "  {} step {step} · {} in · {} out · {} cached{cache}",
+                self.output.print(format!(
+                    "  {} step {step} · {} in · {} out · {} cached{cache}\n",
                     Style::new().green().apply_to("✓"),
                     compact_number(usage.input_tokens),
                     compact_number(usage.output_tokens),
                     compact_number(usage.cache_read_tokens),
-                );
+                ))?;
             }
             Event::Action {
                 kind,
@@ -149,22 +219,23 @@ impl EventSink for TerminalUi {
                 ..
             } => {
                 self.stop_spinner();
-                match kind.as_str() {
-                    "shell" => print_panel(
+                let panel = match kind.as_str() {
+                    "shell" => render_panel(
                         &format!("Shell · {description}"),
                         detail,
                         PanelTone::Cyan,
                         8,
                     ),
-                    "patch" => print_panel(
+                    "patch" => render_panel(
                         &format!("Edit · {description}"),
                         detail,
                         PanelTone::Yellow,
                         8,
                     ),
-                    "finish" => print_panel("WeCode", detail, PanelTone::Green, 20),
-                    _ => print_panel(kind, detail, PanelTone::Cyan, 8),
-                }
+                    "finish" => render_panel("WeCode", detail, PanelTone::Green, 20),
+                    _ => render_panel(kind, detail, PanelTone::Cyan, 8),
+                };
+                self.output.print(panel)?;
             }
             Event::ToolCompleted {
                 exit_code,
@@ -185,26 +256,34 @@ impl EventSink for TerminalUi {
                 } else {
                     String::new()
                 };
-                eprintln!(
-                    "  ↳ {status} · {:.1}s{truncated}",
+                self.output.print(format!(
+                    "  ↳ {status} · {:.1}s{truncated}\n",
                     *duration_ms as f64 / 1000.0
-                );
+                ))?;
             }
             Event::ToolOutput { output, .. } => {
-                print_panel("Output", output, PanelTone::Dim, 14);
+                self.output
+                    .print(render_panel("Output", output, PanelTone::Dim, 14))?;
             }
             Event::ContextCompacted { removed_messages } => {
-                eprintln!(
-                    "  {} compacted {removed_messages} older messages",
+                self.output.print(format!(
+                    "  {} compacted {removed_messages} older messages\n",
                     Style::new().yellow().apply_to("↻")
-                );
+                ))?;
+            }
+            Event::SteeringDelivered { count, .. } => {
+                self.output.print(format!(
+                    "  {} applied {count} steering message{}\n",
+                    Style::new().cyan().apply_to("↪"),
+                    if *count == 1 { "" } else { "s" }
+                ))?;
             }
             Event::RunCancelled { .. } => {
                 self.stop_spinner();
-                eprintln!(
-                    "  {} cancelled · workspace changes made before cancellation were preserved",
+                self.output.print(format!(
+                    "  {} cancelled · workspace changes made before cancellation were preserved\n",
                     Style::new().yellow().bold().apply_to("■")
-                );
+                ))?;
             }
             Event::Verification { passed, .. } => {
                 let text = if *passed {
@@ -215,7 +294,7 @@ impl EventSink for TerminalUi {
                 } else {
                     Style::new().red().bold().apply_to("✗ verification failed")
                 };
-                eprintln!("  {text}");
+                self.output.print(format!("  {text}\n"))?;
             }
             Event::RunCompleted {
                 success,
@@ -231,15 +310,16 @@ impl EventSink for TerminalUi {
                 } else {
                     Style::new().red().bold().apply_to("■ Stopped")
                 };
-                eprintln!(
-                    "  {marker} · {steps} steps · {:.1}s · {} patch · {cache_hits} cache hits\n",
+                self.output.print(format!(
+                    "  {marker} · {steps} steps · {:.1}s · {} patch · {cache_hits} cache hits\n\n",
                     *duration_ms as f64 / 1000.0,
                     human_bytes(*patch_bytes as u64),
-                );
+                ))?;
             }
             Event::Error { message } => {
                 self.stop_spinner();
-                print_panel("Error", message, PanelTone::Red, 12);
+                self.output
+                    .print(render_panel("Error", message, PanelTone::Red, 12))?;
             }
             Event::AssistantMessage { .. } => {}
         }
@@ -247,7 +327,7 @@ impl EventSink for TerminalUi {
     }
 
     fn wants_model_deltas(&self) -> bool {
-        self.interactive
+        self.allow_deltas && self.interactive
     }
 }
 
@@ -260,7 +340,7 @@ enum PanelTone {
     Dim,
 }
 
-fn print_panel(title: &str, content: &str, tone: PanelTone, max_lines: usize) {
+fn render_panel(title: &str, content: &str, tone: PanelTone, max_lines: usize) -> String {
     let width = panel_width();
     let inner = width.saturating_sub(4).max(20);
     let title_style = match tone {
@@ -277,26 +357,27 @@ fn print_panel(title: &str, content: &str, tone: PanelTone, max_lines: usize) {
     };
     let clean_title = truncate_chars(title, inner.saturating_sub(4));
     let rule = "─".repeat(width.saturating_sub(clean_title.chars().count() + 5));
-    eprintln!(
-        "{} {} {}",
+    let mut output = format!(
+        "{} {} {}\n",
         title_style.apply_to("╭─"),
         title_style.apply_to(clean_title),
         title_style.apply_to(rule),
     );
     for line in visible_lines(content, inner, max_lines) {
         let padding = " ".repeat(inner.saturating_sub(line.chars().count()));
-        eprintln!(
-            "{} {}{} {}",
+        output.push_str(&format!(
+            "{} {}{} {}\n",
             title_style.apply_to("│"),
             line_style.apply_to(line),
             padding,
             title_style.apply_to("│"),
-        );
+        ));
     }
-    eprintln!(
-        "{}",
+    output.push_str(&format!(
+        "{}\n",
         title_style.apply_to(format!("╰{}╯", "─".repeat(width.saturating_sub(2))))
-    );
+    ));
+    output
 }
 
 fn panel_width() -> usize {
@@ -379,5 +460,10 @@ mod tests {
         assert_eq!(compact_number(999), "999");
         assert_eq!(compact_number(1_500), "1.5k");
         assert_eq!(human_bytes(2_048), "2.0 KiB");
+    }
+
+    #[test]
+    fn benchmark_renderer_never_requests_model_deltas() {
+        assert!(!TerminalUi::benchmark().wants_model_deltas());
     }
 }

@@ -7,12 +7,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::agent::{Agent, Conversation, RunOptions};
 use crate::bench::{BenchOptions, run_manifest};
 use crate::cache::ResponseCache;
-use crate::chat::{ChatCommand, ChatInput, ChatShell};
+use crate::chat::{ChatCommand, ChatInput, ChatShell, ChatView};
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, provider_preset,
 };
 use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
+use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
 use crate::model::create_model;
 use crate::session::ChatSession;
@@ -296,6 +297,7 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 task_id: None,
                 session_id: None,
                 cancellation: Some(cancellation),
+                input_queue: None,
             },
         )
         .await;
@@ -316,7 +318,8 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let (config, workspace) = resolve_config(&common)?;
     let instruction_set = instructions::discover(&workspace)?;
     let state_directory = config.agent.trajectory_directory.clone();
-    let mut shell = ChatShell::new()?;
+    let shell = ChatShell::new()?;
+    let view = shell.view();
     let (mut session, mut conversation) = match start {
         ChatStart::New => (
             ChatSession::create(
@@ -332,12 +335,20 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         }
     };
     let mut agent: Option<Agent> = None;
-    shell.welcome(&config, &workspace, session.summary(), &instruction_set);
+    let input_queue = InputQueue::new();
+    view.welcome(&config, &workspace, session.summary(), &instruction_set)?;
+    let mut inputs = shell.into_input_stream();
 
     loop {
-        match shell.read_input()? {
+        let Some(input) = inputs.recv().await else {
+            break;
+        };
+        match input? {
             ChatInput::Exit => break,
             ChatInput::Interrupted => continue,
+            ChatInput::FollowUp(task) | ChatInput::Task(task) if task.trim().is_empty() => {
+                view.warning("Message cannot be empty.")?;
+            }
             ChatInput::Command(ChatCommand::New) => {
                 session = ChatSession::create(
                     &state_directory,
@@ -346,18 +357,29 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     &config.model.model,
                 )?;
                 conversation = Conversation::default();
-                shell.clear_screen(&config, &workspace, session.summary(), &instruction_set)?;
-                println!("  Started a new session.\n");
+                input_queue.clear();
+                view.clear_screen(&config, &workspace, session.summary(), &instruction_set)?;
+                view.notice("Started a new session.")?;
             }
-            ChatInput::Command(ChatCommand::Config) => shell.show_config_path(),
-            ChatInput::Command(ChatCommand::Help) => shell.show_help(),
-            ChatInput::Command(ChatCommand::History) => shell.show_history_path(),
+            ChatInput::Command(ChatCommand::Cancel) => {
+                view.notice("No task is running.")?;
+            }
+            ChatInput::Command(ChatCommand::ClearQueue) => {
+                let cleared = input_queue.clear();
+                view.notice(format!("Cleared {} queued messages.", cleared.len()))?;
+            }
+            ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
+            ChatInput::Command(ChatCommand::Help) => view.show_help()?,
+            ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
+            ChatInput::Command(ChatCommand::Queue) => {
+                view.show_queue(&input_queue.snapshot())?;
+            }
             ChatInput::Command(ChatCommand::Rename(title)) => {
                 if title.is_empty() {
-                    eprintln!("  Usage: /rename <title>");
+                    view.warning("Usage: /rename <title>")?;
                 } else {
                     session.rename(&title)?;
-                    println!("  Session renamed to {title:?}.\n");
+                    view.notice(format!("Session renamed to {title:?}."))?;
                 }
             }
             ChatInput::Command(ChatCommand::Resume(selector)) => {
@@ -367,42 +389,47 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     Ok((next_session, next_conversation)) => {
                         session = next_session;
                         conversation = next_conversation;
-                        shell.clear_screen(
+                        input_queue.clear();
+                        view.clear_screen(
                             &config,
                             &workspace,
                             session.summary(),
                             &instruction_set,
                         )?;
-                        println!(
-                            "  Resumed session {} with {} messages.\n",
+                        view.notice(format!(
+                            "Resumed session {} with {} messages.",
                             session.summary().id,
                             conversation.message_count()
-                        );
+                        ))?;
                     }
-                    Err(error) => eprintln!("  {error}\n"),
+                    Err(error) => view.warning(error.to_string())?,
                 }
             }
-            ChatInput::Command(ChatCommand::Rules) => shell.show_rules(&instruction_set),
+            ChatInput::Command(ChatCommand::Rules) => view.show_rules(&instruction_set)?,
             ChatInput::Command(ChatCommand::Sessions) => {
                 let sessions = ChatSession::list(&state_directory, &workspace)?;
-                shell.show_sessions(&sessions);
+                view.show_sessions(&sessions)?;
             }
             ChatInput::Command(ChatCommand::Status) => {
-                shell.show_status(
+                view.show_status(
                     &config,
                     &workspace,
                     session.summary(),
                     &instruction_set,
                     conversation.message_count(),
-                );
+                    &input_queue.snapshot(),
+                )?;
             }
-            ChatInput::Task(task) => {
+            ChatInput::Command(ChatCommand::Unknown(command)) => {
+                view.warning(format!("Unknown command {command:?}. Type /help."))?;
+            }
+            ChatInput::FollowUp(task) | ChatInput::Task(task) => {
                 session.set_initial_title(&task)?;
                 if agent.is_none() {
                     let api_key = match config.api_key() {
                         Ok(api_key) => api_key,
                         Err(error) => {
-                            shell.show_setup_required(&error);
+                            view.show_setup_required(&error)?;
                             continue;
                         }
                     };
@@ -411,34 +438,175 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     agent = Some(Agent::new(
                         config.clone(),
                         model,
-                        Box::new(TerminalUi::chat()),
+                        Box::new(TerminalUi::chat(view.output())),
                         workspace.clone(),
                     ));
                 }
-                let cancellation = CancellationToken::new();
-                let signal_task = spawn_cancellation_signal(cancellation.clone());
-                let result = agent
-                    .as_mut()
-                    .expect("chat agent initialized")
-                    .run_in_conversation(
-                        &task,
-                        RunOptions {
-                            session_id: Some(session.summary().id.clone()),
-                            cancellation: Some(cancellation),
-                            ..Default::default()
-                        },
+
+                let mut current_task = task;
+                let exit_requested = loop {
+                    let result = run_active_chat_task(
+                        agent.as_mut().expect("chat agent initialized"),
+                        &current_task,
                         &mut conversation,
+                        &session,
+                        &config,
+                        &workspace,
+                        &instruction_set,
+                        &input_queue,
+                        &mut inputs,
+                        &view,
                     )
-                    .await;
-                signal_task.abort();
-                session.save(&conversation)?;
-                if let Err(error) = result {
-                    eprintln!("error: {error:#}");
+                    .await?;
+                    session.save(&conversation)?;
+                    if result.exit_requested || result.reason != "finished" {
+                        break result.exit_requested;
+                    }
+                    let follow_ups =
+                        input_queue.take_follow_ups(config.agent.follow_up_mode.take_all());
+                    if follow_ups.is_empty() {
+                        break false;
+                    }
+                    current_task = combined_follow_up(&follow_ups);
+                    view.notice(format!(
+                        "Starting {} queued follow-up message{}.",
+                        follow_ups.len(),
+                        if follow_ups.len() == 1 { "" } else { "s" }
+                    ))?;
+                };
+                if exit_requested {
+                    break;
                 }
             }
         }
     }
     Ok(())
+}
+
+struct ActiveChatResult {
+    reason: String,
+    exit_requested: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_active_chat_task(
+    agent: &mut Agent,
+    task: &str,
+    conversation: &mut Conversation,
+    session: &ChatSession,
+    config: &Config,
+    workspace: &Path,
+    instruction_set: &instructions::InstructionSet,
+    input_queue: &InputQueue,
+    inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
+    view: &ChatView,
+) -> Result<ActiveChatResult> {
+    let cancellation = CancellationToken::new();
+    let signal_task = spawn_cancellation_signal(cancellation.clone());
+    let context_messages = conversation.message_count();
+    let run = agent.run_in_conversation(
+        task,
+        RunOptions {
+            session_id: Some(session.summary().id.clone()),
+            cancellation: Some(cancellation.clone()),
+            input_queue: Some(input_queue.clone()),
+            ..Default::default()
+        },
+        conversation,
+    );
+    tokio::pin!(run);
+    let mut exit_requested = false;
+
+    let result = loop {
+        tokio::select! {
+            result = &mut run => break result,
+            input = inputs.recv() => {
+                let Some(input) = input else {
+                    exit_requested = true;
+                    cancellation.cancel();
+                    continue;
+                };
+                match input? {
+                    ChatInput::Task(text) if text.trim().is_empty() => {
+                        view.warning("Steering message cannot be empty.")?;
+                    }
+                    ChatInput::Task(text) => {
+                        let queued = input_queue.steer(text);
+                        view.show_queued("steer", queued.id, input_queue.snapshot().len())?;
+                    }
+                    ChatInput::FollowUp(text) if text.trim().is_empty() => {
+                        view.warning("Follow-up message cannot be empty.")?;
+                    }
+                    ChatInput::FollowUp(text) => {
+                        let queued = input_queue.follow_up(text);
+                        view.show_queued("follow-up", queued.id, input_queue.snapshot().len())?;
+                    }
+                    ChatInput::Interrupted | ChatInput::Command(ChatCommand::Cancel) => {
+                        cancellation.cancel();
+                    }
+                    ChatInput::Exit => {
+                        exit_requested = true;
+                        cancellation.cancel();
+                    }
+                    ChatInput::Command(ChatCommand::ClearQueue) => {
+                        let cleared = input_queue.clear();
+                        view.notice(format!("Cleared {} queued messages.", cleared.len()))?;
+                    }
+                    ChatInput::Command(ChatCommand::Queue) => {
+                        view.show_queue(&input_queue.snapshot())?;
+                    }
+                    ChatInput::Command(ChatCommand::Help) => view.show_help()?,
+                    ChatInput::Command(ChatCommand::Status) => {
+                        view.show_status(
+                            config,
+                            workspace,
+                            session.summary(),
+                            instruction_set,
+                            context_messages,
+                            &input_queue.snapshot(),
+                        )?;
+                    }
+                    ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
+                    ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
+                    ChatInput::Command(ChatCommand::Rules) => view.show_rules(instruction_set)?,
+                    ChatInput::Command(ChatCommand::Sessions) => {
+                        view.warning("Use /sessions after the active task finishes.")?;
+                    }
+                    ChatInput::Command(ChatCommand::New)
+                    | ChatInput::Command(ChatCommand::Rename(_))
+                    | ChatInput::Command(ChatCommand::Resume(_)) => {
+                        view.warning("That command is available after the active task finishes.")?;
+                    }
+                    ChatInput::Command(ChatCommand::Unknown(command)) => {
+                        view.warning(format!("Unknown command {command:?}. Type /help."))?;
+                    }
+                }
+            }
+        }
+    };
+    signal_task.abort();
+    let reason = match result {
+        Ok(result) => result.reason,
+        Err(error) => {
+            view.warning(format!("Agent error: {error:#}"))?;
+            "error".into()
+        }
+    };
+    Ok(ActiveChatResult {
+        reason,
+        exit_requested,
+    })
+}
+
+fn combined_follow_up(inputs: &[QueuedInput]) -> String {
+    if inputs.len() == 1 {
+        return inputs[0].text.clone();
+    }
+    let mut result = String::from("Queued follow-up requests, in order:\n");
+    for (index, input) in inputs.iter().enumerate() {
+        result.push_str(&format!("\n{}. {}", index + 1, input.text.trim()));
+    }
+    result
 }
 
 fn spawn_cancellation_signal(cancellation: CancellationToken) -> tokio::task::JoinHandle<()> {
