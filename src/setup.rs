@@ -162,11 +162,10 @@ fn prompt_wire_api(term: &Term, current: WireApi) -> Result<WireApi> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn credential_file_is_private() {
         use std::os::unix::fs::PermissionsExt;

@@ -191,11 +191,11 @@ fn create_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn make_file_private(path: &Path) -> Result<()> {
+fn make_file_private(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }
