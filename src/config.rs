@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use directories::ProjectDirs;
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -327,21 +327,24 @@ fn openai_compatible(
 }
 
 pub fn default_config_path() -> PathBuf {
-    ProjectDirs::from("dev", "wecode", "wecode")
-        .map(|dirs| dirs.config_dir().join("config.toml"))
-        .unwrap_or_else(|| std::env::temp_dir().join("wecode/config.toml"))
+    wecode_home_dir().join("config.toml")
 }
 
 pub fn default_cache_dir() -> PathBuf {
-    ProjectDirs::from("dev", "wecode", "wecode")
-        .map(|dirs| dirs.cache_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir().join("wecode/cache"))
+    wecode_home_dir().join("cache")
 }
 
 pub fn default_state_dir() -> PathBuf {
-    ProjectDirs::from("dev", "wecode", "wecode")
-        .map(|dirs| dirs.data_local_dir().join("sessions"))
-        .unwrap_or_else(|| std::env::temp_dir().join("wecode/sessions"))
+    wecode_home_dir().join("sessions")
+}
+
+fn wecode_home_dir() -> PathBuf {
+    if let Some(path) = env::var_os("WECODE_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".wecode"))
+        .unwrap_or_else(|| std::env::temp_dir().join("wecode"))
 }
 
 fn is_local_provider(provider: &str) -> bool {
@@ -394,6 +397,14 @@ mod tests {
         assert!(CacheMode::ReadWrite.can_write());
         assert!(!CacheMode::Refresh.can_read());
         assert!(CacheMode::Refresh.can_write());
+    }
+
+    #[test]
+    fn user_data_paths_share_the_wecode_home() {
+        let home = wecode_home_dir();
+        assert_eq!(default_config_path(), home.join("config.toml"));
+        assert_eq!(default_cache_dir(), home.join("cache"));
+        assert_eq!(default_state_dir(), home.join("sessions"));
     }
 
     #[cfg(unix)]

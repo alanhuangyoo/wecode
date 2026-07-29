@@ -45,7 +45,14 @@ cd wecode
 cargo install --path .
 ```
 
-只构建、不安装：
+安装后，进入希望 WeCode 操作的仓库，直接启动：
+
+```bash
+cd /path/to/repository
+wecode
+```
+
+不带子命令运行 `wecode`，会为当前目录启动轻量交互会话。只构建、不安装：
 
 ```bash
 cargo build --release
@@ -54,7 +61,16 @@ cargo build --release
 
 ## 快速开始
 
-设置模型服务需要的密钥，然后对目标仓库执行任务：
+创建用户配置、编辑配置，然后启动：
+
+```bash
+wecode init
+${EDITOR:-vi} ~/.wecode/config.toml
+cd /path/to/repository
+wecode
+```
+
+也可以直接设置模型服务密钥，并执行一次性任务：
 
 ```bash
 export OPENAI_API_KEY="your-key"
@@ -77,14 +93,18 @@ printf '%s' "定位并修复解析器错误。" | \
 
 ## 配置
 
-创建当前平台的用户配置文件：
+创建用户配置文件：
 
 ```bash
 wecode init
 ```
 
+该命令会写入 `~/.wecode/config.toml`。响应缓存位于 `~/.wecode/cache/`，运行轨迹位于
+`~/.wecode/sessions/`。可以通过 `WECODE_HOME` 同时修改这三个位置，便于容器和
+Benchmark Worker 使用。
+
 也可以在仓库根目录放置 `.wecode.toml`，或使用 `--config /path/to/config.toml`。
-命令行参数的优先级高于配置文件。
+仓库配置会覆盖用户配置，命令行参数的优先级最高。
 
 ```toml
 [model]

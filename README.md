@@ -48,7 +48,15 @@ cd wecode
 cargo install --path .
 ```
 
-To build without installing:
+After installation, start WeCode from the repository you want it to work on:
+
+```bash
+cd /path/to/repository
+wecode
+```
+
+Running `wecode` with no subcommand opens the lightweight interactive session for the current
+directory. To build without installing:
 
 ```bash
 cargo build --release
@@ -57,7 +65,16 @@ cargo build --release
 
 ## Quick start
 
-Set the key expected by your provider and run a task against a repository:
+Create the user configuration, edit it, then launch WeCode:
+
+```bash
+wecode init
+${EDITOR:-vi} ~/.wecode/config.toml
+cd /path/to/repository
+wecode
+```
+
+Alternatively, set the key expected by your provider and run a one-shot task:
 
 ```bash
 export OPENAI_API_KEY="your-key"
@@ -80,14 +97,19 @@ Run `wecode` or `wecode chat` for a lightweight interactive prompt.
 
 ## Configuration
 
-Create the platform-specific user configuration:
+Create the user configuration:
 
 ```bash
 wecode init
 ```
 
+This writes `~/.wecode/config.toml`. WeCode keeps its response cache in `~/.wecode/cache/` and
+trajectories in `~/.wecode/sessions/`. Set `WECODE_HOME` to move all three locations, which is
+useful in containers and benchmark workers.
+
 You can also place `.wecode.toml` in a repository or pass `--config /path/to/config.toml`.
-Command-line options override the loaded configuration.
+Repository configuration overrides the user configuration, and command-line options override the
+loaded configuration.
 
 ```toml
 [model]
