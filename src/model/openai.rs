@@ -4,12 +4,12 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    CompletionRequest, ModelResponse, RawModel, Usage, action_from_tool_call, action_text,
-    tool_definitions,
+    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, Usage,
+    action_from_tool_call, action_text, tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode, WireApi};
 use crate::context::Role;
-use crate::model::http::send_json;
+use crate::model::http::{SseEvent, send_json, send_sse};
 
 pub struct OpenAiModel {
     config: ModelConfig,
@@ -128,7 +128,19 @@ impl OpenAiModel {
 
 #[async_trait]
 impl RawModel for OpenAiModel {
-    async fn complete_raw(&self, request: &CompletionRequest) -> Result<ModelResponse> {
+    async fn complete_raw(
+        &self,
+        request: &CompletionRequest,
+        stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
+        if self.config.streaming
+            && let Some(stream) = stream
+        {
+            return match self.config.wire_api {
+                WireApi::ChatCompletions => self.complete_chat_stream(request, stream).await,
+                WireApi::Responses => self.complete_responses_stream(request, stream).await,
+            };
+        }
         let (endpoint, body) = match self.config.wire_api {
             WireApi::ChatCompletions => ("chat/completions", self.chat_body(request)),
             WireApi::Responses => ("responses", self.responses_body(request)),
@@ -151,6 +163,219 @@ impl RawModel for OpenAiModel {
             WireApi::Responses => parse_responses_response(value),
         }
     }
+}
+
+impl OpenAiModel {
+    async fn complete_chat_stream(
+        &self,
+        request: &CompletionRequest,
+        stream: &dyn ModelStream,
+    ) -> Result<ModelResponse> {
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
+        let mut body = self.chat_body(request);
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+        let mut state = OpenAiStreamState::default();
+        send_sse(
+            &self.client,
+            reqwest::Method::POST,
+            &url,
+            self.headers()?,
+            &body,
+            |event| ingest_chat_event(event, stream, &mut state),
+        )
+        .await?;
+        state.finish("OpenAI-compatible stream")
+    }
+
+    async fn complete_responses_stream(
+        &self,
+        request: &CompletionRequest,
+        stream: &dyn ModelStream,
+    ) -> Result<ModelResponse> {
+        let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
+        let mut body = self.responses_body(request);
+        body["stream"] = json!(true);
+        let mut state = OpenAiStreamState::default();
+        let mut completed = None;
+        send_sse(
+            &self.client,
+            reqwest::Method::POST,
+            &url,
+            self.headers()?,
+            &body,
+            |event| ingest_responses_event(event, stream, &mut state, &mut completed),
+        )
+        .await?;
+        if let Some(response) = completed {
+            return parse_responses_response(response);
+        }
+        state.finish("OpenAI Responses stream")
+    }
+}
+
+#[derive(Default)]
+struct OpenAiStreamState {
+    text: String,
+    tool_name: String,
+    tool_arguments: String,
+    usage: Usage,
+}
+
+impl OpenAiStreamState {
+    fn finish(self, source: &str) -> Result<ModelResponse> {
+        let action = if self.tool_name.is_empty() {
+            None
+        } else {
+            let arguments = serde_json::from_str(&self.tool_arguments)
+                .with_context(|| format!("{source} returned invalid tool arguments"))?;
+            Some(action_from_tool_call(&self.tool_name, arguments)?)
+        };
+        let text = if self.text.is_empty() {
+            action
+                .as_ref()
+                .map(action_text)
+                .with_context(|| format!("{source} contained neither text nor a tool call"))?
+        } else {
+            self.text
+        };
+        Ok(ModelResponse {
+            text,
+            action,
+            usage: self.usage,
+            cache_hit: false,
+        })
+    }
+}
+
+fn ingest_chat_event(
+    event: SseEvent,
+    stream: &dyn ModelStream,
+    state: &mut OpenAiStreamState,
+) -> Result<()> {
+    if event.data == "[DONE]" {
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(&event.data).context("invalid OpenAI-compatible SSE event")?;
+    if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+        state.usage = Usage {
+            input_tokens: usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_read_tokens: usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_write_tokens: 0,
+        };
+    }
+    let Some(delta) = value.pointer("/choices/0/delta") else {
+        return Ok(());
+    };
+    if let Some(text) = delta.get("content").and_then(Value::as_str) {
+        state.text.push_str(text);
+        emit_nonempty(stream, ModelStreamEvent::TextDelta(text.to_owned()))?;
+    }
+    for key in ["reasoning_content", "reasoning", "reasoning_text"] {
+        if let Some(text) = delta.get(key).and_then(Value::as_str) {
+            emit_nonempty(stream, ModelStreamEvent::ReasoningDelta(text.to_owned()))?;
+        }
+    }
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            if tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) != 0 {
+                continue;
+            }
+            let Some(function) = tool_call.get("function") else {
+                continue;
+            };
+            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                state.tool_name.push_str(name);
+            }
+            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                state.tool_arguments.push_str(arguments);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ingest_responses_event(
+    event: SseEvent,
+    stream: &dyn ModelStream,
+    state: &mut OpenAiStreamState,
+    completed: &mut Option<Value>,
+) -> Result<()> {
+    if event.data == "[DONE]" {
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(&event.data).context("invalid OpenAI Responses event")?;
+    let kind = event
+        .event
+        .as_deref()
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .unwrap_or_default();
+    match kind {
+        "response.output_text.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                state.text.push_str(delta);
+                emit_nonempty(stream, ModelStreamEvent::TextDelta(delta.to_owned()))?;
+            }
+        }
+        "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_summary_part.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                emit_nonempty(stream, ModelStreamEvent::ReasoningDelta(delta.to_owned()))?;
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                state.tool_arguments.push_str(delta);
+            }
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            if let Some(item) = value.get("item")
+                && item.get("type").and_then(Value::as_str) == Some("function_call")
+            {
+                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    state.tool_name = name.to_owned();
+                }
+                if kind.ends_with(".done")
+                    && let Some(arguments) = item.get("arguments").and_then(Value::as_str)
+                {
+                    state.tool_arguments = arguments.to_owned();
+                }
+            }
+        }
+        "response.completed" => {
+            *completed = value.get("response").cloned();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn emit_nonempty(stream: &dyn ModelStream, event: ModelStreamEvent) -> Result<()> {
+    let empty = match &event {
+        ModelStreamEvent::TextDelta(text) | ModelStreamEvent::ReasoningDelta(text) => {
+            text.is_empty()
+        }
+    };
+    if !empty {
+        stream.emit(event)?;
+    }
+    Ok(())
 }
 
 fn parse_chat_response(value: Value) -> Result<ModelResponse> {
@@ -254,7 +479,19 @@ fn clamp_cache_key(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingStream(Mutex<Vec<ModelStreamEvent>>);
+
+    impl ModelStream for RecordingStream {
+        fn emit(&self, event: ModelStreamEvent) -> Result<()> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
 
     #[test]
     fn parses_both_openai_response_shapes() {
@@ -311,6 +548,85 @@ mod tests {
             Some(crate::protocol::Action::Finish {
                 summary: "all checks pass".into(),
             })
+        );
+    }
+
+    #[test]
+    fn assembles_chat_stream_tool_fragments_and_usage() {
+        let stream = RecordingStream::default();
+        let mut state = OpenAiStreamState::default();
+        for data in [
+            r#"{"choices":[{"delta":{"reasoning_content":"checking "}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"finish","arguments":"{\"summary\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"done\"}"}}]}}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":8}}}"#,
+        ] {
+            ingest_chat_event(
+                SseEvent {
+                    event: None,
+                    data: data.into(),
+                },
+                &stream,
+                &mut state,
+            )
+            .unwrap();
+        }
+        let response = state.finish("test").unwrap();
+
+        assert_eq!(
+            response.action,
+            Some(crate::protocol::Action::Finish {
+                summary: "done".into(),
+            })
+        );
+        assert_eq!(response.usage.input_tokens, 12);
+        assert_eq!(response.usage.cache_read_tokens, 8);
+        assert_eq!(
+            *stream.0.lock().unwrap(),
+            [ModelStreamEvent::ReasoningDelta("checking ".into())]
+        );
+    }
+
+    #[test]
+    fn consumes_responses_deltas_and_completed_response() {
+        let stream = RecordingStream::default();
+        let mut state = OpenAiStreamState::default();
+        let mut completed = None;
+        for (event, data) in [
+            (
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","delta":"do"}"#,
+            ),
+            (
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","delta":"ne"}"#,
+            ),
+            (
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output_text":"done","usage":{"input_tokens":4,"output_tokens":1}}}"#,
+            ),
+        ] {
+            ingest_responses_event(
+                SseEvent {
+                    event: Some(event.into()),
+                    data: data.into(),
+                },
+                &stream,
+                &mut state,
+                &mut completed,
+            )
+            .unwrap();
+        }
+
+        let response = parse_responses_response(completed.unwrap()).unwrap();
+        assert_eq!(response.text, "done");
+        assert_eq!(response.usage.output_tokens, 1);
+        assert_eq!(
+            *stream.0.lock().unwrap(),
+            [
+                ModelStreamEvent::TextDelta("do".into()),
+                ModelStreamEvent::TextDelta("ne".into()),
+            ]
         );
     }
 }

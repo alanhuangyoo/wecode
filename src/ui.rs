@@ -16,6 +16,7 @@ pub enum UiMode {
 
 pub struct TerminalUi {
     spinner: Mutex<Option<ProgressBar>>,
+    stream_preview: Mutex<String>,
     interactive: bool,
     mode: UiMode,
 }
@@ -32,6 +33,7 @@ impl TerminalUi {
     fn with_mode(mode: UiMode) -> Self {
         Self {
             spinner: Mutex::new(None),
+            stream_preview: Mutex::new(String::new()),
             interactive: io::stderr().is_terminal(),
             mode,
         }
@@ -45,6 +47,10 @@ impl TerminalUi {
 
     fn start_spinner(&self, step: usize) {
         self.stop_spinner();
+        self.stream_preview
+            .lock()
+            .expect("stream preview lock poisoned")
+            .clear();
         if self.interactive {
             let spinner = ProgressBar::new_spinner();
             spinner.set_style(
@@ -57,6 +63,32 @@ impl TerminalUi {
             *self.spinner.lock().expect("spinner lock poisoned") = Some(spinner);
         } else {
             eprintln!("  Thinking · step {step}");
+        }
+    }
+
+    fn show_delta(&self, text: &str, reasoning: bool) {
+        if !self.interactive || text.is_empty() {
+            return;
+        }
+        let mut preview = self
+            .stream_preview
+            .lock()
+            .expect("stream preview lock poisoned");
+        preview.push_str(text);
+        *preview = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+        if preview.chars().count() > 88 {
+            *preview = preview
+                .chars()
+                .rev()
+                .take(88)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+        }
+        if let Some(spinner) = self.spinner.lock().expect("spinner lock poisoned").as_ref() {
+            let label = if reasoning { "Thinking" } else { "Streaming" };
+            spinner.set_message(format!("{label} · {preview}"));
         }
     }
 }
@@ -86,6 +118,9 @@ impl EventSink for TerminalUi {
                 }
             }
             Event::ModelStarted { step } => self.start_spinner(*step),
+            Event::ModelDelta {
+                text, reasoning, ..
+            } => self.show_delta(text, *reasoning),
             Event::ModelCompleted {
                 step,
                 cache_hit,
@@ -164,6 +199,13 @@ impl EventSink for TerminalUi {
                     Style::new().yellow().apply_to("↻")
                 );
             }
+            Event::RunCancelled { .. } => {
+                self.stop_spinner();
+                eprintln!(
+                    "  {} cancelled · workspace changes made before cancellation were preserved",
+                    Style::new().yellow().bold().apply_to("■")
+                );
+            }
             Event::Verification { passed, .. } => {
                 let text = if *passed {
                     Style::new()
@@ -202,6 +244,10 @@ impl EventSink for TerminalUi {
             Event::AssistantMessage { .. } => {}
         }
         Ok(())
+    }
+
+    fn wants_model_deltas(&self) -> bool {
+        self.interactive
     }
 }
 

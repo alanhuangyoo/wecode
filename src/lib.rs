@@ -5,6 +5,7 @@ pub mod chat;
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod control;
 pub mod events;
 pub mod executor;
 pub mod git;

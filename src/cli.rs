@@ -11,6 +11,7 @@ use crate::chat::{ChatCommand, ChatInput, ChatShell};
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, provider_preset,
 };
+use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
 use crate::instructions;
 use crate::model::create_model;
@@ -116,6 +117,9 @@ pub struct CommonArgs {
     /// Disable native function tools and require the JSON text-action fallback.
     #[arg(long)]
     pub text_actions: bool,
+    /// Disable provider streaming for gateways that only support buffered responses.
+    #[arg(long)]
+    pub no_stream: bool,
     /// Override the request cache mode.
     #[arg(long, value_enum)]
     pub cache_mode: Option<CacheModeArg>,
@@ -233,6 +237,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             api_key_file: None,
             wire_api: None,
             text_actions: false,
+            no_stream: false,
             cache_mode: None,
             max_steps: None,
             unsafe_local: false,
@@ -279,6 +284,8 @@ async fn run_once(args: RunArgs) -> Result<()> {
         OutputMode::Jsonl => Box::new(JsonlSink::stdout()),
     };
     let mut agent = Agent::new(config, model, sink, workspace);
+    let cancellation = CancellationToken::new();
+    let signal_task = spawn_cancellation_signal(cancellation.clone());
     let result = agent
         .run(
             &task,
@@ -288,9 +295,12 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 result_out: args.result_out,
                 task_id: None,
                 session_id: None,
+                cancellation: Some(cancellation),
             },
         )
-        .await?;
+        .await;
+    signal_task.abort();
+    let result = result?;
     if !result.success {
         std::process::exit(2);
     }
@@ -405,6 +415,8 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         workspace.clone(),
                     ));
                 }
+                let cancellation = CancellationToken::new();
+                let signal_task = spawn_cancellation_signal(cancellation.clone());
                 let result = agent
                     .as_mut()
                     .expect("chat agent initialized")
@@ -412,11 +424,13 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &task,
                         RunOptions {
                             session_id: Some(session.summary().id.clone()),
+                            cancellation: Some(cancellation),
                             ..Default::default()
                         },
                         &mut conversation,
                     )
                     .await;
+                signal_task.abort();
                 session.save(&conversation)?;
                 if let Err(error) = result {
                     eprintln!("error: {error:#}");
@@ -425,6 +439,14 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn spawn_cancellation_signal(cancellation: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancellation.cancel();
+        }
+    })
 }
 
 fn list_sessions(args: SessionsArgs) -> Result<()> {
@@ -538,6 +560,9 @@ fn resolve_config(args: &CommonArgs) -> Result<(Config, PathBuf)> {
     }
     if args.text_actions {
         config.model.native_tools = false;
+    }
+    if args.no_stream {
+        config.model.streaming = false;
     }
     if let Some(cache_mode) = args.cache_mode {
         config.cache.mode = cache_mode.into();

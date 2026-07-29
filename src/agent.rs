@@ -8,11 +8,12 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::context::{ContextWindow, Message};
+use crate::control::CancellationToken;
 use crate::events::{Event, EventSink, JsonlSink};
 use crate::executor::{ExecutionResult, Executor};
 use crate::git::{collect_patch, head_id};
 use crate::instructions;
-use crate::model::{CompletionRequest, Model, Usage, action_text};
+use crate::model::{CompletionRequest, Model, ModelStream, ModelStreamEvent, Usage, action_text};
 use crate::protocol::{Action, parse_action};
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
@@ -24,6 +25,7 @@ pub struct RunOptions {
     pub result_out: Option<PathBuf>,
     pub task_id: Option<String>,
     pub session_id: Option<String>,
+    pub cancellation: Option<CancellationToken>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -156,8 +158,18 @@ impl Agent {
         let mut reason = "step_limit".to_string();
         let mut success = false;
         let mut steps = 0;
+        let cancellation = options.cancellation.clone();
 
         for step in 1..=self.config.agent.max_steps {
+            if cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                summary = "cancelled by user".into();
+                reason = "cancelled".into();
+                self.emit(&recorder, Event::RunCancelled { step })?;
+                break;
+            }
             if started.elapsed().as_secs() >= self.config.agent.wall_time_limit_seconds {
                 reason = "wall_time_limit".into();
                 break;
@@ -173,15 +185,35 @@ impl Agent {
                 )?;
             }
             self.emit(&recorder, Event::ModelStarted { step })?;
-            let response = match self
-                .model
-                .complete(CompletionRequest {
-                    system: SYSTEM_PROMPT.to_owned(),
-                    messages: messages.clone(),
-                    session_id: session_id.clone(),
-                })
-                .await
-            {
+            let stream = self.sink.wants_model_deltas().then(|| EventModelStream {
+                sink: self.sink.as_ref(),
+                step,
+            });
+            let request = CompletionRequest {
+                system: SYSTEM_PROMPT.to_owned(),
+                messages: messages.clone(),
+                session_id: session_id.clone(),
+            };
+            let completion = self.model.complete(
+                request,
+                stream.as_ref().map(|stream| stream as &dyn ModelStream),
+            );
+            let response = if let Some(cancellation) = &cancellation {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => None,
+                    response = completion => Some(response),
+                }
+            } else {
+                Some(completion.await)
+            };
+            let Some(response) = response else {
+                summary = "cancelled by user".into();
+                reason = "cancelled".into();
+                self.emit(&recorder, Event::RunCancelled { step })?;
+                break;
+            };
+            let response = match response {
                 Ok(response) => response,
                 Err(error) => {
                     summary = format!("model request failed: {error:#}");
@@ -259,7 +291,22 @@ impl Agent {
 
             match action {
                 Action::Shell { command, .. } => {
-                    let result = executor.shell(&command).await;
+                    let execution = executor.shell(&command);
+                    let result = if let Some(cancellation) = &cancellation {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => None,
+                            result = execution => Some(result),
+                        }
+                    } else {
+                        Some(execution.await)
+                    };
+                    let Some(result) = result else {
+                        summary = "cancelled by user".into();
+                        reason = "cancelled".into();
+                        self.emit(&recorder, Event::RunCancelled { step })?;
+                        break;
+                    };
                     self.handle_execution(step, result, &recorder, &mut messages)?;
                 }
                 Action::Patch { patch, .. } => {
@@ -270,7 +317,23 @@ impl Agent {
                     summary: proposed_summary,
                 } => {
                     if let Some(verify) = &options.verify {
-                        let result = executor.shell(verify).await?;
+                        let verification = executor.shell(verify);
+                        let result = if let Some(cancellation) = &cancellation {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => None,
+                                result = verification => Some(result),
+                            }
+                        } else {
+                            Some(verification.await)
+                        };
+                        let Some(result) = result else {
+                            summary = "cancelled by user".into();
+                            reason = "cancelled".into();
+                            self.emit(&recorder, Event::RunCancelled { step })?;
+                            break;
+                        };
+                        let result = result?;
                         self.emit(
                             &recorder,
                             Event::Verification {
@@ -430,6 +493,25 @@ impl Agent {
     fn emit(&self, recorder: &JsonlSink, event: Event) -> Result<()> {
         self.sink.emit(&event)?;
         recorder.emit(&event)
+    }
+}
+
+struct EventModelStream<'a> {
+    sink: &'a dyn EventSink,
+    step: usize,
+}
+
+impl ModelStream for EventModelStream<'_> {
+    fn emit(&self, event: ModelStreamEvent) -> Result<()> {
+        let (text, reasoning) = match event {
+            ModelStreamEvent::TextDelta(text) => (text, false),
+            ModelStreamEvent::ReasoningDelta(text) => (text, true),
+        };
+        self.sink.emit(&Event::ModelDelta {
+            step: self.step,
+            text,
+            reasoning,
+        })
     }
 }
 

@@ -22,7 +22,8 @@ runtime.
 - **Reliable tools** — native `shell`, `apply_patch`, and `finish` function calls, plus a JSON
   text-action fallback for gateways without tool-call support.
 - **Purpose-built terminal UX** — conversation history, persistent follow-up context, structured
-  tool/output panels, live thinking status, and slash commands without a full-screen TUI.
+  tool/output panels, live provider streaming, cancellable runs, and slash commands without a
+  full-screen TUI.
 - **Durable sessions** — conversations auto-save as inspectable JSONL, can be listed or resumed,
   and retain one stable provider cache identity across follow-up turns.
 - **Repository-aware** — bounded global and hierarchical `AGENTS.md`, `CLAUDE.md`, and rules
@@ -123,9 +124,11 @@ the final response into compact terminal panels.
 
 Sessions auto-save under `~/.wecode/sessions/chat/`. Resume outside the interactive interface with
 `wecode resume [session-id]`, or inspect recent sessions with `wecode sessions`. Input history is
-stored at `~/.wecode/history`. The interactive renderer is isolated from
+stored at `~/.wecode/history`. During a running turn, press `Ctrl-C` once to cancel the active
+model request or shell command and return to the prompt; edits already applied are preserved.
+The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
-depend on terminal rendering.
+depend on terminal rendering or delta events.
 
 ## Project instructions
 
@@ -172,6 +175,7 @@ max_output_tokens = 8192
 prompt_cache = "auto"
 send_prompt_cache_key = false
 native_tools = true
+streaming = true
 
 [agent]
 max_steps = 40
@@ -221,7 +225,8 @@ wecode run -C /path/to/repository \
 ```
 
 Native function tools are enabled by default. Add `--text-actions` if the gateway rejects tool
-schemas or returns tool calls as plain text.
+schemas or returns tool calls as plain text. Interactive provider streaming is enabled by default;
+add `--no-stream` for gateways that only support buffered responses.
 
 ## Caching
 
@@ -274,6 +279,9 @@ printf '%s' "$SWE_TASK" | wecode run \
   --result-out /results/run.json \
   --unsafe-local
 ```
+
+JSONL and benchmark sinks intentionally use buffered model responses and emit no UI delta events,
+even when `streaming = true`. This keeps benchmark trajectories stable and machine-readable.
 
 WeCode never resets or cleans a worktree. The benchmark harness is responsible for repository
 checkout, task isolation, and grading. See [docs/benchmarking.md](docs/benchmarking.md) for a

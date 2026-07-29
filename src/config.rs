@@ -67,6 +67,7 @@ pub struct ModelConfig {
     pub prompt_cache: PromptCacheMode,
     pub send_prompt_cache_key: bool,
     pub native_tools: bool,
+    pub streaming: bool,
 }
 
 impl Default for ModelConfig {
@@ -226,6 +227,7 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             prompt_cache: PromptCacheMode::Auto,
             send_prompt_cache_key: true,
             native_tools: true,
+            streaming: true,
         },
         "anthropic" => ModelConfig {
             provider: key,
@@ -240,6 +242,7 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             prompt_cache: PromptCacheMode::Long,
             send_prompt_cache_key: false,
             native_tools: true,
+            streaming: true,
         },
         "gemini" | "google" => ModelConfig {
             provider: "gemini".into(),
@@ -254,6 +257,7 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             prompt_cache: PromptCacheMode::Auto,
             send_prompt_cache_key: false,
             native_tools: true,
+            streaming: true,
         },
         "openrouter" => openai_compatible(
             key,
@@ -323,6 +327,7 @@ fn openai_compatible(
         prompt_cache: PromptCacheMode::Auto,
         send_prompt_cache_key: false,
         native_tools: true,
+        streaming: true,
     }
 }
 

@@ -4,11 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::Notify;
 use wecode::agent::{Agent, Conversation, RunOptions};
 use wecode::cache::ResponseCache;
 use wecode::config::{CacheConfig, Config};
+use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
-use wecode::model::{CompletionRequest, Model, ModelResponse, Usage};
+use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, Usage};
 use wecode::protocol::Action;
 
 struct FakeModel {
@@ -17,7 +19,11 @@ struct FakeModel {
 
 #[async_trait]
 impl Model for FakeModel {
-    async fn complete(&self, _request: CompletionRequest) -> Result<ModelResponse> {
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
         let text = self
             .responses
             .lock()
@@ -48,7 +54,11 @@ struct CapturingModel {
 
 #[async_trait]
 impl Model for CapturingModel {
-    async fn complete(&self, request: CompletionRequest) -> Result<ModelResponse> {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
         self.requests.lock().expect("request capture").push(request);
         let action = self
             .responses
@@ -67,7 +77,11 @@ impl Model for CapturingModel {
 
 #[async_trait]
 impl Model for NativeFakeModel {
-    async fn complete(&self, _request: CompletionRequest) -> Result<ModelResponse> {
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
         let action = self
             .responses
             .lock()
@@ -91,6 +105,34 @@ struct NullSink;
 
 impl EventSink for NullSink {
     fn emit(&self, _event: &Event) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct BlockingModel {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for BlockingModel {
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturingSink {
+    events: Arc<Mutex<Vec<Event>>>,
+}
+
+impl EventSink for CapturingSink {
+    fn emit(&self, event: &Event) -> Result<()> {
+        self.events.lock().unwrap().push(event.clone());
         Ok(())
     }
 }
@@ -295,6 +337,66 @@ async fn project_instructions_are_injected_into_the_initial_context() {
             .content
             .contains("<project_instructions")
     );
+}
+
+#[tokio::test]
+async fn cancellation_stops_a_model_call_and_preserves_the_user_task() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let started = Arc::new(Notify::new());
+    let sink = CapturingSink::default();
+    let events = sink.events.clone();
+    let cancellation = CancellationToken::new();
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(BlockingModel {
+            started: started.clone(),
+        }),
+        Box::new(sink),
+        temp.path().canonicalize().unwrap(),
+    );
+    let cancel_task = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move {
+            started.notified().await;
+            cancellation.cancel();
+        }
+    });
+    let mut conversation = Conversation::default();
+
+    let result = agent
+        .run_in_conversation(
+            "remember this cancelled task",
+            RunOptions {
+                cancellation: Some(cancellation),
+                ..Default::default()
+            },
+            &mut conversation,
+        )
+        .await
+        .unwrap();
+    cancel_task.await.unwrap();
+
+    assert!(!result.success);
+    assert_eq!(result.reason, "cancelled");
+    assert_eq!(conversation.message_count(), 1);
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::RunCancelled { step: 1 }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::RunCompleted {
+            success: false,
+            reason,
+            ..
+        } if reason == "cancelled"
+    )));
 }
 
 fn init_fixture(directory: &std::path::Path) {

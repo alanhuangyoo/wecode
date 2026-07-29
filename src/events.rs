@@ -20,6 +20,11 @@ pub enum Event {
     ModelStarted {
         step: usize,
     },
+    ModelDelta {
+        step: usize,
+        text: String,
+        reasoning: bool,
+    },
     ModelCompleted {
         step: usize,
         cache_hit: bool,
@@ -48,6 +53,9 @@ pub enum Event {
     ContextCompacted {
         removed_messages: usize,
     },
+    RunCancelled {
+        step: usize,
+    },
     Verification {
         passed: bool,
         exit_code: Option<i32>,
@@ -75,6 +83,10 @@ struct TimestampedEvent<'a> {
 
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: &Event) -> Result<()>;
+
+    fn wants_model_deltas(&self) -> bool {
+        false
+    }
 }
 
 pub struct JsonlSink {

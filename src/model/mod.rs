@@ -54,14 +54,32 @@ pub struct ModelResponse {
     pub cache_hit: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelStreamEvent {
+    TextDelta(String),
+    ReasoningDelta(String),
+}
+
+pub trait ModelStream: Send + Sync {
+    fn emit(&self, event: ModelStreamEvent) -> Result<()>;
+}
+
 #[async_trait]
 pub trait Model: Send + Sync {
-    async fn complete(&self, request: CompletionRequest) -> Result<ModelResponse>;
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+        stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse>;
 }
 
 #[async_trait]
 trait RawModel: Send + Sync {
-    async fn complete_raw(&self, request: &CompletionRequest) -> Result<ModelResponse>;
+    async fn complete_raw(
+        &self,
+        request: &CompletionRequest,
+        stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse>;
 }
 
 struct CachedModel {
@@ -72,13 +90,17 @@ struct CachedModel {
 
 #[async_trait]
 impl Model for CachedModel {
-    async fn complete(&self, request: CompletionRequest) -> Result<ModelResponse> {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+        stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
         let key = self.cache.key(&self.namespace, &request)?;
         if let Some(mut response) = self.cache.get::<ModelResponse>(&key).await? {
             response.cache_hit = true;
             return Ok(response);
         }
-        let mut response = self.inner.complete_raw(&request).await?;
+        let mut response = self.inner.complete_raw(&request, stream).await?;
         response.cache_hit = false;
         self.cache.put(&key, &response).await?;
         Ok(response)
@@ -231,7 +253,11 @@ mod tests {
 
     #[async_trait]
     impl RawModel for FakeRawModel {
-        async fn complete_raw(&self, _request: &CompletionRequest) -> Result<ModelResponse> {
+        async fn complete_raw(
+            &self,
+            _request: &CompletionRequest,
+            _stream: Option<&dyn ModelStream>,
+        ) -> Result<ModelResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ModelResponse {
                 text: r#"{"action":"finish","summary":"done"}"#.into(),
@@ -267,8 +293,8 @@ mod tests {
             session_id: "session".into(),
         };
 
-        let first = model.complete(request.clone()).await.unwrap();
-        let second = model.complete(request).await.unwrap();
+        let first = model.complete(request.clone(), None).await.unwrap();
+        let second = model.complete(request, None).await.unwrap();
 
         assert!(!first.cache_hit);
         assert!(second.cache_hit);

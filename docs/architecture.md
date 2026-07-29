@@ -28,6 +28,9 @@ Interactive shell -> append-only session log -> resume / follow-up context
 - Context compaction is local and deterministic and does not require another model call.
 - Project instructions are ordered, content-deduplicated, and bounded before entering context.
 - Interactive conversations use an append-only JSONL session log and a stable provider cache key.
+- Interactive model calls can stream normalized text/reasoning deltas into the terminal renderer.
+- Each active run owns a cancellation token. Cancelling drops in-flight HTTP or shell futures;
+  patch application remains an atomic boundary and already-applied changes are preserved.
 - Runtime trajectories and caches are stored outside the target repository unless explicitly
   redirected.
 
@@ -40,14 +43,17 @@ actions:
 2. `apply_patch` performs a bounded, path-checked file change.
 3. `finish` returns the final summary after optional verification succeeds.
 
-Every turn emits typed events. Human mode renders compact progress in the terminal; JSONL mode
-allows an external harness to record and analyze the same execution.
+Every turn emits typed events. Human mode opts into model deltas and renders compact live progress
+in the terminal. JSONL and benchmark sinks do not request deltas, so they retain the buffered
+provider path and stable machine-readable event stream.
 
 ## Provider layer
 
 All provider protocols normalize into one internal message, tool, response, and usage model. This
 keeps the agent loop independent of HTTP wire formats and allows provider-specific prompt caching
-without changing repository behavior.
+without changing repository behavior. OpenAI Chat Completions, OpenAI Responses, Anthropic
+Messages, and Gemini `streamGenerateContent` SSE events are reconstructed into the same completed
+response before the agent parses an action or writes to the exact-response cache.
 
 ## Output and replay
 
