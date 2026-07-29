@@ -1,0 +1,13 @@
+[package]
+name = "codex-apply-patch-lite"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Vendored pure apply_patch engine from xai-org/grok-build's Codex port"
+
+[lib]
+name = "codex_apply_patch_lite"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"

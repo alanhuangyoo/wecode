@@ -1,0 +1,2 @@
+{"id":"example-fix","task":"Fix the failing unit test without changing its assertion.","workspace":"../fixture","verify":"cargo test","max_steps":30}
+

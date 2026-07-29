@@ -1,0 +1,6 @@
+target/
+third_party/**/Cargo.lock
+/.wecode.toml
+wecode-results.jsonl
+*.patch
+.DS_Store

@@ -1,0 +1,9 @@
+[package]
+name = "xai-token-estimation"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Vendored token-estimation primitives from xai-org/grok-build"
+
+[lib]
+path = "src/lib.rs"
