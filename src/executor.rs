@@ -289,7 +289,12 @@ mod tests {
             true,
             None,
         );
-        let result = executor.shell("printf hello").await.unwrap();
+        let command = if cfg!(windows) {
+            "echo|set /p=hello"
+        } else {
+            "printf hello"
+        };
+        let result = executor.shell(command).await.unwrap();
         assert!(result.success());
         assert_eq!(result.stdout, "hello");
     }
