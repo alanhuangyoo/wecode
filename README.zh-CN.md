@@ -115,6 +115,9 @@ Agent 工作时仍可继续编辑。
 /fork        从当前位置或指定检查点创建分支
 /rewind      通过分支安全回到更早的检查点
 /plan        查看当前任务计划
+/processes   查看受管理的后台进程
+/stop-process <id>
+             停止一个后台进程树
 /steer       在下一个模型边界修正当前任务
 /followup    将任务排到当前任务结束之后
 /queue       查看待处理的 steer 和 follow-up
@@ -157,8 +160,15 @@ Agent 工作时仍可继续编辑。
 时中断。不支持全屏界面的终端可设置 `WECODE_TUI=0` 使用普通行模式。交互渲染和模型流式事件与
 `wecode run --output jsonl`、`wecode bench`
 完全分离，因此 Benchmark 的事件输出和 Agent 执行不依赖终端 UI 或流式增量事件。
-计划与提问工具只在交互式 `wecode` 会话中暴露；机器执行仍使用原来的七工具配置和同一
-缓存命名空间。
+计划、提问、Skill 和后台进程工具只在交互式 `wecode` 会话中暴露；机器执行仍使用原来的
+七工具配置和同一缓存命名空间。
+
+交互 Agent 可以让开发服务器、Watcher 或长时间测试在后台运行，同时继续对话。
+`start_process` 会返回进程 ID；`process_status` 使用可复用游标增量读取有界输出；
+`write_process` 可写入有大小限制的 stdin；`stop_process` 会结束整个受管理的进程树。
+进程完成时会自动显示在时间线，并在下一个安全模型边界通知 Agent，无需反复 sleep 或轮询。
+任务运行中也可使用 `/processes` 和 `/stop-process <id>`。切换会话或退出 WeCode 时，所有
+受管理进程都会被回收。
 
 长对话会在本地压缩为确定且有硬上限的结构化摘要，保留任务意图、检查或修改过的路径、
 验证结果、失败信息和待处理事实。重复压缩会替换上一份摘要，不会产生“摘要套摘要”；
@@ -247,6 +257,12 @@ trajectory_directory = "/path/to/wecode/sessions"
 mode = "read-write"
 max_megabytes = 2048
 
+[processes]
+enabled = true
+max_processes = 8
+max_runtime_seconds = 3600
+max_output_bytes = 131072
+
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
@@ -299,6 +315,11 @@ wecode run -C /path/to/repository \
 ```
 
 在 Unix 系统上，密钥文件不能允许用户组或其他用户读取，并且必须位于 Agent 工作区之外。
+
+`[processes]` 限制只用于交互模式的受管理后台进程。输出保存在有硬上限的环形缓冲区中；
+状态读取会返回 `next_cursor`、报告已经淘汰的字节，不会把无限日志注入模型上下文。子进程
+不会继承模型服务商的 API Key 环境变量。该功能不会给 `wecode run` 或 `wecode bench`
+增加任何工具。
 
 ### MCP 工具
 

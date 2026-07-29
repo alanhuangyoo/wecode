@@ -123,6 +123,9 @@ composer remains editable while the agent works.
 /fork        Fork from now or from a selected checkpoint
 /rewind      Rewind safely by forking from an earlier checkpoint
 /plan        Show the current task plan
+/processes   Show managed background processes
+/stop-process <id>
+             Stop a managed background process tree
 /steer       Steer the active task at the next model boundary
 /followup    Queue work for after the active task
 /queue       Show pending steer and follow-up messages
@@ -170,9 +173,17 @@ application is never interrupted halfway through. Set `WECODE_TUI=0` to use the 
 fallback in a terminal that does not support the full-screen interface.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
-depend on terminal rendering or delta events. Plan and question tools are exposed only by
-interactive `wecode` sessions; machine-oriented runs retain the original seven-tool profile and
-the same cache namespace.
+depend on terminal rendering or delta events. Plan, question, skill, and managed-process tools are
+exposed only by interactive `wecode` sessions; machine-oriented runs retain the original seven-tool
+profile and the same cache namespace.
+
+Interactive agents can keep development servers, watchers, and long tests running without blocking
+the conversation. `start_process` returns an ID, `process_status` reads bounded output incrementally
+with a reusable cursor, `write_process` sends bounded stdin, and `stop_process` terminates the owned
+process tree. Completion appears automatically in the timeline and is delivered to the model at its
+next safe boundary, so it does not need to sleep or poll continuously. `/processes` and
+`/stop-process <id>` remain usable while a task is active. All managed processes are stopped when
+the session changes or WeCode exits.
 
 Long conversations are compacted locally into a deterministic, bounded summary that retains task
 intent, inspected or edited paths, validation results, failures, and pending facts. Repeated
@@ -266,6 +277,12 @@ trajectory_directory = "/path/to/wecode/sessions"
 mode = "read-write"
 max_megabytes = 2048
 
+[processes]
+enabled = true
+max_processes = 8
+max_runtime_seconds = 3600
+max_output_bytes = 131072
+
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
@@ -320,6 +337,11 @@ wecode run -C /path/to/repository \
 
 On Unix, key files must not be accessible by group or other users and must be located outside the
 agent workspace.
+
+The `[processes]` limits apply only to interactive managed processes. Output is retained in a
+bounded ring buffer; status reads return `next_cursor`, report evicted bytes, and never inject
+unbounded logs into model context. The provider API-key environment variable is removed from child
+processes. This feature does not add tools to `wecode run` or `wecode bench`.
 
 ### MCP tools
 

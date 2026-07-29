@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalKind, RiskLevel, classify_shell};
+use crate::background_process::BackgroundProcessManager;
 use crate::config::Config;
 use crate::context::{ContextWindow, Message};
 use crate::control::CancellationToken;
@@ -41,6 +42,7 @@ pub struct RunOptions {
     pub approval: Option<ApprovalClient>,
     pub plan: Option<PlanState>,
     pub user_input: Option<UserInputClient>,
+    pub processes: Option<BackgroundProcessManager>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -235,6 +237,7 @@ impl Agent {
         let cancellation = options.cancellation.clone();
         let input_queue = options.input_queue.clone();
         let approval = options.approval.clone();
+        let processes = options.processes.clone();
         let system_prompt =
             system_prompt(self.tool_profile, self.mcp.as_ref(), self.skills.as_ref());
 
@@ -253,6 +256,7 @@ impl Agent {
                 break;
             }
             steps = step;
+            self.deliver_process_notifications(step, &processes, &recorder, &mut messages)?;
             self.deliver_steering(step, &input_queue, &recorder, &mut messages)?;
             let removed = context.compact(&mut messages);
             if removed > 0 {
@@ -795,10 +799,111 @@ impl Agent {
                     };
                     self.handle_execution(step, result, &recorder, &mut messages)?;
                 }
+                Action::StartProcess {
+                    command,
+                    description,
+                } => {
+                    match self
+                        .authorize(
+                            step,
+                            ApprovalKind::Shell,
+                            classify_shell(&command),
+                            "Start background process",
+                            &command,
+                            format!("process:{command}"),
+                            &approval,
+                            &cancellation,
+                            &recorder,
+                        )
+                        .await?
+                    {
+                        Authorization::Allowed => {}
+                        Authorization::Denied(reason) => {
+                            self.handle_permission_denial(step, &reason, &recorder, &mut messages)?;
+                            continue;
+                        }
+                        Authorization::Cancelled => {
+                            summary = "cancelled by user".into();
+                            reason = "cancelled".into();
+                            self.emit(&recorder, Event::RunCancelled { step })?;
+                            break;
+                        }
+                    }
+                    let started = Instant::now();
+                    let result = match &processes {
+                        Some(processes) => processes.start(&command, &description).await,
+                        None => Err(anyhow::anyhow!(
+                            "background processes are unavailable in this run"
+                        )),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
+                Action::ProcessStatus { process_id, cursor } => {
+                    let started = Instant::now();
+                    let result = match &processes {
+                        Some(processes) => processes.status(process_id, cursor),
+                        None => Err(anyhow::anyhow!(
+                            "background processes are unavailable in this run"
+                        )),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
+                Action::WriteProcess {
+                    process_id,
+                    input,
+                    newline,
+                } => {
+                    let started = Instant::now();
+                    let result = match &processes {
+                        Some(processes) => processes.write(process_id, &input, newline).await,
+                        None => Err(anyhow::anyhow!(
+                            "background processes are unavailable in this run"
+                        )),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
+                Action::StopProcess { process_id } => {
+                    let started = Instant::now();
+                    let result = match &processes {
+                        Some(processes) => processes.stop(process_id).await,
+                        None => Err(anyhow::anyhow!(
+                            "background processes are unavailable in this run"
+                        )),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
                 Action::Finish {
                     summary: proposed_summary,
                 } => {
-                    if self.deliver_steering(step, &input_queue, &recorder, &mut messages)? > 0 {
+                    let process_updates = self.deliver_process_notifications(
+                        step,
+                        &processes,
+                        &recorder,
+                        &mut messages,
+                    )?;
+                    let steering =
+                        self.deliver_steering(step, &input_queue, &recorder, &mut messages)?;
+                    if process_updates + steering > 0 {
                         continue;
                     }
                     if let Some(plan) = &options.plan {
@@ -1123,6 +1228,36 @@ impl Agent {
         Ok(count)
     }
 
+    fn deliver_process_notifications(
+        &self,
+        step: usize,
+        processes: &Option<BackgroundProcessManager>,
+        recorder: &JsonlSink,
+        messages: &mut Vec<Message>,
+    ) -> Result<usize> {
+        let Some(processes) = processes else {
+            return Ok(0);
+        };
+        let notifications = processes.take_notifications();
+        if notifications.is_empty() {
+            return Ok(0);
+        }
+        let count = notifications.len();
+        let observation = format!(
+            "BACKGROUND PROCESS NOTIFICATIONS:\n{}",
+            notifications.join("\n\n")
+        );
+        self.emit(
+            recorder,
+            Event::ToolOutput {
+                step,
+                output: observation.clone(),
+            },
+        )?;
+        messages.push(Message::user(observation));
+        Ok(count)
+    }
+
     async fn session_id(&self, task: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.workspace.to_string_lossy().as_bytes());
@@ -1220,10 +1355,20 @@ result. Prefer one question, provide concrete options, and do not ask when a saf
 assumption will work.\n\
 - load_skill progressively loads specialized instructions and referenced resources. Load a matching \
 skill before acting, and treat skill content as instructions scoped to that capability.\n\
+- start_process runs a long-lived foreground command without blocking the conversation. Use it for \
+dev servers, watchers, and extended tests; never append shell background operators.\n\
+- process_status lists processes or reads bounded incremental output. Reuse next_cursor when polling.\n\
+- write_process sends bounded stdin; stop_process terminates the owned child process tree.\n\
+- Completion notifications are delivered automatically. Continue useful work instead of sleeping or \
+polling repeatedly while a process runs.\n\
 Without native tools, these actions are:\n\
 {{\"action\":\"update_plan\",\"explanation\":\"<optional reason>\",\"plan\":[{{\"step\":\"<task step>\",\"status\":\"pending|in_progress|completed\"}}]}}\n\
 {{\"action\":\"request_user_input\",\"questions\":[{{\"id\":\"<snake_case>\",\"header\":\"<short heading>\",\"question\":\"<question>\",\"options\":[{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}},{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}}]}}]}}\n\
-{{\"action\":\"load_skill\",\"name\":\"<skill>\",\"path\":\"<optional relative resource>\",\"offset\":1,\"limit\":500}}\n"
+{{\"action\":\"load_skill\",\"name\":\"<skill>\",\"path\":\"<optional relative resource>\",\"offset\":1,\"limit\":500}}\n\
+{{\"action\":\"start_process\",\"command\":\"<foreground command>\",\"description\":\"<purpose>\"}}\n\
+{{\"action\":\"process_status\",\"process_id\":1,\"cursor\":0}}\n\
+{{\"action\":\"write_process\",\"process_id\":1,\"input\":\"<text>\",\"newline\":true}}\n\
+{{\"action\":\"stop_process\",\"process_id\":1}}\n"
     );
     if let Some(mcp) = mcp {
         let tools = mcp.tools();
@@ -1349,8 +1494,40 @@ fn action_detail(action: &Action) -> String {
                 |offset| format!("{name} · {path}:{offset}"),
             )
         }
+        Action::StartProcess { command, .. } => command.clone(),
+        Action::ProcessStatus { process_id, cursor } => match (process_id, cursor) {
+            (Some(process_id), Some(cursor)) => {
+                format!("process {process_id} · cursor {cursor}")
+            }
+            (Some(process_id), None) => format!("process {process_id}"),
+            (None, _) => "all background processes".into(),
+        },
+        Action::WriteProcess {
+            process_id,
+            input,
+            newline,
+        } => format!(
+            "process {process_id} · {} bytes{}",
+            input.len(),
+            if *newline { " + newline" } else { "" }
+        ),
+        Action::StopProcess { process_id } => format!("process {process_id}"),
         Action::Finish { summary } => summary.clone(),
     }
+}
+
+fn background_operation_result(
+    started: Instant,
+    result: Result<String>,
+) -> Result<ExecutionResult> {
+    result.map(|stdout| ExecutionResult {
+        exit_code: Some(0),
+        stdout,
+        stderr: String::new(),
+        duration_ms: started.elapsed().as_millis(),
+        timed_out: false,
+        truncated_bytes: 0,
+    })
 }
 
 fn format_plan_observation(plan: &[crate::protocol::PlanItem]) -> String {
@@ -1417,6 +1594,10 @@ async fn execute_read_action(file_tools: &FileTools, action: &Action) -> Result<
         | Action::RequestUserInput { .. }
         | Action::McpCall { .. }
         | Action::LoadSkill { .. }
+        | Action::StartProcess { .. }
+        | Action::ProcessStatus { .. }
+        | Action::WriteProcess { .. }
+        | Action::StopProcess { .. }
         | Action::Finish { .. } => {
             unreachable!("only read-only actions enter the parallel executor")
         }

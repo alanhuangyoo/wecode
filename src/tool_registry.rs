@@ -69,7 +69,11 @@ impl ToolRegistry {
             | Action::UpdatePlan { .. }
             | Action::RequestUserInput { .. }
             | Action::McpCall { .. }
-            | Action::LoadSkill { .. } => ToolConcurrency::Exclusive,
+            | Action::LoadSkill { .. }
+            | Action::StartProcess { .. }
+            | Action::ProcessStatus { .. }
+            | Action::WriteProcess { .. }
+            | Action::StopProcess { .. } => ToolConcurrency::Exclusive,
             Action::Finish { .. } => ToolConcurrency::Terminal,
         }
     }
@@ -178,6 +182,31 @@ impl ToolRegistry {
                 offset: get_usize("offset"),
                 limit: get_usize("limit"),
             },
+            "start_process" => Action::StartProcess {
+                command: get_string("command"),
+                description: get_string("description"),
+            },
+            "process_status" => Action::ProcessStatus {
+                process_id: arguments.get("process_id").and_then(Value::as_u64),
+                cursor: arguments.get("cursor").and_then(Value::as_u64),
+            },
+            "write_process" => Action::WriteProcess {
+                process_id: arguments
+                    .get("process_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                input: get_string("input"),
+                newline: arguments
+                    .get("newline")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            },
+            "stop_process" => Action::StopProcess {
+                process_id: arguments
+                    .get("process_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            },
             "finish" => Action::Finish {
                 summary: get_string("summary"),
             },
@@ -285,6 +314,57 @@ fn interactive_definitions() -> Vec<Value> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum lines to return."}
                 },
                 "required": ["name"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "start_process",
+            "description": "Start a long-running command such as a dev server, watcher, or extended test in the workspace. It runs without blocking the conversation and returns a process ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Foreground shell command. Do not append & or another background operator."},
+                    "description": {"type": "string", "description": "Short human-readable purpose."}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "process_status",
+            "description": "List background processes or read incremental output from one process. Reuse next_cursor on later calls to avoid repeated output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "integer", "minimum": 1, "description": "Process to inspect. Omit to list all processes."},
+                    "cursor": {"type": "integer", "minimum": 0, "description": "Output cursor returned by the prior status call."}
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "write_process",
+            "description": "Write bounded input to a running background process stdin.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "integer", "minimum": 1},
+                    "input": {"type": "string", "description": "Text to write."},
+                    "newline": {"type": "boolean", "description": "Append a newline. Defaults to true."}
+                },
+                "required": ["process_id", "input"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "stop_process",
+            "description": "Stop a running background process and its child process tree.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "integer", "minimum": 1}
+                },
+                "required": ["process_id"],
                 "additionalProperties": false
             }
         }),
@@ -446,19 +526,63 @@ mod tests {
     }
 
     #[test]
-    fn interactive_profile_adds_plan_question_and_skill_without_changing_coding_tools() {
+    fn interactive_profile_adds_session_tools_without_changing_benchmark_tools() {
         let coding = ToolRegistry::for_profile(ToolProfile::Coding).definitions();
         let interactive = ToolRegistry::for_profile(ToolProfile::Interactive).definitions();
         assert_eq!(coding.len(), 7);
-        assert_eq!(interactive.len(), 10);
+        assert_eq!(interactive.len(), 14);
         assert_eq!(
             interactive
                 .iter()
                 .skip(coding.len())
                 .filter_map(|tool| tool["name"].as_str())
                 .collect::<Vec<_>>(),
-            vec!["update_plan", "request_user_input", "load_skill"]
+            vec![
+                "update_plan",
+                "request_user_input",
+                "load_skill",
+                "start_process",
+                "process_status",
+                "write_process",
+                "stop_process",
+            ]
         );
+    }
+
+    #[test]
+    fn process_calls_preserve_ids_cursors_and_input_mode() {
+        assert_eq!(
+            ToolRegistry::parse_call(
+                "start_process",
+                json!({"command": "cargo watch", "description": "watch tests"})
+            )
+            .unwrap(),
+            Action::StartProcess {
+                command: "cargo watch".into(),
+                description: "watch tests".into(),
+            }
+        );
+        assert_eq!(
+            ToolRegistry::parse_call("process_status", json!({"process_id": 4, "cursor": 1024}))
+                .unwrap(),
+            Action::ProcessStatus {
+                process_id: Some(4),
+                cursor: Some(1024),
+            }
+        );
+        assert_eq!(
+            ToolRegistry::parse_call(
+                "write_process",
+                json!({"process_id": 4, "input": "q", "newline": false})
+            )
+            .unwrap(),
+            Action::WriteProcess {
+                process_id: 4,
+                input: "q".into(),
+                newline: false,
+            }
+        );
+        assert!(ToolRegistry::parse_call("stop_process", json!({"process_id": 0})).is_err());
     }
 
     #[test]

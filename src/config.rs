@@ -176,6 +176,26 @@ impl Default for CacheConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProcessesConfig {
+    pub enabled: bool,
+    pub max_processes: usize,
+    pub max_runtime_seconds: u64,
+    pub max_output_bytes: usize,
+}
+
+impl Default for ProcessesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_processes: 8,
+            max_runtime_seconds: 3_600,
+            max_output_bytes: 128 * 1_024,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct McpConfig {
@@ -347,6 +367,7 @@ pub struct Config {
     pub model: ModelConfig,
     pub agent: AgentConfig,
     pub cache: CacheConfig,
+    pub processes: ProcessesConfig,
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub commands: CommandsConfig,
@@ -453,6 +474,15 @@ impl Config {
         }
         if self.agent.command_output_bytes < 1_024 {
             bail!("agent.command_output_bytes must be at least 1024");
+        }
+        if !(1..=32).contains(&self.processes.max_processes) {
+            bail!("processes.max_processes must be between 1 and 32");
+        }
+        if !(1..=86_400).contains(&self.processes.max_runtime_seconds) {
+            bail!("processes.max_runtime_seconds must be between 1 and 86400");
+        }
+        if !(4 * 1_024..=16 * 1_024 * 1_024).contains(&self.processes.max_output_bytes) {
+            bail!("processes.max_output_bytes must be between 4096 and 16777216");
         }
         if self.mcp.servers.len() > 16 {
             bail!("mcp cannot configure more than 16 servers");
@@ -853,6 +883,25 @@ mod tests {
             },
         );
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn background_process_limits_are_bounded() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+
+        config.processes.max_processes = 0;
+        assert!(config.validate().is_err());
+        config.processes.max_processes = 8;
+
+        config.processes.max_runtime_seconds = 86_401;
+        assert!(config.validate().is_err());
+        config.processes.max_runtime_seconds = 3_600;
+
+        config.processes.max_output_bytes = 4 * 1_024 - 1;
+        assert!(config.validate().is_err());
+        config.processes.max_output_bytes = 128 * 1_024;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

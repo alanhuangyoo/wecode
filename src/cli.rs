@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::agent::{Agent, Conversation, RunOptions};
 use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalEnvelope};
+use crate::background_process::BackgroundProcessManager;
 use crate::bench::{BenchOptions, run_manifest};
 use crate::cache::ResponseCache;
 use crate::chat::{ChatCommand, ChatInput, ChatShell, ChatView};
@@ -341,6 +342,7 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 approval,
                 plan: None,
                 user_input: None,
+                processes: None,
             },
         )
         .await;
@@ -373,6 +375,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let state_directory = config.agent.trajectory_directory.clone();
     let shell = ChatShell::new(&commands.commands(), &skills.skills())?;
     let view = shell.view();
+    let mut processes = create_background_process_manager(&config, &workspace, &view);
     let (mut session, mut conversation, initial_source) = match start {
         ChatStart::New => (
             ChatSession::create(
@@ -556,6 +559,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 view.warning("Message cannot be empty.")?;
             }
             ChatInput::Command(ChatCommand::New) => {
+                processes.shutdown_all().await;
                 let _ = run_hook_event(
                     &hooks,
                     HookEvent::SessionEnd,
@@ -577,6 +581,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 conversation = Conversation::default();
                 plan.clear();
                 input_queue.clear();
+                processes = create_background_process_manager(&config, &workspace, &view);
                 let started = run_hook_event(
                     &hooks,
                     HookEvent::SessionStart,
@@ -638,11 +643,18 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::Mcp) => view.show_mcp(&mcp.reports())?,
             ChatInput::Command(ChatCommand::Skills) => view.show_skills(&skills.skills())?,
             ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
+            ChatInput::Command(ChatCommand::Processes) => {
+                view.show_processes(&processes.summaries())?
+            }
+            ChatInput::Command(ChatCommand::StopProcess(process_id)) => {
+                stop_background_process(&processes, process_id, &view).await?;
+            }
             ChatInput::Command(ChatCommand::Fork(selector)) => {
                 let source_id = session.summary().id.clone();
                 let previous_session = session.summary().clone();
                 match session.fork(&state_directory, &conversation, selector.as_deref()) {
                     Ok((next_session, next_conversation)) => {
+                        processes.shutdown_all().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -659,6 +671,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        processes = create_background_process_manager(&config, &workspace, &view);
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -713,6 +726,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 let previous_session = session.summary().clone();
                 match session.rewind(&state_directory, &conversation, selector.as_deref()) {
                     Ok((next_session, next_conversation)) => {
+                        processes.shutdown_all().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -729,6 +743,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        processes = create_background_process_manager(&config, &workspace, &view);
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -773,6 +788,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     ChatSession::resume(&state_directory, &workspace, selector.as_deref());
                 match resumed {
                     Ok((next_session, next_conversation)) => {
+                        processes.shutdown_all().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -789,6 +805,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        processes = create_background_process_manager(&config, &workspace, &view);
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -914,6 +931,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &plan,
                         &user_input,
                         &mut user_input_requests,
+                        &processes,
                         &mcp,
                         &skills,
                         &commands,
@@ -981,6 +999,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
         }
     }
+    processes.shutdown_all().await;
     let _ = run_hook_event(
         &hooks,
         HookEvent::SessionEnd,
@@ -994,6 +1013,40 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     )
     .await?;
     mcp.shutdown().await;
+    Ok(())
+}
+
+fn create_background_process_manager(
+    config: &Config,
+    workspace: &Path,
+    view: &ChatView,
+) -> BackgroundProcessManager {
+    let manager = BackgroundProcessManager::new(
+        config.processes.clone(),
+        workspace.to_path_buf(),
+        config.agent.deny_dangerous_commands,
+        Some(config.model.api_key_env.clone()),
+    );
+    let event_view = view.clone();
+    manager.set_event_handler(move |event| {
+        let _ = event_view.show_process_event(&event);
+    });
+    manager
+}
+
+async fn stop_background_process(
+    processes: &BackgroundProcessManager,
+    process_id: Option<u64>,
+    view: &ChatView,
+) -> Result<()> {
+    let Some(process_id) = process_id else {
+        view.warning("Usage: /stop-process <id>")?;
+        return Ok(());
+    };
+    match processes.stop(process_id).await {
+        Ok(_) => view.notice(format!("Stopped background process #{process_id}."))?,
+        Err(error) => view.warning(error.to_string())?,
+    }
     Ok(())
 }
 
@@ -1074,6 +1127,7 @@ async fn run_active_chat_task(
     plan: &PlanState,
     user_input: &UserInputClient,
     user_input_requests: &mut tokio::sync::mpsc::UnboundedReceiver<UserInputEnvelope>,
+    processes: &BackgroundProcessManager,
     mcp: &McpManager,
     skills: &SkillCatalog,
     commands: &CommandCatalog,
@@ -1093,6 +1147,7 @@ async fn run_active_chat_task(
             approval: Some(approval.clone()),
             plan: Some(plan.clone()),
             user_input: Some(user_input.clone()),
+            processes: Some(processes.clone()),
             ..Default::default()
         },
         conversation,
@@ -1124,6 +1179,17 @@ async fn run_active_chat_task(
                     continue;
                 };
                 let input = input?;
+                match &input {
+                    ChatInput::Command(ChatCommand::Processes) => {
+                        view.show_processes(&processes.summaries())?;
+                        continue;
+                    }
+                    ChatInput::Command(ChatCommand::StopProcess(process_id)) => {
+                        stop_background_process(processes, *process_id, view).await?;
+                        continue;
+                    }
+                    _ => {}
+                }
                 if pending_approval.is_some() {
                     let decision = match &input {
                         ChatInput::Command(ChatCommand::Approve) => {
@@ -1319,6 +1385,10 @@ async fn run_active_chat_task(
                     }
                     ChatInput::Command(ChatCommand::Queue) => {
                         view.show_queue(&input_queue.snapshot())?;
+                    }
+                    ChatInput::Command(ChatCommand::Processes)
+                    | ChatInput::Command(ChatCommand::StopProcess(_)) => {
+                        unreachable!("process commands are handled before interaction dispatch")
                     }
                     ChatInput::Command(ChatCommand::Help) => view.show_help()?,
                     ChatInput::Command(ChatCommand::Approve)

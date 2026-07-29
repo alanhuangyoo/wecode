@@ -86,9 +86,6 @@ impl Executor {
     }
 
     pub async fn shell(&self, command: &str) -> Result<ExecutionResult> {
-        if self.deny_dangerous_commands {
-            reject_dangerous_command(command)?;
-        }
         self.shell_with_stdin(command, None).await
     }
 
@@ -101,11 +98,27 @@ impl Executor {
         command: &str,
         stdin: Option<&[u8]>,
     ) -> Result<ExecutionResult> {
+        let command = self.prepare_shell_command(command)?;
+        self.run(command, stdin).await
+    }
+
+    pub(crate) fn prepare_shell_command(&self, shell_command: &str) -> Result<Command> {
+        if self.deny_dangerous_commands {
+            reject_dangerous_command(shell_command)?;
+        }
         #[cfg(windows)]
-        let (program, args): (&str, &[&str]) = ("cmd", &["/D", "/S", "/C", command]);
+        let (program, args): (&str, &[&str]) = ("cmd", &["/D", "/S", "/C", shell_command]);
         #[cfg(not(windows))]
-        let (program, args): (&str, &[&str]) = ("/bin/sh", &["-lc", command]);
-        self.run(program, args, stdin).await
+        let (program, args): (&str, &[&str]) = ("/bin/sh", &["-lc", shell_command]);
+        let mut command = Command::new(program);
+        command.args(args).current_dir(&self.workspace);
+        for name in SECRET_ENV_VARS {
+            command.env_remove(name);
+        }
+        if let Some(name) = &self.extra_secret_env {
+            command.env_remove(name);
+        }
+        Ok(command)
     }
 
     pub async fn apply_patch(&self, patch: &str) -> Result<ExecutionResult> {
@@ -121,17 +134,9 @@ impl Executor {
         })
     }
 
-    async fn run(
-        &self,
-        program: &str,
-        args: &[&str],
-        stdin: Option<&[u8]>,
-    ) -> Result<ExecutionResult> {
+    async fn run(&self, mut command: Command, stdin: Option<&[u8]>) -> Result<ExecutionResult> {
         let started = Instant::now();
-        let mut command = Command::new(program);
         command
-            .args(args)
-            .current_dir(&self.workspace)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -140,16 +145,8 @@ impl Executor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for name in SECRET_ENV_VARS {
-            command.env_remove(name);
-        }
-        if let Some(name) = &self.extra_secret_env {
-            command.env_remove(name);
-        }
 
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to start {program}"))?;
+        let mut child = command.spawn().context("failed to start shell command")?;
         if let Some(input) = stdin {
             let mut child_stdin = child.stdin.take().context("child stdin unavailable")?;
             child_stdin.write_all(input).await?;

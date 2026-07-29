@@ -116,6 +116,26 @@ pub enum Action {
         #[serde(default)]
         limit: Option<usize>,
     },
+    StartProcess {
+        command: String,
+        #[serde(default)]
+        description: String,
+    },
+    ProcessStatus {
+        #[serde(default)]
+        process_id: Option<u64>,
+        #[serde(default)]
+        cursor: Option<u64>,
+    },
+    WriteProcess {
+        process_id: u64,
+        input: String,
+        #[serde(default = "default_true")]
+        newline: bool,
+    },
+    StopProcess {
+        process_id: u64,
+    },
     Finish {
         summary: String,
     },
@@ -134,6 +154,10 @@ impl Action {
             Self::RequestUserInput { .. } => "request_user_input",
             Self::McpCall { .. } => "mcp_call",
             Self::LoadSkill { .. } => "load_skill",
+            Self::StartProcess { .. } => "start_process",
+            Self::ProcessStatus { .. } => "process_status",
+            Self::WriteProcess { .. } => "write_process",
+            Self::StopProcess { .. } => "stop_process",
             Self::Finish { .. } => "finish",
         }
     }
@@ -175,6 +199,19 @@ impl Action {
             }
             Self::McpCall { tool, .. } => tool,
             Self::LoadSkill { name, path, .. } => path.as_deref().unwrap_or(name),
+            Self::StartProcess {
+                command,
+                description,
+            } => {
+                if description.is_empty() {
+                    command
+                } else {
+                    description
+                }
+            }
+            Self::ProcessStatus { .. } => "inspect background processes",
+            Self::WriteProcess { .. } => "write background process stdin",
+            Self::StopProcess { .. } => "stop background process",
             Self::Finish { summary } => summary,
         }
     }
@@ -236,6 +273,20 @@ pub(crate) fn validate_action(action: &Action) -> Result<()> {
                 bail!("skill offset and limit must be greater than zero");
             }
             Ok(())
+        }
+        Action::StartProcess { command, .. } if command.trim().is_empty() => {
+            bail!("start_process command cannot be empty")
+        }
+        Action::ProcessStatus {
+            process_id: Some(0),
+            ..
+        }
+        | Action::WriteProcess { process_id: 0, .. }
+        | Action::StopProcess { process_id: 0 } => {
+            bail!("background process ID must be greater than zero")
+        }
+        Action::WriteProcess { input, .. } if input.len() > 64 * 1_024 => {
+            bail!("background process input cannot exceed 65536 bytes")
         }
         Action::Finish { summary } if summary.trim().is_empty() => {
             bail!("finish summary cannot be empty")
@@ -324,6 +375,10 @@ fn valid_question_id(id: &str) -> bool {
 
 fn default_path() -> String {
     ".".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn strip_code_fence(input: &str) -> Option<&str> {
@@ -415,5 +470,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_and_validates_background_process_actions() {
+        assert_eq!(
+            parse_action(
+                r#"{"action":"start_process","command":"cargo watch","description":"watch tests"}"#
+            )
+            .unwrap(),
+            Action::StartProcess {
+                command: "cargo watch".into(),
+                description: "watch tests".into(),
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"action":"process_status","process_id":2,"cursor":99}"#).unwrap(),
+            Action::ProcessStatus {
+                process_id: Some(2),
+                cursor: Some(99),
+            }
+        );
+        assert!(
+            parse_action(r#"{"action":"write_process","process_id":0,"input":"hello"}"#).is_err()
+        );
+        assert!(parse_action(r#"{"action":"stop_process","process_id":0}"#).is_err());
     }
 }

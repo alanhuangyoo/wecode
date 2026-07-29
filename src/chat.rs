@@ -13,6 +13,9 @@ use rustyline::{
 use tokio::sync::mpsc;
 
 use crate::approval::ApprovalRequest;
+use crate::background_process::{
+    BackgroundProcessEvent, BackgroundProcessStatus, BackgroundProcessSummary,
+};
 use crate::commands::PromptCommand;
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, default_history_path,
@@ -46,6 +49,7 @@ pub enum ChatCommand {
     Fork(Option<String>),
     New,
     Plan,
+    Processes,
     Rename(String),
     Rewind(Option<String>),
     Resume(Option<String>),
@@ -54,6 +58,7 @@ pub enum ChatCommand {
     Skill { name: String, arguments: String },
     Skills,
     Status,
+    StopProcess(Option<u64>),
     Queue,
     Unknown { name: String, arguments: String },
 }
@@ -220,6 +225,8 @@ fn command_completions(
         ("/fork", "Fork from a checkpoint"),
         ("/rewind", "Rewind safely by forking"),
         ("/plan", "Show the current plan"),
+        ("/processes", "Show managed background processes"),
+        ("/stop-process", "Stop a managed background process"),
         ("/queue", "Show queued messages"),
         ("/clear-queue", "Clear queued messages"),
         ("/cancel", "Cancel the active task"),
@@ -340,6 +347,8 @@ impl ChatView {
              \n  {:12} Fork from now or a selected checkpoint\
              \n  {:12} Rewind safely by forking from an earlier checkpoint\
              \n  {:12} Show the current task plan\
+             \n  {:12} Show managed background processes\
+             \n  {:12} Stop a managed background process\
              \n  {:12} Steer the active task at the next model boundary\
              \n  {:12} Queue work for after the active task\
              \n  {:12} Show pending steer and follow-up messages\
@@ -371,6 +380,8 @@ impl ChatView {
             "/fork [checkpoint]",
             "/rewind [checkpoint]",
             "/plan",
+            "/processes",
+            "/stop-process <id>",
             "/steer <text>",
             "/followup <text>",
             "/queue",
@@ -443,6 +454,74 @@ impl ChatView {
         }
         output.push('\n');
         self.output.print(output)
+    }
+
+    pub fn show_processes(&self, processes: &[BackgroundProcessSummary]) -> Result<()> {
+        let mut output = format!(
+            "\n{} · {} known\n",
+            Style::new().cyan().bold().apply_to("Background processes"),
+            processes.len()
+        );
+        if processes.is_empty() {
+            output.push_str("  No managed background processes.\n\n");
+            return self.output.print(output);
+        }
+        for process in processes {
+            let exit = process
+                .exit_code
+                .map(|code| format!(" · exit {code}"))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "  #{:<3} {:9} {:>7}ms · {}{} · {} bytes\n",
+                process.process_id,
+                process.status.as_str(),
+                process.duration_ms,
+                one_line(&process.description),
+                exit,
+                process.total_output_bytes,
+            ));
+        }
+        output.push_str("\n  Stop one with /stop-process <id>.\n\n");
+        self.output.print(output)
+    }
+
+    pub fn show_process_event(&self, event: &BackgroundProcessEvent) -> Result<()> {
+        let summary = &event.summary;
+        let exit = summary
+            .exit_code
+            .map(|code| format!(" · exit {code}"))
+            .unwrap_or_default();
+        let tail = one_line(&event.output_tail);
+        let detail = format!(
+            "{} · {}ms{exit} · {}{}",
+            summary.status.as_str(),
+            summary.duration_ms,
+            summary.description,
+            if tail.is_empty() {
+                String::new()
+            } else {
+                format!("\n{tail}")
+            }
+        );
+        let tone = match summary.status {
+            BackgroundProcessStatus::Exited if summary.exit_code == Some(0) => TuiTone::Success,
+            BackgroundProcessStatus::Running => TuiTone::Normal,
+            BackgroundProcessStatus::Exited
+            | BackgroundProcessStatus::Failed
+            | BackgroundProcessStatus::Killed
+            | BackgroundProcessStatus::TimedOut => TuiTone::Warning,
+        };
+        if self
+            .output
+            .tui_entry(format!("PROCESS · {}", summary.process_id), &detail, tone)
+        {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "  process #{} · {}\n",
+            summary.process_id,
+            one_line(&detail)
+        ))
     }
 
     pub fn show_mcp(&self, reports: &[McpServerReport]) -> Result<()> {
@@ -968,7 +1047,7 @@ fn render_welcome(
     welcome_row(
         &mut output,
         width,
-        "tools      read · list · glob · grep · shell · patch · plan · ask · finish",
+        "tools      repo · shell · patch · plan · ask · managed processes · finish",
     );
     welcome_row(
         &mut output,
@@ -1040,6 +1119,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         )),
         "/queue" => ChatInput::Command(ChatCommand::Queue),
         "/plan" | "/todo" | "/todos" => ChatInput::Command(ChatCommand::Plan),
+        "/processes" | "/jobs" => ChatInput::Command(ChatCommand::Processes),
         "/rename" | "/name" => ChatInput::Command(ChatCommand::Rename(argument.to_owned())),
         "/resume" => ChatInput::Command(ChatCommand::Resume(
             (!argument.is_empty()).then(|| argument.to_owned()),
@@ -1050,6 +1130,9 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/rules" | "/instructions" => ChatInput::Command(ChatCommand::Rules),
         "/sessions" => ChatInput::Command(ChatCommand::Sessions),
         "/skills" => ChatInput::Command(ChatCommand::Skills),
+        "/stop-process" | "/process-stop" => {
+            ChatInput::Command(ChatCommand::StopProcess(argument.parse::<u64>().ok()))
+        }
         "/steer" => ChatInput::Task(argument.to_owned()),
         "/model" | "/status" => ChatInput::Command(ChatCommand::Status),
         command if command.starts_with("/skill:") => ChatInput::Command(ChatCommand::Skill {
@@ -1133,6 +1216,18 @@ mod tests {
             ChatInput::Command(ChatCommand::Rewind(None))
         );
         assert_eq!(parse_input("/plan"), ChatInput::Command(ChatCommand::Plan));
+        assert_eq!(
+            parse_input("/processes"),
+            ChatInput::Command(ChatCommand::Processes)
+        );
+        assert_eq!(
+            parse_input("/stop-process 7"),
+            ChatInput::Command(ChatCommand::StopProcess(Some(7)))
+        );
+        assert_eq!(
+            parse_input("/stop-process nope"),
+            ChatInput::Command(ChatCommand::StopProcess(None))
+        );
         assert_eq!(parse_input("/mcp"), ChatInput::Command(ChatCommand::Mcp));
         assert_eq!(
             parse_input("/hooks"),

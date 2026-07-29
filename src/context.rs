@@ -267,6 +267,44 @@ fn ingest_actions(content: &str, result: Option<&str>, facts: &mut SummaryFacts)
                     10,
                 );
             }
+            Action::StartProcess {
+                command,
+                description,
+            } => {
+                push_fact(
+                    &mut facts.other,
+                    format!(
+                        "Started background process `{}`: {}.",
+                        single_line_excerpt(&description, 120),
+                        single_line_excerpt(&command, MAX_FACT_BYTES)
+                    ),
+                    10,
+                );
+            }
+            Action::ProcessStatus { process_id, .. } => {
+                push_fact(
+                    &mut facts.other,
+                    process_id.map_or_else(
+                        || "Inspected background processes.".into(),
+                        |process_id| format!("Inspected background process `{process_id}`."),
+                    ),
+                    10,
+                );
+            }
+            Action::WriteProcess { process_id, .. } => {
+                push_fact(
+                    &mut facts.other,
+                    format!("Wrote stdin to background process `{process_id}`."),
+                    10,
+                );
+            }
+            Action::StopProcess { process_id } => {
+                push_fact(
+                    &mut facts.other,
+                    format!("Stopped background process `{process_id}`."),
+                    10,
+                );
+            }
             Action::Finish { summary } => {
                 push_fact(
                     &mut facts.other,
