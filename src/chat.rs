@@ -19,6 +19,7 @@ use crate::config::{
 use crate::input_queue::QueueSnapshot;
 use crate::instructions::InstructionSet;
 use crate::session::SessionSummary;
+use crate::tui::{self, TuiHandle, TuiMessage, TuiTone};
 use crate::ui::TerminalOutput;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +56,7 @@ pub struct ChatShell {
     follow_up_submit: Arc<AtomicBool>,
     history_path: PathBuf,
     output: TerminalOutput,
+    tui_receiver: Option<std::sync::mpsc::Receiver<TuiMessage>>,
 }
 
 #[derive(Clone)]
@@ -70,7 +72,8 @@ impl ChatShell {
             create_private_directory(parent)?;
         }
         let follow_up_submit = Arc::new(AtomicBool::new(false));
-        let mut editor = if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        let use_tui = tui::supported();
+        let mut editor = if !use_tui && io::stdin().is_terminal() && io::stdout().is_terminal() {
             let mut editor = DefaultEditor::new()?;
             if history_path.is_file() {
                 let _ = editor.load_history(&history_path);
@@ -85,18 +88,29 @@ impl ChatShell {
         } else {
             None
         };
-        let output = match editor.as_mut() {
-            Some(editor) => match editor.create_external_printer() {
-                Ok(printer) => TerminalOutput::external(Box::new(printer)),
-                Err(_) => TerminalOutput::stdout(),
-            },
-            None => TerminalOutput::stdout(),
+        let (tui_handle, tui_receiver) = if use_tui {
+            let (handle, receiver) = TuiHandle::new();
+            (Some(handle), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let output = if let Some(handle) = &tui_handle {
+            TerminalOutput::tui(handle.clone())
+        } else {
+            match editor.as_mut() {
+                Some(editor) => match editor.create_external_printer() {
+                    Ok(printer) => TerminalOutput::external(Box::new(printer)),
+                    Err(_) => TerminalOutput::stdout(),
+                },
+                None => TerminalOutput::stdout(),
+            }
         };
         Ok(Self {
             editor,
             follow_up_submit,
             history_path,
             output,
+            tui_receiver,
         })
     }
 
@@ -109,6 +123,15 @@ impl ChatShell {
 
     pub fn into_input_stream(mut self) -> mpsc::UnboundedReceiver<Result<ChatInput>> {
         let (sender, receiver) = mpsc::unbounded_channel();
+        if let Some(tui_receiver) = self.tui_receiver.take() {
+            let history_path = self.history_path.clone();
+            thread::spawn(move || {
+                if let Err(error) = tui::run(tui_receiver, sender.clone(), history_path) {
+                    let _ = sender.send(Err(error));
+                }
+            });
+            return receiver;
+        }
         thread::spawn(move || {
             loop {
                 let input = self.read_input();
@@ -175,6 +198,22 @@ impl ChatView {
         session: &SessionSummary,
         instructions: &InstructionSet,
     ) -> Result<()> {
+        if self.output.set_tui_header(
+            format!(
+                "{} · {}  |  {}",
+                config.model.provider,
+                config.model.model,
+                compact_path(workspace)
+            ),
+            format!(
+                "session {} · {} rules · {} · /help for commands",
+                short_id(&session.id),
+                instructions.files.len(),
+                protocol_name(config.model.family, config.model.wire_api)
+            ),
+        ) {
+            return Ok(());
+        }
         self.output
             .print(render_welcome(config, workspace, session, instructions))
     }
@@ -186,6 +225,9 @@ impl ChatView {
         session: &SessionSummary,
         instructions: &InstructionSet,
     ) -> Result<()> {
+        if self.output.clear_tui() {
+            return self.welcome(config, workspace, session, instructions);
+        }
         self.output.print(format!(
             "\x1b[2J\x1b[H]{}",
             render_welcome(config, workspace, session, instructions)
@@ -326,6 +368,15 @@ impl ChatView {
     }
 
     pub fn show_setup_required(&self, error: &anyhow::Error) -> Result<()> {
+        if self.output.tui_entry(
+            "SETUP REQUIRED",
+            format!(
+                "{error}\n\nRun `wecode setup` to configure a provider and store its key safely."
+            ),
+            TuiTone::Warning,
+        ) {
+            return Ok(());
+        }
         self.output.print(format!(
             "\n{}\n  {}\n\n  Run {} to configure a provider and store its key safely.\n",
             Style::new().yellow().bold().apply_to("Setup required"),
@@ -371,6 +422,18 @@ impl ChatView {
     }
 
     pub fn show_approval(&self, request: &ApprovalRequest) -> Result<()> {
+        if self.output.tui_entry(
+            "APPROVAL REQUIRED",
+            format!(
+                "{} · {} risk\n{}\n\n/approve once · /approve-session · /deny [reason]",
+                request.kind.as_str(),
+                request.risk.as_str(),
+                request.detail
+            ),
+            TuiTone::Warning,
+        ) {
+            return Ok(());
+        }
         self.output.print(format!(
             "\n{}\n  id       #{}\n  action   {}\n  risk     {}\n  summary  {}\n  detail   {}\n\n  {} allow once · {} allow session · {} deny\n\n",
             Style::new().yellow().bold().apply_to("Approval required"),
@@ -386,10 +449,22 @@ impl ChatView {
     }
 
     pub fn notice(&self, message: impl AsRef<str>) -> Result<()> {
+        if self
+            .output
+            .tui_entry("NOTICE", message.as_ref(), TuiTone::Dim)
+        {
+            return Ok(());
+        }
         self.output.print(format!("  {}\n", message.as_ref()))
     }
 
     pub fn warning(&self, message: impl AsRef<str>) -> Result<()> {
+        if self
+            .output
+            .tui_entry("WARNING", message.as_ref(), TuiTone::Warning)
+        {
+            return Ok(());
+        }
         self.output.print(format!(
             "  {} {}\n",
             Style::new().yellow().apply_to("!"),
@@ -529,7 +604,7 @@ fn truncate_chars(value: &str, width: usize) -> String {
     truncated
 }
 
-fn parse_input(line: &str) -> ChatInput {
+pub(crate) fn parse_input(line: &str) -> ChatInput {
     let (command, argument) = line
         .split_once(char::is_whitespace)
         .map(|(command, argument)| (command, argument.trim()))
@@ -571,6 +646,18 @@ fn one_line(value: &str) -> String {
 
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+fn compact_path(path: &Path) -> String {
+    let display = path.display().to_string();
+    let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().display().to_string())
+    else {
+        return display;
+    };
+    display
+        .strip_prefix(&home)
+        .map(|suffix| format!("~{suffix}"))
+        .unwrap_or(display)
 }
 
 fn protocol_name(family: ProviderFamily, wire: WireApi) -> &'static str {

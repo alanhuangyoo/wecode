@@ -21,9 +21,9 @@ runtime.
   Messages, and Gemini `generateContent`.
 - **Reliable tools** — native `shell`, `apply_patch`, and `finish` function calls, plus a JSON
   text-action fallback for gateways without tool-call support.
-- **Purpose-built terminal UX** — conversation history, persistent follow-up context, structured
-  tool/output panels, live provider streaming, mid-run steering, queued follow-ups, cancellable
-  runs, and slash commands without a full-screen TUI.
+- **Purpose-built terminal UX** — a fast full-screen conversation timeline, persistent multiline
+  composer, structured tool/output cards, live provider streaming, mid-run steering, queued
+  follow-ups, cancellable runs, and slash commands.
 - **Durable sessions** — conversations auto-save as inspectable JSONL, can be listed or resumed,
   and retain one stable provider cache identity across follow-up turns.
 - **Repository-aware** — bounded global and hierarchical `AGENTS.md`, `CLAUDE.md`, and rules
@@ -107,8 +107,9 @@ printf '%s' "Find and fix the parser bug." | \
 ## Interactive session
 
 The interactive interface keeps follow-up context while repository mutations remain visible to the
-next turn. It separates model activity, shell commands, patches, command output, verification, and
-the final response into compact terminal panels.
+next turn. Its fixed header shows the active model, workspace, session, and protocol; the scrollable
+timeline separates your messages, model activity, shell commands, patches, output, verification,
+and final responses; and the bordered composer remains editable while the agent works.
 
 ```text
 /new         Start a fresh saved session
@@ -137,9 +138,11 @@ Sessions auto-save under `~/.wecode/sessions/chat/`. Resume outside the interact
 stored at `~/.wecode/history`. During a running turn, press `Ctrl-C` once to cancel the active
 model request or shell command and return to the prompt; edits already applied are preserved.
 The composer remains editable while the agent works: regular `Enter` steers the active task,
-`Alt-Enter` queues a follow-up, and the explicit `/steer` and `/followup` commands provide the same
-behavior in terminals that do not transmit modified Enter keys. Steering is delivered only at a
-safe model boundary; patch application is never interrupted halfway through.
+`Ctrl-J` inserts a newline, `Alt-Enter` queues a follow-up, `PageUp`/`PageDown` scroll the timeline,
+and the explicit `/steer` and `/followup` commands provide the same behavior in terminals that do
+not transmit modified Enter keys. Steering is delivered only at a safe model boundary; patch
+application is never interrupted halfway through. Set `WECODE_TUI=0` to use the plain line-oriented
+fallback in a terminal that does not support the full-screen interface.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
 depend on terminal rendering or delta events.
