@@ -20,6 +20,7 @@ const MAX_POLL_BYTES: usize = 16 * 1_024;
 const MAX_NOTIFICATION_BYTES: usize = 4 * 1_024;
 const MAX_NOTIFICATIONS: usize = 64;
 const PROCESS_TICK: Duration = Duration::from_millis(50);
+#[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(300);
 
 type ProcessEventHandler = Arc<dyn Fn(BackgroundProcessEvent) + Send + Sync>;
