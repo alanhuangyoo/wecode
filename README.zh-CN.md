@@ -29,7 +29,8 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
   让重复运行更快、更省 Token。
 - **适合跑榜**：支持非交互运行、JSONL 事件与轨迹、最终 Git Patch、验证重试和 JSONL
   批量任务。
-- **默认行为可预测**：限制最大步骤、执行时间和命令输出，并隔离 API Key、拦截明显危险命令。
+- **默认行为可预测**：限制最大步骤、执行时间和命令输出，并隔离 API Key、提供风险分级审批
+  和会话授权、拦截明显危险命令。
 
 ## 支持的模型服务
 
@@ -112,6 +113,10 @@ printf '%s' "定位并修复解析器错误。" | \
 /queue       查看待处理的 steer 和 follow-up
 /clear-queue 清空待处理消息
 /cancel      取消当前模型请求或命令
+/approve     仅允许当前待审批操作
+/approve-session
+             本会话允许相同操作
+/deny        拒绝操作并可提供原因
 /status      查看模型、工作区、缓存和上下文
 /rules       查看已加载的项目规则
 /config      查看当前配置文件
@@ -186,6 +191,7 @@ verify_retries = 2
 deny_dangerous_commands = true
 steering_mode = "one-at-a-time"
 follow_up_mode = "one-at-a-time"
+approval_policy = "on-request"
 trajectory_directory = "/path/to/wecode/sessions"
 
 [cache]
@@ -205,6 +211,26 @@ wecode run -C /path/to/repository \
 ```
 
 在 Unix 系统上，密钥文件不能允许用户组或其他用户读取，并且必须位于 Agent 工作区之外。
+
+## 权限审批
+
+Shell 命令会分为 `read-only`、`workspace-write` 和 `elevated`。交互审批会显示完整命令或
+Patch 摘要，并支持：
+
+- `/approve`：仅允许本次执行。
+- `/approve-session`：在 WeCode 退出前记住相同命令或工作区 Patch 授权。
+- `/deny [原因]`：拒绝操作，并把原因反馈给模型，让它选择更安全的方案。
+- `Ctrl-C`：取消当前运行，同时保留尚未投递的队列消息。
+
+可选策略：
+
+- `on-request`：默认；网络访问、进程控制、发布、系统包安装等 elevated 操作需要审批。
+- `untrusted`：仅自动允许已知只读操作；工作区写入和 Patch 都需要审批。
+- `never`：绝不弹出审批；除非同时使用 `--unsafe-local`，危险命令拦截仍然生效。
+
+可以用 `--approval-policy` 覆盖配置。非交互 JSONL 运行绝不会等待审批人：需要审批的操作
+会直接以拒绝结果反馈给模型。`wecode bench` 在没有显式策略时默认使用 `never`，因为
+Benchmark Worker 应由外层容器或虚拟机负责隔离。
 
 ## 接入 OpenAI 兼容网关
 

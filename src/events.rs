@@ -40,6 +40,19 @@ pub enum Event {
         description: String,
         detail: String,
     },
+    ApprovalRequested {
+        id: u64,
+        step: usize,
+        kind: String,
+        risk: String,
+        summary: String,
+        detail: String,
+    },
+    ApprovalResolved {
+        id: u64,
+        step: usize,
+        decision: String,
+    },
     ToolCompleted {
         step: usize,
         exit_code: Option<i32>,

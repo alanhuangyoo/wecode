@@ -60,6 +60,32 @@ pub enum QueueMode {
     OneAtATime,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalPolicy {
+    UnlessTrusted,
+    #[default]
+    OnRequest,
+    Never,
+}
+
+impl ApprovalPolicy {
+    pub fn requires_approval(
+        self,
+        kind: crate::approval::ApprovalKind,
+        risk: crate::approval::RiskLevel,
+    ) -> bool {
+        match self {
+            Self::Never => false,
+            Self::OnRequest => risk == crate::approval::RiskLevel::Elevated,
+            Self::UnlessTrusted => {
+                kind == crate::approval::ApprovalKind::Patch
+                    || risk != crate::approval::RiskLevel::ReadOnly
+            }
+        }
+    }
+}
+
 impl QueueMode {
     pub fn take_all(self) -> bool {
         matches!(self, Self::All)
@@ -105,6 +131,7 @@ pub struct AgentConfig {
     pub deny_dangerous_commands: bool,
     pub steering_mode: QueueMode,
     pub follow_up_mode: QueueMode,
+    pub approval_policy: ApprovalPolicy,
     pub trajectory_directory: PathBuf,
 }
 
@@ -122,6 +149,7 @@ impl Default for AgentConfig {
             deny_dangerous_commands: true,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
+            approval_policy: ApprovalPolicy::OnRequest,
             trajectory_directory: default_state_dir(),
         }
     }

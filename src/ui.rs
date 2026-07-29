@@ -237,6 +237,29 @@ impl EventSink for TerminalUi {
                 };
                 self.output.print(panel)?;
             }
+            Event::ApprovalRequested {
+                kind,
+                risk,
+                summary,
+                detail,
+                ..
+            } => {
+                self.stop_spinner();
+                if self.mode == UiMode::Run {
+                    self.output.print(render_panel(
+                        &format!("Approval · {kind} · {risk}"),
+                        &format!("{summary}\n{detail}"),
+                        PanelTone::Yellow,
+                        10,
+                    ))?;
+                }
+            }
+            Event::ApprovalResolved { decision, .. } => {
+                self.output.print(format!(
+                    "  {} approval {decision}\n",
+                    Style::new().yellow().apply_to("◆")
+                ))?;
+            }
             Event::ToolCompleted {
                 exit_code,
                 duration_ms,

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalKind, RiskLevel, classify_shell};
 use crate::config::Config;
 use crate::context::{ContextWindow, Message};
 use crate::control::CancellationToken;
@@ -28,6 +29,7 @@ pub struct RunOptions {
     pub session_id: Option<String>,
     pub cancellation: Option<CancellationToken>,
     pub input_queue: Option<InputQueue>,
+    pub approval: Option<ApprovalClient>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,6 +164,7 @@ impl Agent {
         let mut steps = 0;
         let cancellation = options.cancellation.clone();
         let input_queue = options.input_queue.clone();
+        let approval = options.approval.clone();
 
         for step in 1..=self.config.agent.max_steps {
             if cancellation
@@ -295,6 +298,32 @@ impl Agent {
 
             match action {
                 Action::Shell { command, .. } => {
+                    match self
+                        .authorize(
+                            step,
+                            ApprovalKind::Shell,
+                            classify_shell(&command),
+                            "Run shell command",
+                            &command,
+                            format!("shell:{command}"),
+                            &approval,
+                            &cancellation,
+                            &recorder,
+                        )
+                        .await?
+                    {
+                        Authorization::Allowed => {}
+                        Authorization::Denied(reason) => {
+                            self.handle_permission_denial(step, &reason, &recorder, &mut messages)?;
+                            continue;
+                        }
+                        Authorization::Cancelled => {
+                            summary = "cancelled by user".into();
+                            reason = "cancelled".into();
+                            self.emit(&recorder, Event::RunCancelled { step })?;
+                            break;
+                        }
+                    }
                     let execution = executor.shell(&command);
                     let result = if let Some(cancellation) = &cancellation {
                         tokio::select! {
@@ -314,6 +343,35 @@ impl Agent {
                     self.handle_execution(step, result, &recorder, &mut messages)?;
                 }
                 Action::Patch { patch, .. } => {
+                    match self
+                        .authorize(
+                            step,
+                            ApprovalKind::Patch,
+                            RiskLevel::WorkspaceWrite,
+                            "Apply workspace patch",
+                            &action_detail(&Action::Patch {
+                                patch: patch.clone(),
+                                description: String::new(),
+                            }),
+                            "patch:workspace",
+                            &approval,
+                            &cancellation,
+                            &recorder,
+                        )
+                        .await?
+                    {
+                        Authorization::Allowed => {}
+                        Authorization::Denied(reason) => {
+                            self.handle_permission_denial(step, &reason, &recorder, &mut messages)?;
+                            continue;
+                        }
+                        Authorization::Cancelled => {
+                            summary = "cancelled by user".into();
+                            reason = "cancelled".into();
+                            self.emit(&recorder, Event::RunCancelled { step })?;
+                            break;
+                        }
+                    }
                     let result = executor.apply_patch(&patch).await;
                     self.handle_execution(step, result, &recorder, &mut messages)?;
                 }
@@ -465,6 +523,91 @@ impl Agent {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize(
+        &self,
+        step: usize,
+        kind: ApprovalKind,
+        risk: RiskLevel,
+        summary: &str,
+        detail: &str,
+        fingerprint: impl Into<String>,
+        approval: &Option<ApprovalClient>,
+        cancellation: &Option<CancellationToken>,
+        recorder: &JsonlSink,
+    ) -> Result<Authorization> {
+        if !self
+            .config
+            .agent
+            .approval_policy
+            .requires_approval(kind, risk)
+        {
+            return Ok(Authorization::Allowed);
+        }
+        let Some(approval) = approval else {
+            return Ok(Authorization::Denied(format!(
+                "{} action requires interactive approval under policy {:?}, but no approval channel is available",
+                kind.as_str(),
+                self.config.agent.approval_policy
+            )));
+        };
+        let request = approval.prepare(kind, risk, summary, detail, fingerprint.into());
+        self.emit(
+            recorder,
+            Event::ApprovalRequested {
+                id: request.id,
+                step,
+                kind: kind.as_str().into(),
+                risk: risk.as_str().into(),
+                summary: request.summary.clone(),
+                detail: request.detail.clone(),
+            },
+        )?;
+        let decision = approval.request(request.clone());
+        let decision = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(Authorization::Cancelled),
+                decision = decision => decision,
+            }
+        } else {
+            decision.await
+        };
+        self.emit(
+            recorder,
+            Event::ApprovalResolved {
+                id: request.id,
+                step,
+                decision: decision.as_str().into(),
+            },
+        )?;
+        Ok(match decision {
+            ApprovalDecision::AllowOnce | ApprovalDecision::AllowSession => Authorization::Allowed,
+            ApprovalDecision::Deny { reason } => Authorization::Denied(reason),
+        })
+    }
+
+    fn handle_permission_denial(
+        &self,
+        step: usize,
+        reason: &str,
+        recorder: &JsonlSink,
+        messages: &mut Vec<Message>,
+    ) -> Result<()> {
+        let observation = format!(
+            "PERMISSION DENIED: {reason}\nChoose a safer approach or explain why the requested operation is necessary."
+        );
+        self.emit(
+            recorder,
+            Event::ToolOutput {
+                step,
+                output: observation.clone(),
+            },
+        )?;
+        messages.push(Message::user(observation));
+        Ok(())
+    }
+
     fn deliver_steering(
         &self,
         step: usize,
@@ -521,6 +664,12 @@ impl Agent {
         self.sink.emit(&event)?;
         recorder.emit(&event)
     }
+}
+
+enum Authorization {
+    Allowed,
+    Denied(String),
+    Cancelled,
 }
 
 struct EventModelStream<'a> {

@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod approval;
 pub mod bench;
 pub mod cache;
 pub mod chat;

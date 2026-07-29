@@ -33,7 +33,8 @@ runtime.
 - **Benchmark ready** — non-interactive execution, JSONL events and trajectories, final Git patch
   output, verification retries, and a JSONL manifest runner.
 - **Predictable and safe by default** — bounded steps, timeouts, output truncation, API-key
-  isolation, and a conservative dangerous-command denylist.
+  isolation, risk-classified approvals, session grants, and a conservative dangerous-command
+  denylist.
 
 ## Supported providers
 
@@ -119,6 +120,10 @@ the final response into compact terminal panels.
 /queue       Show pending steer and follow-up messages
 /clear-queue Clear all pending messages
 /cancel      Cancel the active request or command
+/approve     Allow the pending action once
+/approve-session
+             Allow matching actions for this session
+/deny        Deny the pending action with optional feedback
 /status      Show model, workspace, cache, and context
 /rules       Show loaded project instruction files
 /config      Show the active config path
@@ -198,6 +203,7 @@ verify_retries = 2
 deny_dangerous_commands = true
 steering_mode = "one-at-a-time"
 follow_up_mode = "one-at-a-time"
+approval_policy = "on-request"
 trajectory_directory = "/path/to/wecode/sessions"
 
 [cache]
@@ -219,6 +225,29 @@ wecode run -C /path/to/repository \
 
 On Unix, key files must not be accessible by group or other users and must be located outside the
 agent workspace.
+
+## Approvals
+
+Shell commands are classified as `read-only`, `workspace-write`, or `elevated`. Interactive
+approval requests include the exact command or patch summary and support:
+
+- `/approve` — allow this invocation once.
+- `/approve-session` — remember the matching command or workspace-patch grant until WeCode exits.
+- `/deny [reason]` — reject it and return the reason to the model so it can choose a safer approach.
+- `Ctrl-C` — cancel the active run while leaving undelivered queue items intact.
+
+Available policies are:
+
+- `on-request` — default; ask for elevated operations such as network access, process control,
+  publishing, or system package installation.
+- `untrusted` — auto-approve only known read operations; ask before workspace writes and patches.
+- `never` — never prompt. The dangerous-command denylist still applies unless `--unsafe-local` is
+  also selected.
+
+Override the policy with `--approval-policy`. Non-interactive JSONL runs never wait for a reviewer:
+an action that requires approval is returned to the model as denied. `wecode bench` defaults to
+`never` unless a policy is explicitly supplied, because benchmark workers are expected to provide
+their own container or VM isolation.
 
 ## Custom OpenAI-compatible gateways
 

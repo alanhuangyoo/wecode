@@ -18,6 +18,9 @@ Interactive shell -> append-only session log -> resume / follow-up context
         |
         v
 Composer -> steer queue (next model boundary) / follow-up queue (next turn)
+        |
+        v
+Approval broker -> allow once / session grant / deny with feedback
 ```
 
 ## Runtime boundaries
@@ -38,6 +41,9 @@ Composer -> steer queue (next model boundary) / follow-up queue (next turn)
   a time or coalesce all currently pending messages while preserving their order.
 - Each active run owns a cancellation token. Cancelling drops in-flight HTTP or shell futures;
   patch application remains an atomic boundary and already-applied changes are preserved.
+- Approval requests use an in-process request/response channel rather than blocking stdin inside
+  the agent. The composer remains responsive, decisions are paired by request ID, and dropped
+  reviewers resolve to denial instead of hanging the run.
 - Runtime trajectories and caches are stored outside the target repository unless explicitly
   redirected.
 
@@ -65,6 +71,17 @@ The composer accepts input continuously:
 3. A pending steer prevents a just-produced `finish` action from ending the run prematurely.
 4. Follow-up input stays separate and starts a new turn only after the active run finishes.
 5. Cancellation preserves both applied workspace changes and undelivered queued input.
+
+## Permission boundaries
+
+The command classifier distinguishes known read operations, workspace mutations, and elevated
+operations. Policy evaluation happens after the model action is recorded but before execution.
+Denied actions become tool observations, allowing the model to recover without ending the turn.
+Session grants are fingerprinted in memory and never silently persisted to a repository.
+
+Machine-oriented paths never block on a terminal prompt. JSONL runs deny approval-required actions
+when no reviewer is attached; the benchmark manifest runner defaults to `never` and relies on the
+outer benchmark sandbox. The executor's dangerous-command denylist remains a separate final gate.
 
 ## Provider layer
 

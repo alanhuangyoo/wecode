@@ -12,6 +12,7 @@ use rustyline::{
 };
 use tokio::sync::mpsc;
 
+use crate::approval::ApprovalRequest;
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, default_history_path,
 };
@@ -22,9 +23,12 @@ use crate::ui::TerminalOutput;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatCommand {
+    Approve,
+    ApproveSession,
     Cancel,
     ClearQueue,
     Config,
+    Deny(String),
     Help,
     History,
     New,
@@ -200,6 +204,9 @@ impl ChatView {
              \n  {:12} Show pending steer and follow-up messages\
              \n  {:12} Clear all pending messages\
              \n  {:12} Cancel the active model request or command\
+             \n  {:12} Allow a pending action once\
+             \n  {:12} Allow matching actions for this session\
+             \n  {:12} Deny a pending action with optional feedback\
              \n  {:12} Show model, workspace, cache, and context\
              \n  {:12} Show loaded project instruction files\
              \n  {:12} Show the active config path\
@@ -218,6 +225,9 @@ impl ChatView {
             "/queue",
             "/clear-queue",
             "/cancel",
+            "/approve",
+            "/approve-session",
+            "/deny [reason]",
             "/status",
             "/rules",
             "/config",
@@ -357,6 +367,21 @@ impl ChatView {
         self.output.print(format!(
             "  {} queued {kind} #{id} · {pending} pending\n",
             Style::new().cyan().apply_to("↳")
+        ))
+    }
+
+    pub fn show_approval(&self, request: &ApprovalRequest) -> Result<()> {
+        self.output.print(format!(
+            "\n{}\n  id       #{}\n  action   {}\n  risk     {}\n  summary  {}\n  detail   {}\n\n  {} allow once · {} allow session · {} deny\n\n",
+            Style::new().yellow().bold().apply_to("Approval required"),
+            request.id,
+            request.kind.as_str(),
+            request.risk.as_str(),
+            request.summary,
+            one_line(&request.detail),
+            Style::new().cyan().apply_to("/approve"),
+            Style::new().cyan().apply_to("/approve-session"),
+            Style::new().cyan().apply_to("/deny [reason]"),
         ))
     }
 
@@ -511,10 +536,15 @@ fn parse_input(line: &str) -> ChatInput {
         .unwrap_or((line, ""));
     match command {
         "/quit" | "/exit" => ChatInput::Exit,
+        "/approve" | "/allow" => ChatInput::Command(ChatCommand::Approve),
+        "/approve-session" | "/allow-session" | "/always" => {
+            ChatInput::Command(ChatCommand::ApproveSession)
+        }
         "/cancel" | "/stop" => ChatInput::Command(ChatCommand::Cancel),
         "/clear-queue" => ChatInput::Command(ChatCommand::ClearQueue),
         "/clear" | "/new" => ChatInput::Command(ChatCommand::New),
         "/config" => ChatInput::Command(ChatCommand::Config),
+        "/deny" | "/reject" => ChatInput::Command(ChatCommand::Deny(argument.to_owned())),
         "/followup" | "/follow-up" | "/later" => ChatInput::FollowUp(argument.to_owned()),
         "/help" | "/?" => ChatInput::Command(ChatCommand::Help),
         "/history" => ChatInput::Command(ChatCommand::History),
@@ -597,6 +627,14 @@ mod tests {
         assert_eq!(
             parse_input("/cancel"),
             ChatInput::Command(ChatCommand::Cancel)
+        );
+        assert_eq!(
+            parse_input("/approve-session"),
+            ChatInput::Command(ChatCommand::ApproveSession)
+        );
+        assert_eq!(
+            parse_input("/deny no network"),
+            ChatInput::Command(ChatCommand::Deny("no network".into()))
         );
         assert_eq!(parse_input("/quit"), ChatInput::Exit);
         assert_eq!(

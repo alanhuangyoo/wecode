@@ -7,8 +7,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Notify;
 use wecode::agent::{Agent, Conversation, RunOptions};
+use wecode::approval::{ApprovalClient, ApprovalDecision};
 use wecode::cache::ResponseCache;
-use wecode::config::{CacheConfig, Config};
+use wecode::config::{ApprovalPolicy, CacheConfig, Config};
 use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
 use wecode::input_queue::InputQueue;
@@ -500,6 +501,104 @@ async fn steering_arriving_during_sampling_reopens_the_active_run() {
             .unwrap()
             .iter()
             .any(|event| matches!(event, Event::SteeringDelivered { step: 1, count: 1 }))
+    );
+}
+
+#[tokio::test]
+async fn denied_elevated_command_is_returned_to_the_model() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::Shell {
+                command: "curl https://example.com".into(),
+                description: "fetch remote data".into(),
+            },
+            Action::Finish {
+                summary: "used a safer approach".into(),
+            },
+        ])),
+    };
+    let (approval, mut approvals) = ApprovalClient::channel();
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+    );
+    let run = agent.run(
+        "inspect without network access",
+        RunOptions {
+            approval: Some(approval),
+            ..Default::default()
+        },
+    );
+    tokio::pin!(run);
+    let request = tokio::select! {
+        request = approvals.recv() => request.expect("approval request"),
+        result = &mut run => panic!("run ended before approval: {result:?}"),
+    };
+    assert_eq!(request.request.detail, "curl https://example.com");
+    request.resolve(ApprovalDecision::Deny {
+        reason: "network access is not allowed".into(),
+    });
+    let result = run.await.unwrap();
+
+    assert!(result.success);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        message
+            .content
+            .contains("PERMISSION DENIED: network access is not allowed")
+    }));
+}
+
+#[tokio::test]
+async fn noninteractive_untrusted_policy_denies_workspace_write_without_hanging() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::Shell {
+                command: "printf blocked > denied.txt".into(),
+                description: "write a file".into(),
+            },
+            Action::Finish {
+                summary: "write was denied".into(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.approval_policy = ApprovalPolicy::UnlessTrusted;
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+    );
+
+    let result = agent
+        .run("try a write", RunOptions::default())
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(!temp.path().join("denied.txt").exists());
+    assert!(
+        requests.lock().unwrap()[1]
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("no approval channel is available") })
     );
 }
 

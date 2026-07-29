@@ -5,11 +5,13 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::agent::{Agent, Conversation, RunOptions};
+use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalEnvelope};
 use crate::bench::{BenchOptions, run_manifest};
 use crate::cache::ResponseCache;
 use crate::chat::{ChatCommand, ChatInput, ChatShell, ChatView};
 use crate::config::{
-    CacheMode, Config, ProviderFamily, WireApi, default_config_path, provider_preset,
+    ApprovalPolicy, CacheMode, Config, ProviderFamily, WireApi, default_config_path,
+    provider_preset,
 };
 use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
@@ -61,6 +63,23 @@ pub enum CacheModeArg {
     ReadOnly,
     ReadWrite,
     Refresh,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ApprovalPolicyArg {
+    Untrusted,
+    OnRequest,
+    Never,
+}
+
+impl From<ApprovalPolicyArg> for ApprovalPolicy {
+    fn from(value: ApprovalPolicyArg) -> Self {
+        match value {
+            ApprovalPolicyArg::Untrusted => Self::UnlessTrusted,
+            ApprovalPolicyArg::OnRequest => Self::OnRequest,
+            ApprovalPolicyArg::Never => Self::Never,
+        }
+    }
 }
 
 impl From<CacheModeArg> for CacheMode {
@@ -121,6 +140,9 @@ pub struct CommonArgs {
     /// Disable provider streaming for gateways that only support buffered responses.
     #[arg(long)]
     pub no_stream: bool,
+    /// Control when shell commands and patches require user approval.
+    #[arg(long, value_enum)]
+    pub approval_policy: Option<ApprovalPolicyArg>,
     /// Override the request cache mode.
     #[arg(long, value_enum)]
     pub cache_mode: Option<CacheModeArg>,
@@ -239,6 +261,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             wire_api: None,
             text_actions: false,
             no_stream: false,
+            approval_policy: None,
             cache_mode: None,
             max_steps: None,
             unsafe_local: false,
@@ -284,6 +307,16 @@ async fn run_once(args: RunArgs) -> Result<()> {
         OutputMode::Human => Box::new(TerminalUi::new()),
         OutputMode::Jsonl => Box::new(JsonlSink::stdout()),
     };
+    let (approval, approval_task) =
+        if matches!(args.output, OutputMode::Human) && io::stdin().is_terminal() {
+            let (approval, requests) = ApprovalClient::channel();
+            (
+                Some(approval),
+                Some(spawn_terminal_approval_reviewer(requests)),
+            )
+        } else {
+            (None, None)
+        };
     let mut agent = Agent::new(config, model, sink, workspace);
     let cancellation = CancellationToken::new();
     let signal_task = spawn_cancellation_signal(cancellation.clone());
@@ -298,10 +331,14 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 session_id: None,
                 cancellation: Some(cancellation),
                 input_queue: None,
+                approval,
             },
         )
         .await;
     signal_task.abort();
+    if let Some(approval_task) = approval_task {
+        approval_task.abort();
+    }
     let result = result?;
     if !result.success {
         std::process::exit(2);
@@ -336,6 +373,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     };
     let mut agent: Option<Agent> = None;
     let input_queue = InputQueue::new();
+    let (approval, mut approval_requests) = ApprovalClient::channel();
     view.welcome(&config, &workspace, session.summary(), &instruction_set)?;
     let mut inputs = shell.into_input_stream();
 
@@ -363,6 +401,11 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
             ChatInput::Command(ChatCommand::Cancel) => {
                 view.notice("No task is running.")?;
+            }
+            ChatInput::Command(ChatCommand::Approve)
+            | ChatInput::Command(ChatCommand::ApproveSession)
+            | ChatInput::Command(ChatCommand::Deny(_)) => {
+                view.notice("No approval request is pending.")?;
             }
             ChatInput::Command(ChatCommand::ClearQueue) => {
                 let cleared = input_queue.clear();
@@ -454,6 +497,8 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &workspace,
                         &instruction_set,
                         &input_queue,
+                        &approval,
+                        &mut approval_requests,
                         &mut inputs,
                         &view,
                     )
@@ -498,6 +543,8 @@ async fn run_active_chat_task(
     workspace: &Path,
     instruction_set: &instructions::InstructionSet,
     input_queue: &InputQueue,
+    approval: &ApprovalClient,
+    approval_requests: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalEnvelope>,
     inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
     view: &ChatView,
 ) -> Result<ActiveChatResult> {
@@ -510,23 +557,97 @@ async fn run_active_chat_task(
             session_id: Some(session.summary().id.clone()),
             cancellation: Some(cancellation.clone()),
             input_queue: Some(input_queue.clone()),
+            approval: Some(approval.clone()),
             ..Default::default()
         },
         conversation,
     );
     tokio::pin!(run);
     let mut exit_requested = false;
+    let mut pending_approval: Option<ApprovalEnvelope> = None;
 
     let result = loop {
         tokio::select! {
             result = &mut run => break result,
+            request = approval_requests.recv(), if pending_approval.is_none() => {
+                if let Some(request) = request {
+                    view.show_approval(&request.request)?;
+                    pending_approval = Some(request);
+                }
+            }
             input = inputs.recv() => {
                 let Some(input) = input else {
                     exit_requested = true;
                     cancellation.cancel();
                     continue;
                 };
-                match input? {
+                let input = input?;
+                if pending_approval.is_some() {
+                    let decision = match &input {
+                        ChatInput::Command(ChatCommand::Approve) => {
+                            Some(ApprovalDecision::AllowOnce)
+                        }
+                        ChatInput::Command(ChatCommand::ApproveSession) => {
+                            Some(ApprovalDecision::AllowSession)
+                        }
+                        ChatInput::Command(ChatCommand::Deny(reason)) => {
+                            Some(ApprovalDecision::Deny {
+                                reason: if reason.trim().is_empty() {
+                                    "denied by user".into()
+                                } else {
+                                    reason.clone()
+                                },
+                            })
+                        }
+                        ChatInput::Task(answer)
+                            if matches!(
+                                answer.trim().to_ascii_lowercase().as_str(),
+                                "y" | "yes" | "allow"
+                            ) =>
+                        {
+                            Some(ApprovalDecision::AllowOnce)
+                        }
+                        ChatInput::Task(answer)
+                            if matches!(
+                                answer.trim().to_ascii_lowercase().as_str(),
+                                "s" | "session" | "always"
+                            ) =>
+                        {
+                            Some(ApprovalDecision::AllowSession)
+                        }
+                        ChatInput::Task(answer)
+                            if matches!(
+                                answer.trim().to_ascii_lowercase().as_str(),
+                                "n" | "no" | "deny"
+                            ) =>
+                        {
+                            Some(ApprovalDecision::Deny {
+                                reason: "denied by user".into(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(decision) = decision {
+                        pending_approval
+                            .take()
+                            .expect("pending approval exists")
+                            .resolve(decision);
+                        continue;
+                    }
+                    if matches!(
+                        input,
+                        ChatInput::Task(_)
+                            | ChatInput::Command(ChatCommand::Approve)
+                            | ChatInput::Command(ChatCommand::ApproveSession)
+                            | ChatInput::Command(ChatCommand::Deny(_))
+                    ) {
+                        view.warning(
+                            "Resolve the approval with /approve, /approve-session, or /deny.",
+                        )?;
+                        continue;
+                    }
+                }
+                match input {
                     ChatInput::Task(text) if text.trim().is_empty() => {
                         view.warning("Steering message cannot be empty.")?;
                     }
@@ -542,6 +663,11 @@ async fn run_active_chat_task(
                         view.show_queued("follow-up", queued.id, input_queue.snapshot().len())?;
                     }
                     ChatInput::Interrupted | ChatInput::Command(ChatCommand::Cancel) => {
+                        if let Some(request) = pending_approval.take() {
+                            request.resolve(ApprovalDecision::Deny {
+                                reason: "active run cancelled".into(),
+                            });
+                        }
                         cancellation.cancel();
                     }
                     ChatInput::Exit => {
@@ -556,6 +682,11 @@ async fn run_active_chat_task(
                         view.show_queue(&input_queue.snapshot())?;
                     }
                     ChatInput::Command(ChatCommand::Help) => view.show_help()?,
+                    ChatInput::Command(ChatCommand::Approve)
+                    | ChatInput::Command(ChatCommand::ApproveSession)
+                    | ChatInput::Command(ChatCommand::Deny(_)) => {
+                        view.notice("No approval request is pending.")?;
+                    }
                     ChatInput::Command(ChatCommand::Status) => {
                         view.show_status(
                             config,
@@ -585,6 +716,16 @@ async fn run_active_chat_task(
         }
     };
     signal_task.abort();
+    if let Some(request) = pending_approval.take() {
+        request.resolve(ApprovalDecision::Deny {
+            reason: "active run ended".into(),
+        });
+    }
+    while let Ok(request) = approval_requests.try_recv() {
+        request.resolve(ApprovalDecision::Deny {
+            reason: "active run ended".into(),
+        });
+    }
     let reason = match result {
         Ok(result) => result.reason,
         Err(error) => {
@@ -637,7 +778,11 @@ fn list_sessions(args: SessionsArgs) -> Result<()> {
 }
 
 async fn bench(args: BenchArgs) -> Result<()> {
-    let (config, workspace) = resolve_config(&args.common)?;
+    let explicit_approval_policy = args.common.approval_policy.is_some();
+    let (mut config, workspace) = resolve_config(&args.common)?;
+    if !explicit_approval_policy {
+        config.agent.approval_policy = ApprovalPolicy::Never;
+    }
     run_manifest(BenchOptions {
         manifest: args.manifest,
         output: args.output,
@@ -646,6 +791,50 @@ async fn bench(args: BenchArgs) -> Result<()> {
         keep_going: args.keep_going,
     })
     .await
+}
+
+fn spawn_terminal_approval_reviewer(
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<ApprovalEnvelope>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(request) = requests.recv().await {
+            let detail = request.request.detail.clone();
+            let kind = request.request.kind.as_str();
+            let risk = request.request.risk.as_str();
+            let decision = tokio::task::spawn_blocking(move || {
+                eprintln!(
+                    "\nApproval required · {kind} · {risk}\n  {detail}\n\n  [y] allow once  [s] allow session  [n] deny"
+                );
+                loop {
+                    eprint!("approval> ");
+                    let _ = io::Write::flush(&mut io::stderr());
+                    let mut answer = String::new();
+                    if io::stdin().read_line(&mut answer).is_err() {
+                        return ApprovalDecision::Deny {
+                            reason: "failed to read approval response".into(),
+                        };
+                    }
+                    match answer.trim().to_ascii_lowercase().as_str() {
+                        "y" | "yes" | "allow" => return ApprovalDecision::AllowOnce,
+                        "s" | "session" | "always" => {
+                            return ApprovalDecision::AllowSession;
+                        }
+                        "n" | "no" | "deny" => {
+                            return ApprovalDecision::Deny {
+                                reason: "denied by user".into(),
+                            };
+                        }
+                        _ => eprintln!("Enter y, s, or n."),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| ApprovalDecision::Deny {
+                reason: "approval reviewer stopped".into(),
+            });
+            request.resolve(decision);
+        }
+    })
 }
 
 async fn cache(args: CacheArgs) -> Result<()> {
@@ -731,6 +920,9 @@ fn resolve_config(args: &CommonArgs) -> Result<(Config, PathBuf)> {
     }
     if args.no_stream {
         config.model.streaming = false;
+    }
+    if let Some(approval_policy) = args.approval_policy {
+        config.agent.approval_policy = approval_policy.into();
     }
     if let Some(cache_mode) = args.cache_mode {
         config.cache.mode = cache_mode.into();
@@ -823,6 +1015,25 @@ mod tests {
             panic!("expected run command");
         };
         assert!(args.common.text_actions);
+    }
+
+    #[test]
+    fn parses_approval_policy_override() {
+        let cli = Cli::try_parse_from([
+            "wecode",
+            "run",
+            "--approval-policy",
+            "never",
+            "fix the test",
+        ])
+        .unwrap();
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(matches!(
+            args.common.approval_policy,
+            Some(ApprovalPolicyArg::Never)
+        ));
     }
 
     #[test]
