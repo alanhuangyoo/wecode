@@ -234,6 +234,32 @@ impl Default for SkillsConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CommandsConfig {
+    pub enabled: bool,
+    pub discover_user: bool,
+    pub discover_project: bool,
+    pub compatibility_directories: bool,
+    pub paths: Vec<PathBuf>,
+    pub max_commands: usize,
+    pub max_file_bytes: usize,
+}
+
+impl Default for CommandsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            discover_user: true,
+            discover_project: true,
+            compatibility_directories: true,
+            paths: Vec::new(),
+            max_commands: 128,
+            max_file_bytes: 64 * 1_024,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -242,6 +268,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
+    pub commands: CommandsConfig,
 }
 
 impl Config {
@@ -275,6 +302,14 @@ impl Config {
         if automatically_loaded_project && !config.skills.paths.is_empty() {
             bail!(
                 "refusing external skill paths from {}; review it, then pass --config {} explicitly or move trusted skill paths to {}",
+                path.display(),
+                path.display(),
+                default_config_path().display()
+            );
+        }
+        if automatically_loaded_project && !config.commands.paths.is_empty() {
+            bail!(
+                "refusing external command paths from {}; review it, then pass --config {} explicitly or move trusted command paths to {}",
                 path.display(),
                 path.display(),
                 default_config_path().display()
@@ -349,6 +384,15 @@ impl Config {
         }
         if !(4 * 1_024..=1_024 * 1_024).contains(&self.skills.max_file_bytes) {
             bail!("skills.max_file_bytes must be between 4096 and 1048576");
+        }
+        if self.commands.paths.len() > 32 {
+            bail!("commands.paths cannot contain more than 32 entries");
+        }
+        if !(1..=512).contains(&self.commands.max_commands) {
+            bail!("commands.max_commands must be between 1 and 512");
+        }
+        if !(1_024..=1_024 * 1_024).contains(&self.commands.max_file_bytes) {
+            bail!("commands.max_file_bytes must be between 1024 and 1048576");
         }
         Ok(())
     }
@@ -654,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn project_mcp_requires_explicit_config_trust() {
+    fn active_project_extensions_require_explicit_config_trust() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(".wecode.toml");
         std::fs::write(
@@ -680,6 +724,22 @@ paths = ["../external-skills"]
         .unwrap();
         let error = Config::load(temp.path(), None).unwrap_err();
         assert!(error.to_string().contains("refusing external skill paths"));
+        assert!(Config::load(temp.path(), Some(&path)).is_ok());
+
+        std::fs::write(
+            &path,
+            r#"
+[commands]
+paths = ["../external-commands"]
+"#,
+        )
+        .unwrap();
+        let error = Config::load(temp.path(), None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing external command paths")
+        );
         assert!(Config::load(temp.path(), Some(&path)).is_ok());
     }
 

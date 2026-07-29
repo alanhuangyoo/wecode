@@ -134,6 +134,7 @@ composer remains editable while the agent works.
 /deny        Deny the pending action with optional feedback
 /status      Show model, workspace, cache, and context
 /mcp         Show connected MCP servers and tools
+/commands    Show reusable prompt commands
 /skills      Show discovered Agent Skills
 /skill:<name>
              Invoke a skill with optional arguments
@@ -280,6 +281,15 @@ compatibility_directories = true
 paths = []
 max_skills = 128
 max_file_bytes = 131072
+
+[commands]
+enabled = true
+discover_user = true
+discover_project = true
+compatibility_directories = true
+paths = []
+max_commands = 128
+max_file_bytes = 65536
 ```
 
 Provider-specific variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`
@@ -341,6 +351,24 @@ automatic model discovery. `/skills` shows scope and visibility for the active c
 
 As with MCP, Skills are interactive-only by default. `wecode run` and `wecode bench` retain the
 unchanged seven-tool benchmark profile.
+
+### Prompt commands
+
+Reusable Markdown prompts turn common workflows into slash commands without adding runtime weight
+or changing the model tool set. Put `review.md` in `~/.wecode/commands/` or
+`.wecode/commands/`, then invoke it as `/review`. WeCode also discovers compatible
+Pi, Claude Code, and OpenCode prompt directories, including `~/.pi/agent/prompts/`,
+`~/.claude/commands/`, `~/.config/opencode/{command,commands}/`, `.pi/prompts/`,
+`.claude/commands/`, and `.opencode/{command,commands}/`, when compatibility is enabled.
+
+An optional YAML frontmatter block supports `description` and `argument-hint`. Templates support
+quoted arguments, `$1`, `$2`, `$@`, `$ARGUMENTS`, defaults such as `${1:-src}`, and slices such as
+`${@:2}`. `/commands` shows the deterministic active catalog and its precedence scope. Built-in
+commands cannot be shadowed, files and catalogs have hard limits, and external `commands.paths`
+from an automatically loaded project config require explicit trust.
+
+Prompt commands are expanded only in interactive chat. Benchmark prompts, tools, and cache
+namespaces remain unchanged.
 
 ## Approvals
 

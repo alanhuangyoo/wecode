@@ -9,6 +9,7 @@ use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalEnvelope};
 use crate::bench::{BenchOptions, run_manifest};
 use crate::cache::ResponseCache;
 use crate::chat::{ChatCommand, ChatInput, ChatShell, ChatView};
+use crate::commands::CommandCatalog;
 use crate::config::{
     ApprovalPolicy, CacheMode, Config, ProviderFamily, WireApi, default_config_path,
     provider_preset,
@@ -362,6 +363,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let (config, workspace) = resolve_config(&common)?;
     let instruction_set = instructions::discover(&workspace)?;
     let skills = SkillCatalog::discover(&workspace, &config.skills)?;
+    let commands = CommandCatalog::discover(&workspace, &config.commands)?;
     let state_directory = config.agent.trajectory_directory.clone();
     let shell = ChatShell::new()?;
     let view = shell.view();
@@ -390,6 +392,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         session.summary(),
         &instruction_set,
         skills.len(),
+        commands.len(),
     )?;
     view.sync_plan(&plan.current());
     if !config.mcp.servers.is_empty() {
@@ -440,6 +443,26 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             if skills.len() == 1 { "" } else { "s" }
         ))?;
     }
+    for diagnostic in commands.diagnostics().iter().take(5) {
+        view.warning(format!(
+            "Command {}: {}",
+            diagnostic.path.display(),
+            diagnostic.message
+        ))?;
+    }
+    if commands.diagnostics().len() > 5 {
+        view.warning(format!(
+            "{} additional command diagnostics omitted; use /commands to inspect loaded commands.",
+            commands.diagnostics().len() - 5
+        ))?;
+    }
+    if !commands.is_empty() {
+        view.notice(format!(
+            "Discovered {} prompt command{} · /commands to inspect.",
+            commands.len(),
+            if commands.len() == 1 { "" } else { "s" }
+        ))?;
+    }
     let mut inputs = shell.into_input_stream();
 
     loop {
@@ -463,6 +486,25 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     }
                     Err(error) => {
                         view.warning(error.to_string())?;
+                        continue;
+                    }
+                }
+            }
+            ChatInput::Command(ChatCommand::Unknown { name, arguments }) => {
+                match commands.expand(&name, &arguments) {
+                    Ok(request) => {
+                        title_override = Some(format!(
+                            "/{name}{}",
+                            if arguments.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", arguments.trim())
+                            }
+                        ));
+                        ChatInput::Task(request)
+                    }
+                    Err(_) => {
+                        view.warning(format!("Unknown command \"/{name}\". Type /help."))?;
                         continue;
                     }
                 }
@@ -491,6 +533,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     session.summary(),
                     &instruction_set,
                     skills.len(),
+                    commands.len(),
                 )?;
                 view.notice("Started a new session.")?;
             }
@@ -517,6 +560,9 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 view.notice(format!("Cleared {} queued messages.", cleared.len()))?;
             }
             ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
+            ChatInput::Command(ChatCommand::Commands) => {
+                view.show_commands(&commands.commands())?
+            }
             ChatInput::Command(ChatCommand::Help) => view.show_help()?,
             ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
             ChatInput::Command(ChatCommand::Mcp) => view.show_mcp(&mcp.reports())?,
@@ -536,6 +582,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             session.summary(),
                             &instruction_set,
                             skills.len(),
+                            commands.len(),
                         )?;
                         view.sync_plan(&plan.current());
                         view.notice(format!(
@@ -573,6 +620,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             session.summary(),
                             &instruction_set,
                             skills.len(),
+                            commands.len(),
                         )?;
                         view.sync_plan(&plan.current());
                         view.notice(format!(
@@ -600,6 +648,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             session.summary(),
                             &instruction_set,
                             skills.len(),
+                            commands.len(),
                         )?;
                         view.sync_plan(&plan.current());
                         view.notice(format!(
@@ -626,8 +675,8 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     &input_queue.snapshot(),
                 )?;
             }
-            ChatInput::Command(ChatCommand::Unknown(command)) => {
-                view.warning(format!("Unknown command {command:?}. Type /help."))?;
+            ChatInput::Command(ChatCommand::Unknown { .. }) => {
+                unreachable!("custom commands are expanded before dispatch")
             }
             ChatInput::Command(ChatCommand::Skill { .. }) => {
                 unreachable!("skill commands are expanded before dispatch")
@@ -684,6 +733,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &mut user_input_requests,
                         &mcp,
                         &skills,
+                        &commands,
                         &mut inputs,
                         &view,
                     )
@@ -736,6 +786,7 @@ async fn run_active_chat_task(
     user_input_requests: &mut tokio::sync::mpsc::UnboundedReceiver<UserInputEnvelope>,
     mcp: &McpManager,
     skills: &SkillCatalog,
+    commands: &CommandCatalog,
     inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
     view: &ChatView,
 ) -> Result<ActiveChatResult> {
@@ -898,6 +949,10 @@ async fn run_active_chat_task(
                             view.show_mcp(&mcp.reports())?;
                             continue;
                         }
+                        ChatInput::Command(ChatCommand::Commands) => {
+                            view.show_commands(&commands.commands())?;
+                            continue;
+                        }
                         ChatInput::Command(ChatCommand::Skills) => {
                             view.show_skills(&skills.skills())?;
                             continue;
@@ -965,6 +1020,9 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Mcp) => {
                         view.show_mcp(&mcp.reports())?;
                     }
+                    ChatInput::Command(ChatCommand::Commands) => {
+                        view.show_commands(&commands.commands())?;
+                    }
                     ChatInput::Command(ChatCommand::Skills) => {
                         view.show_skills(&skills.skills())?;
                     }
@@ -979,6 +1037,23 @@ async fn run_active_chat_task(
                                 )?;
                             }
                             Err(error) => view.warning(error.to_string())?,
+                        }
+                    }
+                    ChatInput::Command(ChatCommand::Unknown { name, arguments }) => {
+                        match commands.expand(&name, &arguments) {
+                            Ok(request) => {
+                                let queued = input_queue.steer(request);
+                                view.show_queued(
+                                    "command steer",
+                                    queued.id,
+                                    input_queue.snapshot().len(),
+                                )?;
+                            }
+                            Err(_) => {
+                                view.warning(format!(
+                                    "Unknown command \"/{name}\". Type /help."
+                                ))?;
+                            }
                         }
                     }
                     ChatInput::Command(ChatCommand::Rules) => view.show_rules(instruction_set)?,
@@ -996,9 +1071,6 @@ async fn run_active_chat_task(
                     | ChatInput::Command(ChatCommand::Resume(_))
                     | ChatInput::Command(ChatCommand::Rewind(_)) => {
                         view.warning("That command is available after the active task finishes.")?;
-                    }
-                    ChatInput::Command(ChatCommand::Unknown(command)) => {
-                        view.warning(format!("Unknown command {command:?}. Type /help."))?;
                     }
                 }
             }

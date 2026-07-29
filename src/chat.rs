@@ -13,6 +13,7 @@ use rustyline::{
 use tokio::sync::mpsc;
 
 use crate::approval::ApprovalRequest;
+use crate::commands::PromptCommand;
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, default_history_path,
 };
@@ -34,6 +35,7 @@ pub enum ChatCommand {
     Checkpoint(Option<String>),
     Checkpoints,
     ClearQueue,
+    Commands,
     Config,
     Deny(String),
     Help,
@@ -51,7 +53,7 @@ pub enum ChatCommand {
     Skills,
     Status,
     Queue,
-    Unknown(String),
+    Unknown { name: String, arguments: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -210,6 +212,7 @@ impl ChatView {
         session: &SessionSummary,
         instructions: &InstructionSet,
         skill_count: usize,
+        command_count: usize,
     ) -> Result<()> {
         if self.output.set_tui_header(
             format!(
@@ -219,10 +222,11 @@ impl ChatView {
                 compact_path(workspace)
             ),
             format!(
-                "session {} · {} rules · {} skills · {} · /help for commands",
+                "session {} · {} rules · {} skills · {} commands · {} · /help",
                 short_id(&session.id),
                 instructions.files.len(),
                 skill_count,
+                command_count,
                 protocol_name(config.model.family, config.model.wire_api)
             ),
         ) {
@@ -234,6 +238,7 @@ impl ChatView {
             session,
             instructions,
             skill_count,
+            command_count,
         ))
     }
 
@@ -244,13 +249,28 @@ impl ChatView {
         session: &SessionSummary,
         instructions: &InstructionSet,
         skill_count: usize,
+        command_count: usize,
     ) -> Result<()> {
         if self.output.clear_tui() {
-            return self.welcome(config, workspace, session, instructions, skill_count);
+            return self.welcome(
+                config,
+                workspace,
+                session,
+                instructions,
+                skill_count,
+                command_count,
+            );
         }
         self.output.print(format!(
             "\x1b[2J\x1b[H]{}",
-            render_welcome(config, workspace, session, instructions, skill_count)
+            render_welcome(
+                config,
+                workspace,
+                session,
+                instructions,
+                skill_count,
+                command_count,
+            )
         ))
     }
 
@@ -276,6 +296,7 @@ impl ChatView {
              \n  {:12} Deny a pending action with optional feedback\
              \n  {:12} Show model, workspace, cache, and context\
              \n  {:12} Show MCP server and tool status\
+             \n  {:12} Show reusable prompt commands\
              \n  {:12} Show discovered skills\
              \n  {:12} Invoke a skill with optional arguments\
              \n  {:12} Show loaded project instruction files\
@@ -305,6 +326,7 @@ impl ChatView {
             "/deny [reason]",
             "/status",
             "/mcp",
+            "/commands",
             "/skills",
             "/skill:<name>",
             "/rules",
@@ -421,6 +443,34 @@ impl ChatView {
             ));
         }
         output.push_str("\n  Invoke with /skill:<name> [arguments].\n\n");
+        self.output.print(output)
+    }
+
+    pub fn show_commands(&self, commands: &[PromptCommand]) -> Result<()> {
+        let mut output = format!(
+            "\n{} · {} available\n",
+            Style::new().cyan().bold().apply_to("Prompt commands"),
+            commands.len()
+        );
+        if commands.is_empty() {
+            output.push_str("  No prompt commands discovered.\n\n");
+            return self.output.print(output);
+        }
+        for command in commands {
+            let hint = command
+                .argument_hint
+                .as_deref()
+                .map(|hint| format!("{hint} · "))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "  /{:<22} {:8} {}{}\n",
+                command.name,
+                command.scope.as_str(),
+                hint,
+                one_line(&command.description)
+            ));
+        }
+        output.push_str("\n  Invoke directly, for example /review src/.\n\n");
         self.output.print(output)
     }
 
@@ -728,6 +778,7 @@ fn render_welcome(
     session: &SessionSummary,
     instructions: &InstructionSet,
     skill_count: usize,
+    command_count: usize,
 ) -> String {
     let cyan = Style::new().cyan().bold();
     let dim = Style::new().dim();
@@ -778,6 +829,11 @@ fn render_welcome(
         &mut output,
         width,
         &format!("skills     {skill_count} discovered · /skills to inspect"),
+    );
+    welcome_row(
+        &mut output,
+        width,
+        &format!("commands   {command_count} reusable prompts · /commands to inspect"),
     );
     welcome_row(
         &mut output,
@@ -840,6 +896,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         )),
         "/checkpoints" | "/marks" => ChatInput::Command(ChatCommand::Checkpoints),
         "/clear-queue" => ChatInput::Command(ChatCommand::ClearQueue),
+        "/commands" => ChatInput::Command(ChatCommand::Commands),
         "/clear" | "/new" => ChatInput::Command(ChatCommand::New),
         "/config" => ChatInput::Command(ChatCommand::Config),
         "/deny" | "/reject" => ChatInput::Command(ChatCommand::Deny(argument.to_owned())),
@@ -868,9 +925,10 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
             name: command.trim_start_matches("/skill:").to_owned(),
             arguments: argument.to_owned(),
         }),
-        command if command.starts_with('/') => {
-            ChatInput::Command(ChatCommand::Unknown(command.to_owned()))
-        }
+        command if command.starts_with('/') => ChatInput::Command(ChatCommand::Unknown {
+            name: command.trim_start_matches('/').to_owned(),
+            arguments: argument.to_owned(),
+        }),
         _ => ChatInput::Task(line.to_owned()),
     }
 }
@@ -946,6 +1004,10 @@ mod tests {
         assert_eq!(parse_input("/plan"), ChatInput::Command(ChatCommand::Plan));
         assert_eq!(parse_input("/mcp"), ChatInput::Command(ChatCommand::Mcp));
         assert_eq!(
+            parse_input("/commands"),
+            ChatInput::Command(ChatCommand::Commands)
+        );
+        assert_eq!(
             parse_input("/skills"),
             ChatInput::Command(ChatCommand::Skills)
         );
@@ -959,6 +1021,13 @@ mod tests {
         assert_eq!(
             parse_input("/model"),
             ChatInput::Command(ChatCommand::Status)
+        );
+        assert_eq!(
+            parse_input("/review src \"error paths\""),
+            ChatInput::Command(ChatCommand::Unknown {
+                name: "review".into(),
+                arguments: "src \"error paths\"".into(),
+            })
         );
         assert_eq!(
             parse_input("/followup run tests"),

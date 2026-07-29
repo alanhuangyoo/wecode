@@ -126,6 +126,7 @@ Agent 工作时仍可继续编辑。
 /deny        拒绝操作并可提供原因
 /status      查看模型、工作区、缓存和上下文
 /mcp         查看 MCP 服务器和工具状态
+/commands    查看可复用 Prompt 命令
 /skills      查看发现的 Agent Skills
 /skill:<名称>
              调用 Skill 并可附带参数
@@ -261,6 +262,15 @@ compatibility_directories = true
 paths = []
 max_skills = 128
 max_file_bytes = 131072
+
+[commands]
+enabled = true
+discover_user = true
+discover_project = true
+compatibility_directories = true
+paths = []
+max_commands = 128
+max_file_bytes = 65536
 ```
 
 支持 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY` 等服务商变量。
@@ -314,6 +324,22 @@ Skill 会按确定顺序从以下位置发现：
 
 与 MCP 一样，Skills 默认只在交互模式启用；`wecode run` 和 `wecode bench` 继续保持不变的
 七工具 Benchmark 配置。
+
+### Prompt 命令
+
+可复用 Markdown Prompt 可以把常见工作流变成斜杠命令，不增加运行时负担，也不改变模型工具
+集合。把 `review.md` 放进 `~/.wecode/commands/` 或 `.wecode/commands/`，即可通过
+`/review` 调用。启用兼容目录时，还会发现 `~/.pi/agent/prompts/`、
+`~/.claude/commands/`、`~/.config/opencode/{command,commands}/`、`.pi/prompts/`、
+`.claude/commands/` 和 `.opencode/{command,commands}/` 等 Pi、Claude Code 与 OpenCode
+Prompt 目录。
+
+可选 YAML frontmatter 支持 `description` 和 `argument-hint`。模板支持带引号参数、`$1`、
+`$2`、`$@`、`$ARGUMENTS`、`${1:-src}` 形式的默认值和 `${@:2}` 形式的切片。
+`/commands` 会显示当前确定性目录和优先级作用域。内置命令不能被覆盖，文件与目录数量有硬
+上限；自动加载的项目配置若指定外部 `commands.paths`，必须先显式信任。
+
+Prompt 命令只在交互 Chat 中展开；Benchmark 的提示词、工具和缓存命名空间保持不变。
 
 ## 权限审批
 
