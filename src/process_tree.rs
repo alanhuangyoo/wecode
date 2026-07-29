@@ -1,4 +1,5 @@
 use std::process::Stdio;
+#[cfg(unix)]
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
