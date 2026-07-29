@@ -131,6 +131,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_parent_and_symlink_escape_paths() {
         let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
         let outside = tempfile::tempdir().unwrap();
         let parent_patch = "*** Begin Patch\n*** Add File: ../escape.txt\n+bad\n*** End Patch";
         assert!(apply_patch(temp.path(), parent_patch).await.is_err());

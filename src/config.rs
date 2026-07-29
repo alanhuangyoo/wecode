@@ -349,6 +349,9 @@ fn is_local_provider(provider: &str) -> bool {
 }
 
 fn validate_secret_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
