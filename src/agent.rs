@@ -38,6 +38,21 @@ pub struct RunResult {
     pub usage: Usage,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Conversation {
+    messages: Vec<Message>,
+}
+
+impl Conversation {
+    pub fn clear(&mut self) {
+        self.messages.clear();
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+}
+
 pub struct Agent {
     config: Config,
     model: Box<dyn Model>,
@@ -61,6 +76,24 @@ impl Agent {
     }
 
     pub async fn run(&mut self, task: &str, options: RunOptions) -> Result<RunResult> {
+        self.run_inner(task, options, None).await
+    }
+
+    pub async fn run_in_conversation(
+        &mut self,
+        task: &str,
+        options: RunOptions,
+        conversation: &mut Conversation,
+    ) -> Result<RunResult> {
+        self.run_inner(task, options, Some(conversation)).await
+    }
+
+    async fn run_inner(
+        &mut self,
+        task: &str,
+        options: RunOptions,
+        conversation: Option<&mut Conversation>,
+    ) -> Result<RunResult> {
         let started = Instant::now();
         let session_id = self.session_id(task).await;
         let recorder = self.open_recorder(&session_id)?;
@@ -86,11 +119,21 @@ impl Agent {
             self.config.agent.context_max_tokens,
             self.config.agent.context_keep_messages,
         );
-        let mut messages = vec![Message::user(initial_prompt(
-            task,
-            &self.workspace,
-            options.verify.as_deref(),
-        ))];
+        let mut messages = match conversation.as_deref() {
+            Some(conversation) if !conversation.messages.is_empty() => {
+                let mut messages = conversation.messages.clone();
+                messages.push(Message::user(follow_up_prompt(
+                    task,
+                    options.verify.as_deref(),
+                )));
+                messages
+            }
+            _ => vec![Message::user(initial_prompt(
+                task,
+                &self.workspace,
+                options.verify.as_deref(),
+            ))],
+        };
         let mut format_errors = 0;
         let mut verify_failures = 0;
         let mut total_usage = Usage::default();
@@ -196,6 +239,7 @@ impl Agent {
                     step,
                     kind: action.kind().into(),
                     description: action.description().into(),
+                    detail: action_detail(&action),
                 },
             )?;
 
@@ -276,6 +320,9 @@ impl Agent {
             cache_hits,
             usage: total_usage,
         };
+        if let Some(conversation) = conversation {
+            conversation.messages = messages;
+        }
         if let Some(path) = &options.result_out {
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
@@ -381,4 +428,37 @@ fn initial_prompt(task: &str, workspace: &std::path::Path, verify: Option<&str>)
         prompt.push('\n');
     }
     prompt
+}
+
+fn follow_up_prompt(task: &str, verify: Option<&str>) -> String {
+    let mut prompt = format!("Follow-up request:\n{task}\n");
+    if let Some(verify) = verify {
+        prompt.push_str("\nThe controller will require this final verification command to pass:\n");
+        prompt.push_str(verify);
+        prompt.push('\n');
+    }
+    prompt
+}
+
+fn action_detail(action: &Action) -> String {
+    match action {
+        Action::Shell { command, .. } => command.clone(),
+        Action::Patch { patch, .. } => {
+            let files = patch
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("*** Add File: ")
+                        .or_else(|| line.strip_prefix("*** Update File: "))
+                        .or_else(|| line.strip_prefix("*** Delete File: "))
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            if files.is_empty() {
+                "workspace patch".into()
+            } else {
+                files.join(", ")
+            }
+        }
+        Action::Finish { summary } => summary.clone(),
+    }
 }

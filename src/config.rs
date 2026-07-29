@@ -338,7 +338,15 @@ pub fn default_state_dir() -> PathBuf {
     wecode_home_dir().join("sessions")
 }
 
-fn wecode_home_dir() -> PathBuf {
+pub fn default_credentials_path() -> PathBuf {
+    wecode_home_dir().join("credentials")
+}
+
+pub fn default_history_path() -> PathBuf {
+    wecode_home_dir().join("history")
+}
+
+pub fn wecode_home_dir() -> PathBuf {
     if let Some(path) = env::var_os("WECODE_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
     }
@@ -405,6 +413,8 @@ mod tests {
         assert_eq!(default_config_path(), home.join("config.toml"));
         assert_eq!(default_cache_dir(), home.join("cache"));
         assert_eq!(default_state_dir(), home.join("sessions"));
+        assert_eq!(default_credentials_path(), home.join("credentials"));
+        assert_eq!(default_history_path(), home.join("history"));
     }
 
     #[cfg(unix)]

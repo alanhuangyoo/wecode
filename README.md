@@ -21,6 +21,8 @@ runtime.
   Messages, and Gemini `generateContent`.
 - **Reliable tools** — native `shell`, `apply_patch`, and `finish` function calls, plus a JSON
   text-action fallback for gateways without tool-call support.
+- **Purpose-built terminal UX** — conversation history, persistent follow-up context, structured
+  tool/output panels, live thinking status, and slash commands without a full-screen TUI.
 - **Cache efficient** — stable prompt prefixes, provider-side prompt-cache hints, and an on-disk
   exact-response cache for cheap, fast reruns.
 - **Benchmark ready** — non-interactive execution, JSONL events and trajectories, final Git patch
@@ -65,14 +67,17 @@ cargo build --release
 
 ## Quick start
 
-Create the user configuration, edit it, then launch WeCode:
+Run the guided setup once, then launch WeCode:
 
 ```bash
-wecode init
-${EDITOR:-vi} ~/.wecode/config.toml
+wecode setup
 cd /path/to/repository
 wecode
 ```
+
+`wecode setup` asks for provider settings and reads the API key without echoing it. The key is
+stored in `~/.wecode/credentials` with owner-only permissions and is never written into the
+repository.
 
 Alternatively, set the key expected by your provider and run a one-shot task:
 
@@ -93,19 +98,38 @@ printf '%s' "Find and fix the parser bug." | \
   wecode run -C /path/to/repository --provider openai
 ```
 
-Run `wecode` or `wecode chat` for a lightweight interactive prompt.
+## Interactive session
+
+The interactive interface keeps follow-up context while repository mutations remain visible to the
+next turn. It separates model activity, shell commands, patches, command output, verification, and
+the final response into compact terminal panels.
+
+```text
+/clear       Start a fresh conversation
+/status      Show model, workspace, cache, and context
+/config      Show the active config path
+/history     Show the history file
+/help        Show all commands
+/quit        Exit
+```
+
+Input history is stored at `~/.wecode/history`. The interactive renderer is isolated from
+`wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
+depend on terminal rendering.
 
 ## Configuration
 
-Create the user configuration:
+Use the guided setup:
 
 ```bash
-wecode init
+wecode setup
 ```
 
-This writes `~/.wecode/config.toml`. WeCode keeps its response cache in `~/.wecode/cache/` and
-trajectories in `~/.wecode/sessions/`. Set `WECODE_HOME` to move all three locations, which is
-useful in containers and benchmark workers.
+This writes `~/.wecode/config.toml` and, when a key is entered, the protected
+`~/.wecode/credentials` file. `wecode init` remains available when only a starter configuration is
+needed. WeCode keeps its response cache in `~/.wecode/cache/`, history in `~/.wecode/history`, and
+trajectories in `~/.wecode/sessions/`. Set `WECODE_HOME` to move all locations, which is useful in
+containers and benchmark workers.
 
 You can also place `.wecode.toml` in a repository or pass `--config /path/to/config.toml`.
 Repository configuration overrides the user configuration, and command-line options override the

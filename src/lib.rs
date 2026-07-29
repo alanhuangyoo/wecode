@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod bench;
 pub mod cache;
+pub mod chat;
 pub mod cli;
 pub mod config;
 pub mod context;
@@ -10,4 +11,5 @@ pub mod git;
 pub mod model;
 pub mod patch;
 pub mod protocol;
+pub mod setup;
 pub mod ui;

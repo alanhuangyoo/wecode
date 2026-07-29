@@ -33,6 +33,7 @@ pub enum Event {
         step: usize,
         kind: String,
         description: String,
+        detail: String,
     },
     ToolCompleted {
         step: usize,

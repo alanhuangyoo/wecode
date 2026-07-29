@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use wecode::agent::{Agent, RunOptions};
+use wecode::agent::{Agent, Conversation, RunOptions};
 use wecode::cache::ResponseCache;
 use wecode::config::{CacheConfig, Config};
 use wecode::events::{Event, EventSink};
@@ -39,6 +39,30 @@ impl Model for FakeModel {
 
 struct NativeFakeModel {
     responses: Mutex<VecDeque<Action>>,
+}
+
+struct CapturingModel {
+    requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    responses: Mutex<VecDeque<Action>>,
+}
+
+#[async_trait]
+impl Model for CapturingModel {
+    async fn complete(&self, request: CompletionRequest) -> Result<ModelResponse> {
+        self.requests.lock().expect("request capture").push(request);
+        let action = self
+            .responses
+            .lock()
+            .expect("fake model lock")
+            .pop_front()
+            .expect("fake model response");
+        Ok(ModelResponse {
+            text: String::new(),
+            action: Some(action),
+            usage: Usage::default(),
+            cache_hit: false,
+        })
+    }
 }
 
 #[async_trait]
@@ -157,6 +181,67 @@ async fn native_tool_action_applies_codex_patch_and_finishes() {
     assert_eq!(result.steps, 2);
     assert!(result.patch.contains("native.txt"));
     assert!(result.patch.contains("+native tools work"));
+}
+
+#[tokio::test]
+async fn interactive_conversation_preserves_follow_up_context() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::Finish {
+                summary: "first task complete".into(),
+            },
+            Action::Finish {
+                summary: "follow-up complete".into(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+    );
+    let mut conversation = Conversation::default();
+
+    agent
+        .run_in_conversation(
+            "inspect the project",
+            RunOptions::default(),
+            &mut conversation,
+        )
+        .await
+        .unwrap();
+    agent
+        .run_in_conversation(
+            "now explain the result",
+            RunOptions::default(),
+            &mut conversation,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(conversation.message_count(), 4);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("first task complete"))
+    );
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("now explain the result"))
+    );
 }
 
 fn init_fixture(directory: &std::path::Path) {

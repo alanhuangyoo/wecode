@@ -19,6 +19,8 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
   Anthropic Messages 和 Gemini `generateContent`。
 - **工具调用可靠**：原生提供 `shell`、`apply_patch`、`finish`，不支持工具调用的网关可用
   JSON 文本动作协议兜底。
+- **专门设计的终端交互**：支持对话历史、多轮上下文、工具与输出卡片、Thinking 状态和
+  斜杠命令，同时避免笨重的全屏 TUI。
 - **高缓存命中设计**：稳定的 Prompt 前缀、服务端 Prompt Cache 提示，以及本地精确响应缓存，
   让重复运行更快、更省 Token。
 - **适合跑榜**：支持非交互运行、JSONL 事件与轨迹、最终 Git Patch、验证重试和 JSONL
@@ -61,14 +63,16 @@ cargo build --release
 
 ## 快速开始
 
-创建用户配置、编辑配置，然后启动：
+首次运行引导式配置，然后启动：
 
 ```bash
-wecode init
-${EDITOR:-vi} ~/.wecode/config.toml
+wecode setup
 cd /path/to/repository
 wecode
 ```
+
+`wecode setup` 会引导配置模型服务，并以隐藏输入方式读取 API Key。密钥保存在权限仅限
+当前用户的 `~/.wecode/credentials`，不会进入项目仓库。
 
 也可以直接设置模型服务密钥，并执行一次性任务：
 
@@ -89,18 +93,35 @@ printf '%s' "定位并修复解析器错误。" | \
   wecode run -C /path/to/repository --provider openai
 ```
 
-直接运行 `wecode` 或 `wecode chat` 可进入轻量交互模式。
+## 交互会话
+
+交互模式会保留多轮上下文，下一轮也能看到前面已完成的修改。模型思考、Shell 命令、
+文件编辑、命令输出、验证和最终回答会显示在不同的终端卡片中。
+
+```text
+/clear       清空上下文，开始新对话
+/status      查看模型、工作区、缓存和上下文
+/config      查看当前配置文件
+/history     查看输入历史文件
+/help        查看所有命令
+/quit        退出
+```
+
+输入历史保存在 `~/.wecode/history`。交互渲染与 `wecode run --output jsonl`、`wecode bench`
+完全分离，因此 Benchmark 的事件输出和 Agent 执行不依赖终端 UI。
 
 ## 配置
 
-创建用户配置文件：
+使用引导式配置：
 
 ```bash
-wecode init
+wecode setup
 ```
 
-该命令会写入 `~/.wecode/config.toml`。响应缓存位于 `~/.wecode/cache/`，运行轨迹位于
-`~/.wecode/sessions/`。可以通过 `WECODE_HOME` 同时修改这三个位置，便于容器和
+该命令会写入 `~/.wecode/config.toml`；输入密钥时，还会生成受保护的
+`~/.wecode/credentials`。如果只需要初始配置，仍可使用 `wecode init`。响应缓存位于
+`~/.wecode/cache/`，输入历史位于 `~/.wecode/history`，运行轨迹位于
+`~/.wecode/sessions/`。可以通过 `WECODE_HOME` 同时修改这些位置，便于容器和
 Benchmark Worker 使用。
 
 也可以在仓库根目录放置 `.wecode.toml`，或使用 `--config /path/to/config.toml`。

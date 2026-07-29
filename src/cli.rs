@@ -1,17 +1,19 @@
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::agent::{Agent, RunOptions};
+use crate::agent::{Agent, Conversation, RunOptions};
 use crate::bench::{BenchOptions, run_manifest};
 use crate::cache::ResponseCache;
+use crate::chat::{ChatCommand, ChatInput, ChatShell};
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, provider_preset,
 };
 use crate::events::{EventSink, JsonlSink};
 use crate::model::create_model;
+use crate::setup::{SetupOptions, run as run_setup};
 use crate::ui::TerminalUi;
 
 #[derive(Debug, Parser)]
@@ -25,7 +27,7 @@ pub struct Cli {
 pub enum Command {
     /// Run one autonomous coding task.
     Run(RunArgs),
-    /// Start a small line-oriented interactive session.
+    /// Start the interactive coding-agent session.
     Chat(ChatArgs),
     /// Run tasks from a JSONL benchmark manifest.
     Bench(BenchArgs),
@@ -35,6 +37,8 @@ pub enum Command {
     Cache(CacheArgs),
     /// Write a starter config file.
     Init(InitArgs),
+    /// Configure a model provider and store its API key securely.
+    Setup(SetupArgs),
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -178,6 +182,25 @@ pub struct InitArgs {
     pub force: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Provider preset to configure.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Model name or provider model ID.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Provider base URL.
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// OpenAI-compatible wire protocol.
+    #[arg(long, value_enum)]
+    pub wire_api: Option<WireApiArg>,
+    /// Update model settings without prompting for an API key.
+    #[arg(long)]
+    pub skip_key: bool,
+}
+
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command.unwrap_or(Command::Chat(ChatArgs {
         common: CommonArgs {
@@ -204,6 +227,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Cache(args) => cache(args).await,
         Command::Init(args) => init(args),
+        Command::Setup(args) => setup(args),
     }
 }
 
@@ -252,38 +276,54 @@ async fn run_once(args: RunArgs) -> Result<()> {
 
 async fn chat(args: ChatArgs) -> Result<()> {
     let (config, workspace) = resolve_config(&args.common)?;
-    println!(
-        "wecode  {} / {}  ({})",
-        config.model.provider,
-        config.model.model,
-        workspace.display()
-    );
-    println!("Enter a task, or /quit.");
+    let mut shell = ChatShell::new()?;
+    let mut conversation = Conversation::default();
+    let mut agent: Option<Agent> = None;
+    shell.welcome(&config, &workspace);
 
     loop {
-        print!("wecode> ");
-        io::stdout().flush()?;
-        let mut task = String::new();
-        if io::stdin().read_line(&mut task)? == 0 {
-            break;
+        match shell.read_input()? {
+            ChatInput::Exit => break,
+            ChatInput::Interrupted => continue,
+            ChatInput::Command(ChatCommand::Clear) => {
+                conversation.clear();
+                shell.clear_screen(&config, &workspace)?;
+                println!("  Conversation cleared.\n");
+            }
+            ChatInput::Command(ChatCommand::Config) => shell.show_config_path(),
+            ChatInput::Command(ChatCommand::Help) => shell.show_help(),
+            ChatInput::Command(ChatCommand::History) => shell.show_history_path(),
+            ChatInput::Command(ChatCommand::Status) => {
+                shell.show_status(&config, &workspace, conversation.message_count());
+            }
+            ChatInput::Task(task) => {
+                if agent.is_none() {
+                    let api_key = match config.api_key() {
+                        Ok(api_key) => api_key,
+                        Err(error) => {
+                            shell.show_setup_required(&error);
+                            continue;
+                        }
+                    };
+                    let cache = ResponseCache::new(config.cache.clone())?;
+                    let model = create_model(&config.model, api_key, cache)?;
+                    agent = Some(Agent::new(
+                        config.clone(),
+                        model,
+                        Box::new(TerminalUi::chat()),
+                        workspace.clone(),
+                    ));
+                }
+                let result = agent
+                    .as_mut()
+                    .expect("chat agent initialized")
+                    .run_in_conversation(&task, RunOptions::default(), &mut conversation)
+                    .await;
+                if let Err(error) = result {
+                    eprintln!("error: {error:#}");
+                }
+            }
         }
-        let task = task.trim();
-        if matches!(task, "/quit" | "/exit") {
-            break;
-        }
-        if task.is_empty() {
-            continue;
-        }
-
-        let cache = ResponseCache::new(config.cache.clone())?;
-        let model = create_model(&config.model, config.api_key()?, cache)?;
-        let mut agent = Agent::new(
-            config.clone(),
-            model,
-            Box::new(TerminalUi::new()),
-            workspace.clone(),
-        );
-        agent.run(task, RunOptions::default()).await?;
     }
     Ok(())
 }
@@ -338,6 +378,22 @@ fn init(args: InitArgs) -> Result<()> {
     let contents = toml::to_string_pretty(&Config::default())?;
     std::fs::write(&path, contents)?;
     println!("wrote {}", path.display());
+    Ok(())
+}
+
+fn setup(args: SetupArgs) -> Result<()> {
+    let report = run_setup(SetupOptions {
+        provider: args.provider,
+        model: args.model,
+        base_url: args.base_url,
+        wire_api: args.wire_api.map(Into::into),
+        skip_key: args.skip_key,
+    })?;
+    println!("configured {}", report.config_path.display());
+    if let Some(path) = report.credentials_path {
+        println!("stored credentials securely at {}", path.display());
+    }
+    println!("run `wecode` inside a repository to start");
     Ok(())
 }
 
@@ -456,6 +512,28 @@ mod tests {
             panic!("expected run command");
         };
         assert!(args.common.text_actions);
+    }
+
+    #[test]
+    fn parses_non_interactive_setup() {
+        let cli = Cli::try_parse_from([
+            "wecode",
+            "setup",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-test",
+            "--wire-api",
+            "chat-completions",
+            "--skip-key",
+        ])
+        .unwrap();
+        let Some(Command::Setup(args)) = cli.command else {
+            panic!("expected setup command");
+        };
+        assert_eq!(args.provider.as_deref(), Some("openai"));
+        assert_eq!(args.model.as_deref(), Some("gpt-test"));
+        assert!(args.skip_key);
     }
 
     #[test]
