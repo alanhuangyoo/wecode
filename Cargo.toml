@@ -16,9 +16,12 @@ console = "0.16"
 crossterm = "0.28"
 directories = "6.0"
 futures-util = "0.3"
+globset = "0.4"
+ignore = "0.4"
 indicatif = "0.18"
 codex-apply-patch-lite = { path = "third_party/codex-apply-patch" }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rustyline = "16.0"
 serde = { version = "1.0", features = ["derive"] }

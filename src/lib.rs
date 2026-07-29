@@ -9,6 +9,7 @@ pub mod context;
 pub mod control;
 pub mod events;
 pub mod executor;
+pub mod file_tools;
 pub mod git;
 pub mod input_queue;
 pub mod instructions;

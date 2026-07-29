@@ -17,8 +17,8 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
 - **轻量且易分发**：单个 Rust CLI，依赖精简，不需要 Node.js 或 Python 运行时。
 - **广泛兼容模型**：支持 OpenAI Responses、OpenAI 兼容的 Chat Completions、
   Anthropic Messages 和 Gemini `generateContent`。
-- **工具调用可靠**：原生提供 `shell`、`apply_patch`、`finish`，不支持工具调用的网关可用
-  JSON 文本动作协议兜底。
+- **工具调用可靠**：原生提供限制在工作区内的 `read_file`、`list_files`、`glob`、`grep`，
+  以及 `shell`、`apply_patch`、`finish`；不支持原生工具调用的网关可用 JSON 文本动作协议兜底。
 - **专门设计的终端交互**：快速的全屏对话时间线、常驻多行输入框、工具与输出卡片、模型实时
   流式状态、运行中修正方向、后续任务队列、可取消任务和斜杠命令。
 - **持久化会话**：对话自动保存为可读的 JSONL，可列出和恢复；多轮对话使用稳定的服务端
@@ -135,6 +135,19 @@ printf '%s' "定位并修复解析器错误。" | \
 时中断。不支持全屏界面的终端可设置 `WECODE_TUI=0` 使用普通行模式。交互渲染和模型流式事件与
 `wecode run --output jsonl`、`wecode bench`
 完全分离，因此 Benchmark 的事件输出和 Agent 执行不依赖终端 UI 或流式增量事件。
+
+## 仓库工具
+
+模型无需浪费轮次拼接 Shell 命令，就能直接检查代码：
+
+- `read_file` 返回稳定的带行号区间，内容未读完时会给出下一次应使用的 offset。
+- `list_files` 进行有界目录遍历并稳定排序。
+- `glob` 使用跨平台 Glob 语法查找路径。
+- `grep` 支持正则或字面量、大小写控制、文件 Glob 和上下文行。
+
+这四个工具都限制在当前工作区内，会拒绝 symlink 逃逸、跳过 Git 元数据、遵循
+`.gitignore`、避开二进制和超大文件，并限制遍历量、行数、匹配数和输出字节。输出顺序
+确定，适合 Benchmark 轨迹复现。构建、测试、版本控制和仓库特有工作流仍可使用 `shell`。
 
 ## 项目规则
 

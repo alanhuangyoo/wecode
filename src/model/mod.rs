@@ -170,6 +170,65 @@ fn merge_adjacent_messages(messages: &[Message]) -> Vec<Message> {
 pub(crate) fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
+            "name": "read_file",
+            "description": "Read a UTF-8 text file in the workspace with stable line numbers. Use offset and limit to continue through large files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative file path."},
+                    "offset": {"type": "integer", "minimum": 1, "description": "1-indexed first line."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum lines to return."}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "list_files",
+            "description": "List a workspace directory deterministically. Respects .gitignore and excludes .git metadata.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative directory path. Defaults to the workspace root."},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Recursive depth. Defaults to 2."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum entries."}
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "glob",
+            "description": "Find workspace files by glob without spawning a shell. Respects .gitignore and returns deterministic paths.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob such as **/*.rs or *.toml."},
+                    "path": {"type": "string", "description": "Workspace-relative search root. Defaults to ."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum matches."}
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "grep",
+            "description": "Search text files in the workspace. Supports regex or literal matching, optional context, glob filtering, .gitignore, and deterministic bounded output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression or literal text."},
+                    "path": {"type": "string", "description": "Workspace-relative file or directory. Defaults to ."},
+                    "glob": {"type": "string", "description": "Optional file filter such as **/*.rs."},
+                    "literal": {"type": "boolean", "description": "Treat pattern as literal text. Defaults to false."},
+                    "ignore_case": {"type": "boolean", "description": "Case-insensitive search. Defaults to false."},
+                    "context": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Context lines before and after matches."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum matching lines."}
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "shell",
             "description": "Run one non-interactive shell command in the repository workspace.",
             "parameters": {
@@ -219,6 +278,69 @@ pub(crate) fn action_from_tool_call(name: &str, arguments: Value) -> Result<Acti
             .to_owned()
     };
     let action = match name {
+        "read_file" | "read" => Action::ReadFile {
+            path: get_string("path"),
+            offset: arguments
+                .get("offset")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            limit: arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+        },
+        "list_files" | "list_dir" | "ls" => Action::ListFiles {
+            path: {
+                let value = get_string("path");
+                if value.is_empty() { ".".into() } else { value }
+            },
+            depth: arguments
+                .get("depth")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            limit: arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+        },
+        "glob" | "find" => Action::Glob {
+            pattern: get_string("pattern"),
+            path: {
+                let value = get_string("path");
+                if value.is_empty() { ".".into() } else { value }
+            },
+            limit: arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+        },
+        "grep" | "search" => Action::Grep {
+            pattern: get_string("pattern"),
+            path: {
+                let value = get_string("path");
+                if value.is_empty() { ".".into() } else { value }
+            },
+            glob: arguments
+                .get("glob")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            literal: arguments
+                .get("literal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ignore_case: arguments
+                .get("ignore_case")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            context: arguments
+                .get("context")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            limit: arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+        },
         "shell" => Action::Shell {
             command: get_string("command"),
             description: get_string("description"),
@@ -317,7 +439,7 @@ mod tests {
 
     #[test]
     fn native_tool_definitions_map_to_actions() {
-        assert_eq!(tool_definitions().len(), 3);
+        assert_eq!(tool_definitions().len(), 7);
         assert_eq!(
             action_from_tool_call(
                 "shell",
@@ -327,6 +449,32 @@ mod tests {
             Action::Shell {
                 command: "cargo test".into(),
                 description: "verify".into(),
+            }
+        );
+        let read = action_from_tool_call(
+            "read_file",
+            json!({"path": "src/lib.rs", "offset": 4, "limit": 20}),
+        )
+        .unwrap();
+        assert_eq!(
+            read,
+            Action::ReadFile {
+                path: "src/lib.rs".into(),
+                offset: Some(4),
+                limit: Some(20),
+            }
+        );
+        let grep = action_from_tool_call("grep", json!({"pattern": "TODO"})).unwrap();
+        assert_eq!(
+            grep,
+            Action::Grep {
+                pattern: "TODO".into(),
+                path: ".".into(),
+                glob: None,
+                literal: false,
+                ignore_case: false,
+                context: None,
+                limit: None,
             }
         );
         assert!(action_from_tool_call("unknown", json!({})).is_err());

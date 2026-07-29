@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -12,6 +13,7 @@ use crate::context::{ContextWindow, Message};
 use crate::control::CancellationToken;
 use crate::events::{Event, EventSink, JsonlSink};
 use crate::executor::{ExecutionResult, Executor};
+use crate::file_tools::FileTools;
 use crate::git::{collect_patch, head_id};
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
@@ -134,6 +136,10 @@ impl Agent {
             self.config.agent.command_output_bytes,
             self.config.agent.deny_dangerous_commands,
             Some(self.config.model.api_key_env.clone()),
+        );
+        let file_tools = FileTools::new(
+            self.workspace.clone(),
+            self.config.agent.command_output_bytes,
         );
         let context = ContextWindow::new(
             self.config.agent.context_max_tokens,
@@ -297,6 +303,86 @@ impl Agent {
             )?;
 
             match action {
+                Action::ReadFile {
+                    path,
+                    offset,
+                    limit,
+                } => {
+                    let result = cancellable_execution(
+                        &cancellation,
+                        file_tools.read_file(&path, offset, limit),
+                    )
+                    .await;
+                    let Some(result) = result else {
+                        summary = "cancelled by user".into();
+                        reason = "cancelled".into();
+                        self.emit(&recorder, Event::RunCancelled { step })?;
+                        break;
+                    };
+                    self.handle_file_execution(step, result, &recorder, &mut messages)?;
+                }
+                Action::ListFiles { path, depth, limit } => {
+                    let result = cancellable_execution(
+                        &cancellation,
+                        file_tools.list_files(&path, depth, limit),
+                    )
+                    .await;
+                    let Some(result) = result else {
+                        summary = "cancelled by user".into();
+                        reason = "cancelled".into();
+                        self.emit(&recorder, Event::RunCancelled { step })?;
+                        break;
+                    };
+                    self.handle_file_execution(step, result, &recorder, &mut messages)?;
+                }
+                Action::Glob {
+                    pattern,
+                    path,
+                    limit,
+                } => {
+                    let result = cancellable_execution(
+                        &cancellation,
+                        file_tools.glob(&pattern, &path, limit),
+                    )
+                    .await;
+                    let Some(result) = result else {
+                        summary = "cancelled by user".into();
+                        reason = "cancelled".into();
+                        self.emit(&recorder, Event::RunCancelled { step })?;
+                        break;
+                    };
+                    self.handle_file_execution(step, result, &recorder, &mut messages)?;
+                }
+                Action::Grep {
+                    pattern,
+                    path,
+                    glob,
+                    literal,
+                    ignore_case,
+                    context,
+                    limit,
+                } => {
+                    let result = cancellable_execution(
+                        &cancellation,
+                        file_tools.grep(
+                            &pattern,
+                            &path,
+                            glob.as_deref(),
+                            literal,
+                            ignore_case,
+                            context,
+                            limit,
+                        ),
+                    )
+                    .await;
+                    let Some(result) = result else {
+                        summary = "cancelled by user".into();
+                        reason = "cancelled".into();
+                        self.emit(&recorder, Event::RunCancelled { step })?;
+                        break;
+                    };
+                    self.handle_file_execution(step, result, &recorder, &mut messages)?;
+                }
                 Action::Shell { command, .. } => {
                     match self
                         .authorize(
@@ -324,16 +410,8 @@ impl Agent {
                             break;
                         }
                     }
-                    let execution = executor.shell(&command);
-                    let result = if let Some(cancellation) = &cancellation {
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => None,
-                            result = execution => Some(result),
-                        }
-                    } else {
-                        Some(execution.await)
-                    };
+                    let result =
+                        cancellable_execution(&cancellation, executor.shell(&command)).await;
                     let Some(result) = result else {
                         summary = "cancelled by user".into();
                         reason = "cancelled".into();
@@ -497,6 +575,27 @@ impl Agent {
         recorder: &JsonlSink,
         messages: &mut Vec<Message>,
     ) -> Result<()> {
+        self.handle_execution_inner(step, result, recorder, messages, false)
+    }
+
+    fn handle_file_execution(
+        &self,
+        step: usize,
+        result: Result<ExecutionResult>,
+        recorder: &JsonlSink,
+        messages: &mut Vec<Message>,
+    ) -> Result<()> {
+        self.handle_execution_inner(step, result, recorder, messages, true)
+    }
+
+    fn handle_execution_inner(
+        &self,
+        step: usize,
+        result: Result<ExecutionResult>,
+        recorder: &JsonlSink,
+        messages: &mut Vec<Message>,
+        compact_output: bool,
+    ) -> Result<()> {
         let observation = match result {
             Ok(result) => {
                 self.emit(
@@ -508,7 +607,18 @@ impl Agent {
                         truncated_bytes: result.truncated_bytes,
                     },
                 )?;
-                result.observation()
+                if compact_output {
+                    let mut output = result.stdout;
+                    if !result.stderr.is_empty() {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str(&result.stderr);
+                    }
+                    output
+                } else {
+                    result.observation()
+                }
             }
             Err(error) => format!("TOOL ERROR: {error}"),
         };
@@ -730,6 +840,36 @@ fn steering_prompt(inputs: &[QueuedInput]) -> String {
 
 fn action_detail(action: &Action) -> String {
     match action {
+        Action::ReadFile {
+            path,
+            offset,
+            limit,
+        } => match (offset, limit) {
+            (Some(offset), Some(limit)) => {
+                format!(
+                    "{path}:{offset}-{}",
+                    offset.saturating_add(*limit).saturating_sub(1)
+                )
+            }
+            (Some(offset), None) => format!("{path}:{offset}"),
+            _ => path.clone(),
+        },
+        Action::ListFiles { path, depth, .. } => {
+            format!("{path} · depth {}", depth.unwrap_or(2))
+        }
+        Action::Glob { pattern, path, .. } => format!("{pattern} in {path}"),
+        Action::Grep {
+            pattern,
+            path,
+            glob,
+            ..
+        } => {
+            let filter = glob
+                .as_deref()
+                .map(|glob| format!(" · {glob}"))
+                .unwrap_or_default();
+            format!("/{pattern}/ in {path}{filter}")
+        }
         Action::Shell { command, .. } => command.clone(),
         Action::Patch { patch, .. } => {
             let files = patch
@@ -748,5 +888,23 @@ fn action_detail(action: &Action) -> String {
             }
         }
         Action::Finish { summary } => summary.clone(),
+    }
+}
+
+async fn cancellable_execution<F>(
+    cancellation: &Option<CancellationToken>,
+    execution: F,
+) -> Option<Result<ExecutionResult>>
+where
+    F: Future<Output = Result<ExecutionResult>>,
+{
+    if let Some(cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            result = execution => Some(result),
+        }
+    } else {
+        Some(execution.await)
     }
 }

@@ -563,7 +563,7 @@ fn render_welcome(
     welcome_row(
         &mut output,
         width,
-        "tools      shell · apply_patch · finish",
+        "tools      read · list · glob · grep · shell · patch · finish",
     );
     welcome_row(
         &mut output,

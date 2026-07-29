@@ -50,6 +50,7 @@ pub(crate) enum TuiMessage {
         primary: String,
         secondary: String,
     },
+    Metrics(Option<String>),
     Status(Option<String>),
 }
 
@@ -77,6 +78,10 @@ impl TuiHandle {
 
     pub fn set_status(&self, status: Option<String>) {
         let _ = self.sender.send(TuiMessage::Status(status));
+    }
+
+    pub fn set_metrics(&self, metrics: Option<String>) {
+        let _ = self.sender.send(TuiMessage::Metrics(metrics));
     }
 }
 
@@ -163,12 +168,18 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
             }
             Ok(TuiMessage::Clear) => {
                 state.transcript.clear();
+                state.metrics = None;
                 state.scroll = 0;
+                state.status = None;
                 changed = true;
             }
             Ok(TuiMessage::Header { primary, secondary }) => {
                 state.header_primary = primary;
                 state.header_secondary = secondary;
+                changed = true;
+            }
+            Ok(TuiMessage::Metrics(metrics)) => {
+                state.metrics = metrics;
                 changed = true;
             }
             Ok(TuiMessage::Status(status)) => {
@@ -239,6 +250,7 @@ struct TuiState {
     header_secondary: String,
     history: Vec<String>,
     history_index: Option<usize>,
+    metrics: Option<String>,
     scroll: u16,
     status: Option<String>,
     transcript: Vec<TranscriptEntry>,
@@ -252,6 +264,7 @@ impl TuiState {
             header_secondary: "Lightweight coding agent".into(),
             history,
             history_index: None,
+            metrics: None,
             scroll: 0,
             status: None,
             transcript: Vec::new(),
@@ -707,7 +720,7 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     } else {
-        let spans = vec![
+        let mut spans = vec![
             key(" Enter "),
             hint("send"),
             separator(),
@@ -716,10 +729,16 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
             separator(),
             key(" Alt-Enter "),
             hint("follow-up"),
-            separator(),
-            key(" / "),
-            hint("commands"),
         ];
+        if let Some(metrics) = &state.metrics {
+            spans.push(Span::raw("    "));
+            spans.push(Span::styled(
+                truncate(metrics, area.width.saturating_sub(62) as usize),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            spans.extend([separator(), key(" / "), hint("commands")]);
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 }
@@ -895,6 +914,7 @@ mod tests {
         state.header_secondary = "session abc123 · 2 rules · chat-completions".into();
         state.append_user("修复失败的测试");
         state.append_entry("RUN".into(), "cargo test".into(), TuiTone::Normal);
+        state.metrics = Some("1.2k in · 80 out · 900 cached".into());
         terminal.draw(|frame| draw(frame, &mut state)).unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -909,5 +929,6 @@ mod tests {
         assert!(rendered.contains('测'));
         assert!(rendered.contains("Message"));
         assert!(rendered.contains("Alt-Enter"));
+        assert!(rendered.contains("cached"));
     }
 }

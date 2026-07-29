@@ -19,8 +19,9 @@ runtime.
   runtime.
 - **Broad model support** — OpenAI Responses, OpenAI-compatible Chat Completions, Anthropic
   Messages, and Gemini `generateContent`.
-- **Reliable tools** — native `shell`, `apply_patch`, and `finish` function calls, plus a JSON
-  text-action fallback for gateways without tool-call support.
+- **Reliable tools** — workspace-confined `read_file`, `list_files`, `glob`, and `grep`, plus
+  `shell`, `apply_patch`, and `finish`; every action also has a JSON text fallback for gateways
+  without native tool calls.
 - **Purpose-built terminal UX** — a fast full-screen conversation timeline, persistent multiline
   composer, structured tool/output cards, live provider streaming, mid-run steering, queued
   follow-ups, cancellable runs, and slash commands.
@@ -146,6 +147,20 @@ fallback in a terminal that does not support the full-screen interface.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
 depend on terminal rendering or delta events.
+
+## Repository tools
+
+Models can inspect code without spending turns constructing shell commands:
+
+- `read_file` returns stable, numbered line ranges and an actionable next offset when more remains.
+- `list_files` performs bounded directory traversal with deterministic sorting.
+- `glob` finds paths using portable glob syntax.
+- `grep` supports regex or literal search, case control, file globs, and context lines.
+
+All four tools are confined to the active workspace, reject symlink escapes, skip Git metadata,
+respect `.gitignore`, avoid binary and oversized files, and bound traversal, lines, matches, and
+bytes. Their output is deterministic for benchmark trajectories. `shell` remains available for
+builds, tests, version control, and repository-specific workflows.
 
 ## Project instructions
 

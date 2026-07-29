@@ -107,6 +107,12 @@ impl TerminalOutput {
         }
     }
 
+    pub fn set_tui_metrics(&self, metrics: Option<String>) {
+        if let TerminalOutputInner::Tui(handle) = self.inner.as_ref() {
+            handle.set_metrics(metrics);
+        }
+    }
+
     pub fn tui_entry(
         &self,
         label: impl Into<String>,
@@ -265,10 +271,8 @@ impl EventSink for TerminalUi {
                     compact_number(usage.output_tokens),
                     compact_number(usage.cache_read_tokens),
                 );
-                if self
-                    .output
-                    .tui_entry(format!("STEP {step}"), &metrics, TuiTone::Dim)
-                {
+                if self.output.is_tui() {
+                    self.output.set_tui_metrics(Some(metrics));
                     return Ok(());
                 }
                 self.output.print(format!(
@@ -288,6 +292,10 @@ impl EventSink for TerminalUi {
                 self.stop_spinner();
                 if self.output.is_tui() {
                     let (label, text, tone) = match kind.as_str() {
+                        "read_file" => ("READ".into(), detail.to_owned(), TuiTone::Normal),
+                        "list_files" => ("LIST".into(), detail.to_owned(), TuiTone::Normal),
+                        "glob" => ("GLOB".into(), detail.to_owned(), TuiTone::Normal),
+                        "grep" => ("GREP".into(), detail.to_owned(), TuiTone::Normal),
                         "shell" => (
                             format!("RUN · {description}"),
                             detail.to_owned(),
@@ -357,6 +365,9 @@ impl EventSink for TerminalUi {
                 truncated_bytes,
                 ..
             } => {
+                if self.output.is_tui() && *exit_code == Some(0) && *truncated_bytes == 0 {
+                    return Ok(());
+                }
                 let status = match exit_code {
                     Some(0) => Style::new().green().apply_to("exit 0").to_string(),
                     Some(code) => Style::new()
@@ -482,9 +493,16 @@ impl EventSink for TerminalUi {
                 duration_ms,
                 patch_bytes,
                 cache_hits,
+                usage,
                 ..
             } => {
                 self.stop_spinner();
+                self.output.set_tui_metrics(Some(format!(
+                    "{} in · {} out · {} cached",
+                    compact_number(usage.input_tokens),
+                    compact_number(usage.output_tokens),
+                    compact_number(usage.cache_read_tokens),
+                )));
                 let marker = if *success {
                     Style::new().green().bold().apply_to("✓ Done")
                 } else {

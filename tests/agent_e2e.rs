@@ -264,6 +264,85 @@ async fn native_tool_action_applies_codex_patch_and_finishes() {
 }
 
 #[tokio::test]
+async fn first_class_file_tools_feed_bounded_observations_back_to_the_model() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn benchmark_ready() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let sink = CapturingSink::default();
+    let events = sink.events.clone();
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::ListFiles {
+                path: ".".into(),
+                depth: Some(2),
+                limit: Some(100),
+            },
+            Action::Grep {
+                pattern: "benchmark_ready".into(),
+                path: ".".into(),
+                glob: Some("**/*.rs".into()),
+                literal: true,
+                ignore_case: false,
+                context: Some(1),
+                limit: Some(20),
+            },
+            Action::ReadFile {
+                path: "src/lib.rs".into(),
+                offset: Some(1),
+                limit: Some(20),
+            },
+            Action::Finish {
+                summary: "inspected the project with first-class file tools".into(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(model),
+        Box::new(sink),
+        temp.path().canonicalize().unwrap(),
+    );
+
+    let result = agent
+        .run("inspect the benchmark helper", RunOptions::default())
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.steps, 4);
+    let requests = requests.lock().unwrap();
+    assert!(requests[1].messages.iter().any(|message| {
+        message.content.contains("directory: .") && message.content.contains("src/lib.rs")
+    }));
+    assert!(requests[2].messages.iter().any(|message| {
+        message
+            .content
+            .contains("src/lib.rs:1:pub fn benchmark_ready()")
+    }));
+    assert!(requests[3].messages.iter().any(|message| {
+        message.content.contains("lines: 1-3 of 3") && message.content.contains("     2\t    true")
+    }));
+    let events = events.lock().unwrap();
+    for expected in ["list_files", "grep", "read_file"] {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Action { kind, .. } if kind == expected))
+        );
+    }
+}
+
+#[tokio::test]
 async fn interactive_conversation_preserves_follow_up_context() {
     let temp = tempfile::tempdir().unwrap();
     init_fixture(temp.path());

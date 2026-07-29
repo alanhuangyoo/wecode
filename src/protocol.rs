@@ -4,6 +4,47 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
+    #[serde(alias = "read")]
+    ReadFile {
+        path: String,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    #[serde(alias = "list_dir", alias = "ls")]
+    ListFiles {
+        #[serde(default = "default_path")]
+        path: String,
+        #[serde(default)]
+        depth: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    #[serde(alias = "find")]
+    Glob {
+        pattern: String,
+        #[serde(default = "default_path")]
+        path: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    #[serde(alias = "search")]
+    Grep {
+        pattern: String,
+        #[serde(default = "default_path")]
+        path: String,
+        #[serde(default)]
+        glob: Option<String>,
+        #[serde(default)]
+        literal: bool,
+        #[serde(default)]
+        ignore_case: bool,
+        #[serde(default)]
+        context: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     Shell {
         command: String,
         #[serde(default)]
@@ -22,6 +63,10 @@ pub enum Action {
 impl Action {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::ReadFile { .. } => "read_file",
+            Self::ListFiles { .. } => "list_files",
+            Self::Glob { .. } => "glob",
+            Self::Grep { .. } => "grep",
             Self::Shell { .. } => "shell",
             Self::Patch { .. } => "patch",
             Self::Finish { .. } => "finish",
@@ -30,6 +75,8 @@ impl Action {
 
     pub fn description(&self) -> &str {
         match self {
+            Self::ReadFile { path, .. } | Self::ListFiles { path, .. } => path,
+            Self::Glob { pattern, .. } | Self::Grep { pattern, .. } => pattern,
             Self::Shell {
                 command,
                 description,
@@ -65,6 +112,15 @@ pub fn parse_action(response: &str) -> Result<Action> {
 
 pub(crate) fn validate_action(action: &Action) -> Result<()> {
     match action {
+        Action::ReadFile { path, .. } if path.trim().is_empty() => {
+            bail!("read_file path cannot be empty")
+        }
+        Action::Glob { pattern, .. } if pattern.trim().is_empty() => {
+            bail!("glob pattern cannot be empty")
+        }
+        Action::Grep { pattern, .. } if pattern.is_empty() => {
+            bail!("grep pattern cannot be empty")
+        }
         Action::Shell { command, .. } if command.trim().is_empty() => {
             bail!("shell command cannot be empty")
         }
@@ -74,6 +130,10 @@ pub(crate) fn validate_action(action: &Action) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+fn default_path() -> String {
+    ".".into()
 }
 
 fn strip_code_fence(input: &str) -> Option<&str> {
@@ -104,6 +164,30 @@ mod tests {
             Action::Shell {
                 command: "rg foo".into(),
                 description: "search".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_file_tool_aliases_and_defaults() {
+        assert_eq!(
+            parse_action(r#"{"action":"read","path":"src/lib.rs","offset":10}"#).unwrap(),
+            Action::ReadFile {
+                path: "src/lib.rs".into(),
+                offset: Some(10),
+                limit: None,
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"action":"search","pattern":"TODO"}"#).unwrap(),
+            Action::Grep {
+                pattern: "TODO".into(),
+                path: ".".into(),
+                glob: None,
+                literal: false,
+                ignore_case: false,
+                context: None,
+                limit: None,
             }
         );
     }
