@@ -257,6 +257,16 @@ fn ingest_actions(content: &str, result: Option<&str>, facts: &mut SummaryFacts)
                     push_fact(&mut facts.other, fact, 10);
                 }
             }
+            Action::LoadSkill { name, path, .. } => {
+                push_fact(
+                    &mut facts.other,
+                    format!(
+                        "Loaded skill `{name}` resource `{}`.",
+                        path.as_deref().unwrap_or("SKILL.md")
+                    ),
+                    10,
+                );
+            }
             Action::Finish { summary } => {
                 push_fact(
                     &mut facts.other,

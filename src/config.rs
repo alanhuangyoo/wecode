@@ -208,6 +208,32 @@ impl Default for McpServerConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    pub enabled: bool,
+    pub discover_user: bool,
+    pub discover_project: bool,
+    pub compatibility_directories: bool,
+    pub paths: Vec<PathBuf>,
+    pub max_skills: usize,
+    pub max_file_bytes: usize,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            discover_user: true,
+            discover_project: true,
+            compatibility_directories: true,
+            paths: Vec::new(),
+            max_skills: 128,
+            max_file_bytes: 128 * 1_024,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -215,6 +241,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub cache: CacheConfig,
     pub mcp: McpConfig,
+    pub skills: SkillsConfig,
 }
 
 impl Config {
@@ -240,6 +267,14 @@ impl Config {
         {
             bail!(
                 "refusing to auto-start MCP commands from {}; review it, then pass --config {} explicitly or move trusted MCP configuration to {}",
+                path.display(),
+                path.display(),
+                default_config_path().display()
+            );
+        }
+        if automatically_loaded_project && !config.skills.paths.is_empty() {
+            bail!(
+                "refusing external skill paths from {}; review it, then pass --config {} explicitly or move trusted skill paths to {}",
                 path.display(),
                 path.display(),
                 default_config_path().display()
@@ -305,6 +340,15 @@ impl Config {
                     bail!("mcp server {name:?} has invalid environment variable {env_name:?}");
                 }
             }
+        }
+        if self.skills.paths.len() > 32 {
+            bail!("skills.paths cannot contain more than 32 entries");
+        }
+        if !(1..=512).contains(&self.skills.max_skills) {
+            bail!("skills.max_skills must be between 1 and 512");
+        }
+        if !(4 * 1_024..=1_024 * 1_024).contains(&self.skills.max_file_bytes) {
+            bail!("skills.max_file_bytes must be between 4096 and 1048576");
         }
         Ok(())
     }
@@ -625,6 +669,18 @@ command = "fixture-server"
         assert!(error.to_string().contains("refusing to auto-start MCP"));
         let explicit = Config::load(temp.path(), Some(&path)).unwrap();
         assert_eq!(explicit.mcp.servers["fixture"].command, "fixture-server");
+
+        std::fs::write(
+            &path,
+            r#"
+[skills]
+paths = ["../external-skills"]
+"#,
+        )
+        .unwrap();
+        let error = Config::load(temp.path(), None).unwrap_err();
+        assert!(error.to_string().contains("refusing external skill paths"));
+        assert!(Config::load(temp.path(), Some(&path)).is_ok());
     }
 
     #[cfg(unix)]

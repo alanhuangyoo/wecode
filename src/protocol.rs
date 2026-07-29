@@ -107,6 +107,15 @@ pub enum Action {
         #[serde(default)]
         arguments: serde_json::Value,
     },
+    LoadSkill {
+        name: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     Finish {
         summary: String,
     },
@@ -124,6 +133,7 @@ impl Action {
             Self::UpdatePlan { .. } => "update_plan",
             Self::RequestUserInput { .. } => "request_user_input",
             Self::McpCall { .. } => "mcp_call",
+            Self::LoadSkill { .. } => "load_skill",
             Self::Finish { .. } => "finish",
         }
     }
@@ -164,6 +174,7 @@ impl Action {
                 }
             }
             Self::McpCall { tool, .. } => tool,
+            Self::LoadSkill { name, path, .. } => path.as_deref().unwrap_or(name),
             Self::Finish { summary } => summary,
         }
     }
@@ -206,6 +217,23 @@ pub(crate) fn validate_action(action: &Action) -> Result<()> {
             validate_mcp_component(tool, "tool")?;
             if !arguments.is_object() {
                 bail!("mcp arguments must be a JSON object");
+            }
+            Ok(())
+        }
+        Action::LoadSkill {
+            name,
+            path,
+            offset,
+            limit,
+        } => {
+            if name.trim().is_empty() {
+                bail!("skill name cannot be empty");
+            }
+            if path.as_ref().is_some_and(|path| path.trim().is_empty()) {
+                bail!("skill path cannot be empty");
+            }
+            if offset == &Some(0) || limit == &Some(0) {
+                bail!("skill offset and limit must be greater than zero");
             }
             Ok(())
         }

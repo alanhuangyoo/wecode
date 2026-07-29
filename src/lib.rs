@@ -20,6 +20,7 @@ pub mod patch;
 pub mod protocol;
 pub mod session;
 pub mod setup;
+pub mod skills;
 pub mod tool_registry;
 pub mod tui;
 pub mod ui;

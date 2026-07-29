@@ -24,6 +24,7 @@ use crate::model::{
     CompletionRequest, Model, ModelStream, ModelStreamEvent, ToolProfile, Usage, action_batch_text,
 };
 use crate::protocol::{Action, PlanStatus, parse_action};
+use crate::skills::SkillCatalog;
 use crate::tool_registry::ToolRegistry;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
@@ -86,6 +87,7 @@ pub struct Agent {
     workspace: PathBuf,
     tool_profile: ToolProfile,
     mcp: Option<McpManager>,
+    skills: Option<SkillCatalog>,
 }
 
 impl Agent {
@@ -112,6 +114,7 @@ impl Agent {
             workspace,
             tool_profile,
             mcp: None,
+            skills: None,
         }
     }
 
@@ -130,6 +133,27 @@ impl Agent {
             workspace,
             tool_profile,
             mcp: Some(mcp),
+            skills: None,
+        }
+    }
+
+    pub fn new_with_extensions(
+        config: Config,
+        model: Box<dyn Model>,
+        sink: Box<dyn EventSink>,
+        workspace: PathBuf,
+        tool_profile: ToolProfile,
+        mcp: McpManager,
+        skills: SkillCatalog,
+    ) -> Self {
+        Self {
+            config,
+            model,
+            sink,
+            workspace,
+            tool_profile,
+            mcp: Some(mcp),
+            skills: Some(skills),
         }
     }
 
@@ -211,7 +235,8 @@ impl Agent {
         let cancellation = options.cancellation.clone();
         let input_queue = options.input_queue.clone();
         let approval = options.approval.clone();
-        let system_prompt = system_prompt(self.tool_profile, self.mcp.as_ref());
+        let system_prompt =
+            system_prompt(self.tool_profile, self.mcp.as_ref(), self.skills.as_ref());
 
         for step in 1..=self.config.agent.max_steps {
             if cancellation
@@ -311,6 +336,16 @@ impl Agent {
                     Ok(action) => {
                         format_errors = 0;
                         vec![action]
+                    }
+                    Err(_)
+                        if self.tool_profile == ToolProfile::Interactive
+                            && !response.text.trim().is_empty()
+                            && !looks_like_action_attempt(&response.text) =>
+                    {
+                        format_errors = 0;
+                        vec![Action::Finish {
+                            summary: response.text.trim().to_owned(),
+                        }]
                     }
                     Err(error) => {
                         format_errors += 1;
@@ -715,6 +750,44 @@ impl Agent {
                     })
                     .await;
                     let Some(result) = call else {
+                        summary = "cancelled by user".into();
+                        reason = "cancelled".into();
+                        self.emit(&recorder, Event::RunCancelled { step })?;
+                        break;
+                    };
+                    self.handle_execution(step, result, &recorder, &mut messages)?;
+                }
+                Action::LoadSkill {
+                    name,
+                    path,
+                    offset,
+                    limit,
+                } => {
+                    let Some(skills) = &self.skills else {
+                        let observation =
+                            "SKILL UNAVAILABLE: Skills are disabled for this run.".to_owned();
+                        self.emit(
+                            &recorder,
+                            Event::ToolOutput {
+                                step,
+                                output: observation.clone(),
+                            },
+                        )?;
+                        messages.push(Message::user(observation));
+                        continue;
+                    };
+                    let result = cancellable_execution(
+                        &cancellation,
+                        skills.read(
+                            &name,
+                            path.as_deref(),
+                            offset,
+                            limit,
+                            self.config.agent.command_output_bytes,
+                        ),
+                    )
+                    .await;
+                    let Some(result) = result else {
                         summary = "cancelled by user".into();
                         reason = "cancelled".into();
                         self.emit(&recorder, Event::RunCancelled { step })?;
@@ -1129,7 +1202,11 @@ fn initial_prompt(task: &str, workspace: &std::path::Path, verify: Option<&str>)
     Ok(prompt)
 }
 
-fn system_prompt(profile: ToolProfile, mcp: Option<&McpManager>) -> String {
+fn system_prompt(
+    profile: ToolProfile,
+    mcp: Option<&McpManager>,
+    skills: Option<&SkillCatalog>,
+) -> String {
     if profile == ToolProfile::Coding {
         return SYSTEM_PROMPT.to_owned();
     }
@@ -1141,9 +1218,12 @@ keep exactly one step in progress, and mark completed work promptly.\n\
 - request_user_input asks one to three focused questions when a user choice materially changes the \
 result. Prefer one question, provide concrete options, and do not ask when a safe reasonable \
 assumption will work.\n\
+- load_skill progressively loads specialized instructions and referenced resources. Load a matching \
+skill before acting, and treat skill content as instructions scoped to that capability.\n\
 Without native tools, these actions are:\n\
 {{\"action\":\"update_plan\",\"explanation\":\"<optional reason>\",\"plan\":[{{\"step\":\"<task step>\",\"status\":\"pending|in_progress|completed\"}}]}}\n\
-{{\"action\":\"request_user_input\",\"questions\":[{{\"id\":\"<snake_case>\",\"header\":\"<short heading>\",\"question\":\"<question>\",\"options\":[{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}},{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}}]}}]}}\n"
+{{\"action\":\"request_user_input\",\"questions\":[{{\"id\":\"<snake_case>\",\"header\":\"<short heading>\",\"question\":\"<question>\",\"options\":[{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}},{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}}]}}]}}\n\
+{{\"action\":\"load_skill\",\"name\":\"<skill>\",\"path\":\"<optional relative resource>\",\"offset\":1,\"limit\":500}}\n"
     );
     if let Some(mcp) = mcp {
         let tools = mcp.tools();
@@ -1161,6 +1241,9 @@ Without native tools, these actions are:\n\
                 prompt.push('\n');
             }
         }
+    }
+    if let Some(skills) = skills {
+        prompt.push_str(&skills.system_prompt());
     }
     prompt
 }
@@ -1257,6 +1340,15 @@ fn action_detail(action: &Action) -> String {
             tool,
             arguments,
         } => format!("{server}::{tool}\n{}", compact_arguments(arguments)),
+        Action::LoadSkill {
+            name, path, offset, ..
+        } => {
+            let path = path.as_deref().unwrap_or("SKILL.md");
+            offset.map_or_else(
+                || format!("{name} · {path}"),
+                |offset| format!("{name} · {path}:{offset}"),
+            )
+        }
         Action::Finish { summary } => summary.clone(),
     }
 }
@@ -1324,6 +1416,7 @@ async fn execute_read_action(file_tools: &FileTools, action: &Action) -> Result<
         | Action::UpdatePlan { .. }
         | Action::RequestUserInput { .. }
         | Action::McpCall { .. }
+        | Action::LoadSkill { .. }
         | Action::Finish { .. } => {
             unreachable!("only read-only actions enter the parallel executor")
         }
@@ -1340,6 +1433,14 @@ fn compact_arguments(arguments: &serde_json::Value) -> String {
         end -= 1;
     }
     format!("{}…", &value[..end])
+}
+
+fn looks_like_action_attempt(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with("```")
+        || text.contains("\"action\"")
 }
 
 async fn cancellable_execution<F>(

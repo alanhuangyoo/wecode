@@ -22,6 +22,7 @@ use crate::interaction::{PlanSnapshot, UserInputRequest};
 use crate::mcp::{McpServerReport, McpServerState};
 use crate::protocol::PlanStatus;
 use crate::session::{SessionCheckpoint, SessionSummary};
+use crate::skills::Skill;
 use crate::tui::{self, TuiHandle, TuiMessage, TuiTone};
 use crate::ui::TerminalOutput;
 
@@ -46,6 +47,8 @@ pub enum ChatCommand {
     Resume(Option<String>),
     Rules,
     Sessions,
+    Skill { name: String, arguments: String },
+    Skills,
     Status,
     Queue,
     Unknown(String),
@@ -206,6 +209,7 @@ impl ChatView {
         workspace: &Path,
         session: &SessionSummary,
         instructions: &InstructionSet,
+        skill_count: usize,
     ) -> Result<()> {
         if self.output.set_tui_header(
             format!(
@@ -215,16 +219,22 @@ impl ChatView {
                 compact_path(workspace)
             ),
             format!(
-                "session {} · {} rules · {} · /help for commands",
+                "session {} · {} rules · {} skills · {} · /help for commands",
                 short_id(&session.id),
                 instructions.files.len(),
+                skill_count,
                 protocol_name(config.model.family, config.model.wire_api)
             ),
         ) {
             return Ok(());
         }
-        self.output
-            .print(render_welcome(config, workspace, session, instructions))
+        self.output.print(render_welcome(
+            config,
+            workspace,
+            session,
+            instructions,
+            skill_count,
+        ))
     }
 
     pub fn clear_screen(
@@ -233,13 +243,14 @@ impl ChatView {
         workspace: &Path,
         session: &SessionSummary,
         instructions: &InstructionSet,
+        skill_count: usize,
     ) -> Result<()> {
         if self.output.clear_tui() {
-            return self.welcome(config, workspace, session, instructions);
+            return self.welcome(config, workspace, session, instructions, skill_count);
         }
         self.output.print(format!(
             "\x1b[2J\x1b[H]{}",
-            render_welcome(config, workspace, session, instructions)
+            render_welcome(config, workspace, session, instructions, skill_count)
         ))
     }
 
@@ -265,6 +276,8 @@ impl ChatView {
              \n  {:12} Deny a pending action with optional feedback\
              \n  {:12} Show model, workspace, cache, and context\
              \n  {:12} Show MCP server and tool status\
+             \n  {:12} Show discovered skills\
+             \n  {:12} Invoke a skill with optional arguments\
              \n  {:12} Show loaded project instruction files\
              \n  {:12} Show the active config path\
              \n  {:12} Show the history file\
@@ -292,6 +305,8 @@ impl ChatView {
             "/deny [reason]",
             "/status",
             "/mcp",
+            "/skills",
+            "/skill:<name>",
             "/rules",
             "/config",
             "/history",
@@ -379,6 +394,33 @@ impl ChatView {
             }
         }
         output.push('\n');
+        self.output.print(output)
+    }
+
+    pub fn show_skills(&self, skills: &[Skill]) -> Result<()> {
+        let mut output = format!(
+            "\n{} · {} available\n",
+            Style::new().cyan().bold().apply_to("Skills"),
+            skills.len()
+        );
+        if skills.is_empty() {
+            output.push_str("  No skills discovered.\n\n");
+            return self.output.print(output);
+        }
+        for skill in skills {
+            output.push_str(&format!(
+                "  {:24} {:8} {}{}\n",
+                skill.name,
+                skill.scope.as_str(),
+                one_line(&skill.description),
+                if skill.disable_model_invocation {
+                    "  · explicit only"
+                } else {
+                    ""
+                }
+            ));
+        }
+        output.push_str("\n  Invoke with /skill:<name> [arguments].\n\n");
         self.output.print(output)
     }
 
@@ -685,6 +727,7 @@ fn render_welcome(
     workspace: &Path,
     session: &SessionSummary,
     instructions: &InstructionSet,
+    skill_count: usize,
 ) -> String {
     let cyan = Style::new().cyan().bold();
     let dim = Style::new().dim();
@@ -730,6 +773,11 @@ fn render_welcome(
         &mut output,
         width,
         &format!("rules      {} instruction files", instructions.files.len()),
+    );
+    welcome_row(
+        &mut output,
+        width,
+        &format!("skills     {skill_count} discovered · /skills to inspect"),
     );
     welcome_row(
         &mut output,
@@ -813,8 +861,13 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         )),
         "/rules" | "/instructions" => ChatInput::Command(ChatCommand::Rules),
         "/sessions" => ChatInput::Command(ChatCommand::Sessions),
+        "/skills" => ChatInput::Command(ChatCommand::Skills),
         "/steer" => ChatInput::Task(argument.to_owned()),
         "/model" | "/status" => ChatInput::Command(ChatCommand::Status),
+        command if command.starts_with("/skill:") => ChatInput::Command(ChatCommand::Skill {
+            name: command.trim_start_matches("/skill:").to_owned(),
+            arguments: argument.to_owned(),
+        }),
         command if command.starts_with('/') => {
             ChatInput::Command(ChatCommand::Unknown(command.to_owned()))
         }
@@ -892,6 +945,17 @@ mod tests {
         );
         assert_eq!(parse_input("/plan"), ChatInput::Command(ChatCommand::Plan));
         assert_eq!(parse_input("/mcp"), ChatInput::Command(ChatCommand::Mcp));
+        assert_eq!(
+            parse_input("/skills"),
+            ChatInput::Command(ChatCommand::Skills)
+        );
+        assert_eq!(
+            parse_input("/skill:review focus on safety"),
+            ChatInput::Command(ChatCommand::Skill {
+                name: "review".into(),
+                arguments: "focus on safety".into(),
+            })
+        );
         assert_eq!(
             parse_input("/model"),
             ChatInput::Command(ChatCommand::Status)

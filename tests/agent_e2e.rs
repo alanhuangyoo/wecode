@@ -11,15 +11,15 @@ use wecode::approval::{ApprovalClient, ApprovalDecision};
 use wecode::cache::ResponseCache;
 #[cfg(unix)]
 use wecode::config::McpServerConfig;
-use wecode::config::{ApprovalPolicy, CacheConfig, Config};
+use wecode::config::{ApprovalPolicy, CacheConfig, Config, SkillsConfig};
 use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
 use wecode::input_queue::InputQueue;
 use wecode::interaction::{PlanState, UserInputClient, UserInputResponse, resolve_answers};
-#[cfg(unix)]
 use wecode::mcp::McpManager;
 use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, ToolProfile, Usage};
 use wecode::protocol::{Action, PlanItem, PlanStatus, QuestionOption, UserQuestion};
+use wecode::skills::SkillCatalog;
 
 struct FakeModel {
     responses: Mutex<VecDeque<String>>,
@@ -989,6 +989,99 @@ done
         );
     }
     manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn interactive_agent_progressively_loads_a_matching_skill() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let skill_directory = temp.path().join(".wecode/skills/reviewer");
+    std::fs::create_dir_all(&skill_directory).unwrap();
+    std::fs::write(
+        skill_directory.join("SKILL.md"),
+        "---\nname: reviewer\ndescription: Review Rust changes for correctness.\n---\n# Review instructions\nCheck error paths and tests.\n",
+    )
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::LoadSkill {
+                name: "reviewer".into(),
+                path: None,
+                offset: None,
+                limit: None,
+            },
+            Action::Finish {
+                summary: "Skill instructions followed".into(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    config.skills = SkillsConfig {
+        discover_user: false,
+        compatibility_directories: false,
+        ..Default::default()
+    };
+    let workspace = temp.path().canonicalize().unwrap();
+    let skills = SkillCatalog::discover(&workspace, &config.skills).unwrap();
+    assert_eq!(skills.len(), 1);
+    let manager = McpManager::connect(&config.mcp, &workspace).await;
+    let mut agent = Agent::new_with_extensions(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        workspace,
+        ToolProfile::Interactive,
+        manager.clone(),
+        skills,
+    );
+
+    let result = agent
+        .run("review this repository", RunOptions::default())
+        .await
+        .unwrap();
+    assert!(result.success);
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].system.contains("<name>reviewer</name>"));
+        assert!(!requests[0].system.contains("# Review instructions"));
+        assert!(requests[1].messages.iter().any(|message| {
+            message.content.contains("# Review instructions")
+                && message.content.contains("Check error paths and tests.")
+        }));
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn interactive_plain_text_is_a_smooth_final_response() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(["The review is complete.".into()])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent
+        .run("review the repository", RunOptions::default())
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(result.steps, 1);
+    assert_eq!(result.summary, "The review is complete.");
 }
 
 #[tokio::test]

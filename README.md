@@ -134,6 +134,9 @@ composer remains editable while the agent works.
 /deny        Deny the pending action with optional feedback
 /status      Show model, workspace, cache, and context
 /mcp         Show connected MCP servers and tools
+/skills      Show discovered Agent Skills
+/skill:<name>
+             Invoke a skill with optional arguments
 /rules       Show loaded project instruction files
 /config      Show the active config path
 /history     Show the history file
@@ -268,6 +271,15 @@ enabled = true
 startup_timeout_seconds = 10
 tool_timeout_seconds = 60
 max_output_bytes = 65536
+
+[skills]
+enabled = true
+discover_user = true
+discover_project = true
+compatibility_directories = true
+paths = []
+max_skills = 128
+max_file_bytes = 131072
 ```
 
 Provider-specific variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`
@@ -305,6 +317,30 @@ with `--config`, or move trusted MCP configuration to `~/.wecode/config.toml`.
 MCP is deliberately disabled for `wecode run`, JSONL output, and `wecode bench`. Those paths retain
 the original seven tools, system prompt, and cache namespace, so adding interactive extensions
 cannot silently change benchmark results.
+
+### Agent Skills
+
+WeCode supports the portable `SKILL.md` format with progressive disclosure. At startup, only a
+skill's validated name and description enter the system prompt. The model calls `load_skill` when
+a task matches, then reads referenced files relative to the skill directory as needed. This keeps
+normal prompts small while preserving complete workflows, scripts, references, and assets.
+
+Skills are discovered deterministically from:
+
+- User scope: `~/.wecode/skills/` and, when compatibility is enabled,
+  `~/.agents/skills/`, `~/.claude/skills/`, and `~/.codex/skills/`.
+- Project scope: the same hidden skill directories from the repository root through the current
+  workspace.
+- Explicit paths: additive entries in `skills.paths`; relative paths resolve from the workspace.
+
+More specific project roots override user skills with the same name. Names follow the Agent Skills
+lowercase/hyphen convention, descriptions and catalogs are bounded, invalid skills produce visible
+diagnostics, and resource paths cannot escape the canonical skill directory. A skill with
+`disable-model-invocation: true` remains available through `/skill:<name>` but is omitted from
+automatic model discovery. `/skills` shows scope and visibility for the active catalog.
+
+As with MCP, Skills are interactive-only by default. `wecode run` and `wecode bench` retain the
+unchanged seven-tool benchmark profile.
 
 ## Approvals
 

@@ -68,7 +68,8 @@ impl ToolRegistry {
             | Action::Patch { .. }
             | Action::UpdatePlan { .. }
             | Action::RequestUserInput { .. }
-            | Action::McpCall { .. } => ToolConcurrency::Exclusive,
+            | Action::McpCall { .. }
+            | Action::LoadSkill { .. } => ToolConcurrency::Exclusive,
             Action::Finish { .. } => ToolConcurrency::Terminal,
         }
     }
@@ -168,6 +169,15 @@ impl ToolRegistry {
                 )
                 .context("request_user_input returned invalid questions")?,
             },
+            "load_skill" | "skill" => Action::LoadSkill {
+                name: get_string("name"),
+                path: arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                offset: get_usize("offset"),
+                limit: get_usize("limit"),
+            },
             "finish" => Action::Finish {
                 summary: get_string("summary"),
             },
@@ -260,6 +270,21 @@ fn interactive_definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["questions"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "load_skill",
+            "description": "Load specialized instructions or a relative text resource from a discovered skill. Load SKILL.md before following a skill, then use path to read referenced files progressively.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Exact skill name from available_skills or an explicit user invocation."},
+                    "path": {"type": "string", "description": "Optional path relative to the skill base directory. Defaults to SKILL.md."},
+                    "offset": {"type": "integer", "minimum": 1, "description": "Optional 1-indexed first line."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum lines to return."}
+                },
+                "required": ["name"],
                 "additionalProperties": false
             }
         }),
@@ -421,18 +446,18 @@ mod tests {
     }
 
     #[test]
-    fn interactive_profile_adds_plan_and_question_without_changing_coding_tools() {
+    fn interactive_profile_adds_plan_question_and_skill_without_changing_coding_tools() {
         let coding = ToolRegistry::for_profile(ToolProfile::Coding).definitions();
         let interactive = ToolRegistry::for_profile(ToolProfile::Interactive).definitions();
         assert_eq!(coding.len(), 7);
-        assert_eq!(interactive.len(), 9);
+        assert_eq!(interactive.len(), 10);
         assert_eq!(
             interactive
                 .iter()
                 .skip(coding.len())
                 .filter_map(|tool| tool["name"].as_str())
                 .collect::<Vec<_>>(),
-            vec!["update_plan", "request_user_input"]
+            vec!["update_plan", "request_user_input", "load_skill"]
         );
     }
 
@@ -449,5 +474,27 @@ mod tests {
             }
         );
         assert!(ToolRegistry::parse_call("mcp__broken", json!({})).is_err());
+    }
+
+    #[test]
+    fn skill_calls_preserve_progressive_resource_ranges() {
+        assert_eq!(
+            ToolRegistry::parse_call(
+                "load_skill",
+                json!({
+                    "name": "code-review",
+                    "path": "references/checklist.md",
+                    "offset": 20,
+                    "limit": 50
+                })
+            )
+            .unwrap(),
+            Action::LoadSkill {
+                name: "code-review".into(),
+                path: Some("references/checklist.md".into()),
+                offset: Some(20),
+                limit: Some(50),
+            }
+        );
     }
 }

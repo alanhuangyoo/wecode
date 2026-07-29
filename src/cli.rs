@@ -24,6 +24,7 @@ use crate::mcp::McpManager;
 use crate::model::{ToolProfile, create_model, create_model_with_tools};
 use crate::session::ChatSession;
 use crate::setup::{SetupOptions, run as run_setup};
+use crate::skills::SkillCatalog;
 use crate::ui::TerminalUi;
 
 #[derive(Debug, Parser)]
@@ -360,6 +361,7 @@ enum ChatStart {
 async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let (config, workspace) = resolve_config(&common)?;
     let instruction_set = instructions::discover(&workspace)?;
+    let skills = SkillCatalog::discover(&workspace, &config.skills)?;
     let state_directory = config.agent.trajectory_directory.clone();
     let shell = ChatShell::new()?;
     let view = shell.view();
@@ -382,7 +384,13 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let (approval, mut approval_requests) = ApprovalClient::channel();
     let (user_input, mut user_input_requests) = UserInputClient::channel();
     let mut plan = PlanState::restore(conversation.messages());
-    view.welcome(&config, &workspace, session.summary(), &instruction_set)?;
+    view.welcome(
+        &config,
+        &workspace,
+        session.summary(),
+        &instruction_set,
+        skills.len(),
+    )?;
     view.sync_plan(&plan.current());
     if !config.mcp.servers.is_empty() {
         view.notice(format!(
@@ -412,13 +420,56 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             report.error.as_deref().unwrap_or("unknown error")
         ))?;
     }
+    for diagnostic in skills.diagnostics().iter().take(5) {
+        view.warning(format!(
+            "Skill {}: {}",
+            diagnostic.path.display(),
+            diagnostic.message
+        ))?;
+    }
+    if skills.diagnostics().len() > 5 {
+        view.warning(format!(
+            "{} additional skill diagnostics omitted; use /skills to inspect loaded skills.",
+            skills.diagnostics().len() - 5
+        ))?;
+    }
+    if !skills.is_empty() {
+        view.notice(format!(
+            "Discovered {} skill{} · /skills to inspect.",
+            skills.len(),
+            if skills.len() == 1 { "" } else { "s" }
+        ))?;
+    }
     let mut inputs = shell.into_input_stream();
 
     loop {
         let Some(input) = inputs.recv().await else {
             break;
         };
-        match input? {
+        let mut title_override = None;
+        let input = match input? {
+            ChatInput::Command(ChatCommand::Skill { name, arguments }) => {
+                match skills.explicit_request(&name, &arguments) {
+                    Ok(request) => {
+                        title_override = Some(format!(
+                            "/skill:{name}{}",
+                            if arguments.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", arguments.trim())
+                            }
+                        ));
+                        ChatInput::Task(request)
+                    }
+                    Err(error) => {
+                        view.warning(error.to_string())?;
+                        continue;
+                    }
+                }
+            }
+            input => input,
+        };
+        match input {
             ChatInput::Exit => break,
             ChatInput::Interrupted => continue,
             ChatInput::FollowUp(task) | ChatInput::Task(task) if task.trim().is_empty() => {
@@ -434,7 +485,13 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 conversation = Conversation::default();
                 plan.clear();
                 input_queue.clear();
-                view.clear_screen(&config, &workspace, session.summary(), &instruction_set)?;
+                view.clear_screen(
+                    &config,
+                    &workspace,
+                    session.summary(),
+                    &instruction_set,
+                    skills.len(),
+                )?;
                 view.notice("Started a new session.")?;
             }
             ChatInput::Command(ChatCommand::Cancel) => {
@@ -463,6 +520,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::Help) => view.show_help()?,
             ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
             ChatInput::Command(ChatCommand::Mcp) => view.show_mcp(&mcp.reports())?,
+            ChatInput::Command(ChatCommand::Skills) => view.show_skills(&skills.skills())?,
             ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
             ChatInput::Command(ChatCommand::Fork(selector)) => {
                 let source_id = session.summary().id.clone();
@@ -477,6 +535,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             &workspace,
                             session.summary(),
                             &instruction_set,
+                            skills.len(),
                         )?;
                         view.sync_plan(&plan.current());
                         view.notice(format!(
@@ -513,6 +572,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             &workspace,
                             session.summary(),
                             &instruction_set,
+                            skills.len(),
                         )?;
                         view.sync_plan(&plan.current());
                         view.notice(format!(
@@ -539,6 +599,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             &workspace,
                             session.summary(),
                             &instruction_set,
+                            skills.len(),
                         )?;
                         view.sync_plan(&plan.current());
                         view.notice(format!(
@@ -568,8 +629,11 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::Unknown(command)) => {
                 view.warning(format!("Unknown command {command:?}. Type /help."))?;
             }
+            ChatInput::Command(ChatCommand::Skill { .. }) => {
+                unreachable!("skill commands are expanded before dispatch")
+            }
             ChatInput::FollowUp(task) | ChatInput::Task(task) => {
-                session.set_initial_title(&task)?;
+                session.set_initial_title(title_override.as_deref().unwrap_or(&task))?;
                 session.checkpoint(
                     Some(&automatic_checkpoint_label(&task)),
                     &conversation,
@@ -591,13 +655,14 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         ToolProfile::Interactive,
                         mcp.definitions(),
                     )?;
-                    agent = Some(Agent::new_with_mcp(
+                    agent = Some(Agent::new_with_extensions(
                         config.clone(),
                         model,
                         Box::new(TerminalUi::chat(view.output())),
                         workspace.clone(),
                         ToolProfile::Interactive,
                         mcp.clone(),
+                        skills.clone(),
                     ));
                 }
 
@@ -618,6 +683,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &user_input,
                         &mut user_input_requests,
                         &mcp,
+                        &skills,
                         &mut inputs,
                         &view,
                     )
@@ -669,6 +735,7 @@ async fn run_active_chat_task(
     user_input: &UserInputClient,
     user_input_requests: &mut tokio::sync::mpsc::UnboundedReceiver<UserInputEnvelope>,
     mcp: &McpManager,
+    skills: &SkillCatalog,
     inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
     view: &ChatView,
 ) -> Result<ActiveChatResult> {
@@ -831,6 +898,10 @@ async fn run_active_chat_task(
                             view.show_mcp(&mcp.reports())?;
                             continue;
                         }
+                        ChatInput::Command(ChatCommand::Skills) => {
+                            view.show_skills(&skills.skills())?;
+                            continue;
+                        }
                         _ => {
                             view.warning(
                                 "Answer the pending question, or use /cancel to stop the task.",
@@ -893,6 +964,22 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
                     ChatInput::Command(ChatCommand::Mcp) => {
                         view.show_mcp(&mcp.reports())?;
+                    }
+                    ChatInput::Command(ChatCommand::Skills) => {
+                        view.show_skills(&skills.skills())?;
+                    }
+                    ChatInput::Command(ChatCommand::Skill { name, arguments }) => {
+                        match skills.explicit_request(&name, &arguments) {
+                            Ok(request) => {
+                                let queued = input_queue.steer(request);
+                                view.show_queued(
+                                    "skill steer",
+                                    queued.id,
+                                    input_queue.snapshot().len(),
+                                )?;
+                            }
+                            Err(error) => view.warning(error.to_string())?,
+                        }
                     }
                     ChatInput::Command(ChatCommand::Rules) => view.show_rules(instruction_set)?,
                     ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,

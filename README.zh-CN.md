@@ -126,6 +126,9 @@ Agent 工作时仍可继续编辑。
 /deny        拒绝操作并可提供原因
 /status      查看模型、工作区、缓存和上下文
 /mcp         查看 MCP 服务器和工具状态
+/skills      查看发现的 Agent Skills
+/skill:<名称>
+             调用 Skill 并可附带参数
 /rules       查看已加载的项目规则
 /config      查看当前配置文件
 /history     查看输入历史文件
@@ -249,6 +252,15 @@ enabled = true
 startup_timeout_seconds = 10
 tool_timeout_seconds = 60
 max_output_bytes = 65536
+
+[skills]
+enabled = true
+discover_user = true
+discover_project = true
+compatibility_directories = true
+paths = []
+max_skills = 128
+max_file_bytes = 131072
 ```
 
 支持 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY` 等服务商变量。
@@ -281,6 +293,27 @@ wecode run -C /path/to/repository \
 
 MCP 在 `wecode run`、JSONL 输出和 `wecode bench` 中默认完全禁用。这些路径继续使用原来的
 七个工具、系统提示词和缓存命名空间，交互扩展不会悄悄改变 Benchmark 结果。
+
+### Agent Skills
+
+WeCode 支持可移植的 `SKILL.md` 格式和渐进披露。启动时只有通过校验的名称与描述进入系统
+提示词；任务匹配后模型才调用 `load_skill`，并按需读取 Skill 目录中的相对引用文件。普通
+请求不会携带完整说明，同时仍可使用完整工作流、脚本、参考资料和资源。
+
+Skill 会按确定顺序从以下位置发现：
+
+- 用户级：`~/.wecode/skills/`；启用兼容目录时，还包括 `~/.agents/skills/`、
+  `~/.claude/skills/` 和 `~/.codex/skills/`。
+- 项目级：从仓库根目录到当前工作区的同名隐藏 Skills 目录。
+- 显式路径：`skills.paths` 中的附加路径；相对路径以当前工作区为基准。
+
+更具体的项目 Skill 会覆盖同名用户 Skill。名称遵循 Agent Skills 的小写字母与连字符规范；
+描述、目录和文件大小都有硬上限；无效 Skill 会显示诊断；资源路径不能逃逸规范化后的 Skill
+目录。带 `disable-model-invocation: true` 的 Skill 不参与模型自动发现，但仍可通过
+`/skill:<名称>` 显式调用。`/skills` 会显示当前目录中每个 Skill 的作用域和可见性。
+
+与 MCP 一样，Skills 默认只在交互模式启用；`wecode run` 和 `wecode bench` 继续保持不变的
+七工具 Benchmark 配置。
 
 ## 权限审批
 
