@@ -191,6 +191,32 @@ pub enum Action {
         #[serde(default)]
         query: Option<String>,
     },
+    SpawnAgent {
+        description: String,
+        prompt: String,
+        #[serde(default = "default_subagent_type")]
+        agent_type: String,
+        #[serde(default)]
+        background: bool,
+        #[serde(default)]
+        model: Option<String>,
+    },
+    AgentStatus {
+        #[serde(default)]
+        agent_id: Option<u64>,
+    },
+    SendAgent {
+        agent_id: u64,
+        message: String,
+    },
+    WaitAgent {
+        agent_ids: Vec<u64>,
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
+    },
+    StopAgent {
+        agent_id: u64,
+    },
     Finish {
         summary: String,
     },
@@ -214,6 +240,11 @@ impl Action {
             Self::WriteProcess { .. } => "write_process",
             Self::StopProcess { .. } => "stop_process",
             Self::Lsp { .. } => "lsp",
+            Self::SpawnAgent { .. } => "spawn_agent",
+            Self::AgentStatus { .. } => "agent_status",
+            Self::SendAgent { .. } => "send_agent",
+            Self::WaitAgent { .. } => "wait_agent",
+            Self::StopAgent { .. } => "stop_agent",
             Self::Finish { .. } => "finish",
         }
     }
@@ -277,6 +308,11 @@ impl Action {
                     path
                 }
             }
+            Self::SpawnAgent { description, .. } => description,
+            Self::AgentStatus { .. } => "inspect subagents",
+            Self::SendAgent { .. } => "send subagent follow-up",
+            Self::WaitAgent { .. } => "wait for subagents",
+            Self::StopAgent { .. } => "stop subagent",
             Self::Finish { summary } => summary,
         }
     }
@@ -377,6 +413,61 @@ pub(crate) fn validate_action(action: &Action) -> Result<()> {
             }
             Ok(())
         }
+        Action::SpawnAgent {
+            description,
+            prompt,
+            agent_type,
+            model,
+            ..
+        } => {
+            if description.trim().is_empty() || description.chars().count() > 120 {
+                bail!("subagent description must contain between 1 and 120 characters");
+            }
+            if prompt.trim().is_empty() || prompt.len() > 64 * 1_024 {
+                bail!("subagent prompt must contain between 1 and 65536 bytes");
+            }
+            validate_agent_type(agent_type)?;
+            if model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty() || model.len() > 256)
+            {
+                bail!("subagent model must contain between 1 and 256 bytes");
+            }
+            Ok(())
+        }
+        Action::AgentStatus { agent_id: Some(0) }
+        | Action::SendAgent { agent_id: 0, .. }
+        | Action::StopAgent { agent_id: 0 } => {
+            bail!("subagent ID must be greater than zero")
+        }
+        Action::SendAgent { message, .. } => {
+            if message.trim().is_empty() || message.len() > 64 * 1_024 {
+                bail!("subagent message must contain between 1 and 65536 bytes");
+            }
+            Ok(())
+        }
+        Action::WaitAgent {
+            agent_ids,
+            timeout_seconds,
+        } => {
+            if agent_ids.is_empty() || agent_ids.len() > 16 {
+                bail!("wait_agent must contain between 1 and 16 agent IDs");
+            }
+            if agent_ids.contains(&0) {
+                bail!("subagent IDs must be greater than zero");
+            }
+            if agent_ids
+                .iter()
+                .enumerate()
+                .any(|(index, id)| agent_ids[..index].contains(id))
+            {
+                bail!("wait_agent IDs must be unique");
+            }
+            if timeout_seconds.is_some_and(|seconds| !(1..=60).contains(&seconds)) {
+                bail!("wait_agent timeout_seconds must be between 1 and 60");
+            }
+            Ok(())
+        }
         Action::Finish { summary } if summary.trim().is_empty() => {
             bail!("finish summary cannot be empty")
         }
@@ -393,6 +484,18 @@ fn validate_mcp_component(value: &str, kind: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
         bail!("mcp {kind} name is invalid");
+    }
+    Ok(())
+}
+
+fn validate_agent_type(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        bail!("subagent type must be 1-64 ASCII letters, digits, underscores, or hyphens");
     }
     Ok(())
 }
@@ -468,6 +571,10 @@ fn default_path() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_subagent_type() -> String {
+    "general-purpose".into()
 }
 
 fn strip_code_fence(input: &str) -> Option<&str> {
@@ -584,5 +691,59 @@ mod tests {
             parse_action(r#"{"action":"write_process","process_id":0,"input":"hello"}"#).is_err()
         );
         assert!(parse_action(r#"{"action":"stop_process","process_id":0}"#).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_subagent_actions() {
+        assert_eq!(
+            parse_action(
+                r#"{"action":"spawn_agent","description":"inspect parser","prompt":"Find parser edge cases.","agent_type":"review","background":true,"model":"small-model"}"#
+            )
+            .unwrap(),
+            Action::SpawnAgent {
+                description: "inspect parser".into(),
+                prompt: "Find parser edge cases.".into(),
+                agent_type: "review".into(),
+                background: true,
+                model: Some("small-model".into()),
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"action":"agent_status","agent_id":2}"#).unwrap(),
+            Action::AgentStatus { agent_id: Some(2) }
+        );
+        assert_eq!(
+            parse_action(
+                r#"{"action":"send_agent","agent_id":2,"message":"Check Windows paths."}"#
+            )
+            .unwrap(),
+            Action::SendAgent {
+                agent_id: 2,
+                message: "Check Windows paths.".into(),
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"action":"wait_agent","agent_ids":[1,2],"timeout_seconds":10}"#)
+                .unwrap(),
+            Action::WaitAgent {
+                agent_ids: vec![1, 2],
+                timeout_seconds: Some(10),
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"action":"stop_agent","agent_id":2}"#).unwrap(),
+            Action::StopAgent { agent_id: 2 }
+        );
+
+        assert!(
+            parse_action(
+                r#"{"action":"spawn_agent","description":"","prompt":"work","agent_type":"review"}"#
+            )
+            .is_err()
+        );
+        assert!(parse_action(r#"{"action":"agent_status","agent_id":0}"#).is_err());
+        assert!(parse_action(r#"{"action":"send_agent","agent_id":2,"message":" "}"#).is_err());
+        assert!(parse_action(r#"{"action":"wait_agent","agent_ids":[2,2]}"#).is_err());
+        assert!(parse_action(r#"{"action":"stop_agent","agent_id":0}"#).is_err());
     }
 }

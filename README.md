@@ -32,6 +32,9 @@ runtime.
 - **Semantic code intelligence** — installed language servers are detected automatically and
   started only when definitions, references, symbols, hover, call hierarchy, or diagnostics are
   needed.
+- **Managed subagents** — delegate focused implementation, exploration, planning, or review work
+  in isolated model contexts, run independent tasks concurrently, and continue completed agents
+  without losing their conversation.
 - **Cache efficient** — stable prompt prefixes, provider-side prompt-cache hints, and an on-disk
   exact-response cache for cheap, fast reruns.
 - **Benchmark ready** — non-interactive execution, JSONL events and trajectories, final Git patch
@@ -129,6 +132,9 @@ composer remains editable while the agent works.
 /processes   Show managed background processes
 /stop-process <id>
              Stop a managed background process tree
+/agents      Show delegated subagents and their state
+/stop-agent <id>
+             Cancel a queued or running subagent
 /steer       Steer the active task at the next model boundary
 /followup    Queue work for after the active task
 /queue       Show pending steer and follow-up messages
@@ -178,7 +184,8 @@ application is never interrupted halfway through. Set `WECODE_TUI=0` to use the 
 fallback in a terminal that does not support the full-screen interface.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
-depend on terminal rendering or delta events. Plan, question, skill, managed-process, and LSP tools
+depend on terminal rendering or delta events. Plan, question, skill, managed-process, LSP, and
+subagent tools
 are exposed only by interactive `wecode` sessions; machine-oriented runs retain the original
 seven-tool profile and the same cache namespace.
 
@@ -189,6 +196,19 @@ process tree. Completion appears automatically in the timeline and is delivered 
 next safe boundary, so it does not need to sleep or poll continuously. `/processes` and
 `/stop-process <id>` remain usable while a task is active. All managed processes are stopped when
 the session changes or WeCode exits.
+
+For focused parallel work, the interactive agent can delegate to four built-in roles:
+`general-purpose` may inspect, edit, and verify; `explore`, `plan`, and `review` are read-only.
+Foreground delegation waits for its bounded result. Background delegation returns immediately,
+shows progress in the timeline, and injects completion automatically at the next safe model
+boundary. Completed agents keep their private conversation so the parent can send a follow-up
+without starting over. `/agents` remains available while the parent is working, and
+`/stop-agent <id>` requests cancellation.
+
+Subagents share the same worktree. Run editing agents concurrently only for non-overlapping tasks;
+there is no automatic Git worktree isolation yet. Concurrency, records, steps, runtime, output,
+notifications, and waits all have hard limits. Subagents cannot recursively create more agents,
+and all active child work is cancelled when the session changes or WeCode exits.
 
 Long conversations are compacted locally into a deterministic, bounded summary that retains task
 intent, inspected or edited paths, validation results, failures, and pending facts. Repeated
@@ -305,6 +325,23 @@ extensions = { ".rs" = "rust" }
 startup_timeout_seconds = 15
 enabled = true
 
+[subagents]
+enabled = true
+max_agents = 16
+max_concurrent = 4
+max_steps = 20
+max_runtime_seconds = 900
+max_output_bytes = 32768
+wait_timeout_seconds = 30
+
+# Optional custom role. It replaces a built-in role with the same name.
+[subagents.roles.security-review]
+description = "Read-only security review"
+prompt = "Inspect the delegated change for concrete security risks and report exact paths."
+read_only = true
+model = "provider-model-id"
+max_steps = 12
+
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
@@ -386,6 +423,28 @@ trusted commands in `~/.wecode/config.toml`. WeCode refuses to execute configure
 an implicitly discovered project `.wecode.toml`; review it and pass it explicitly with `--config`
 if it is trusted. LSP remains disabled in `wecode run` and `wecode bench`, preserving their exact
 seven-tool prompt and cache path.
+
+### Managed subagents
+
+Subagents are available only in interactive sessions. `spawn_agent` supports foreground and
+background execution and can launch several independent background tasks in one model turn.
+`agent_status`, `send_agent`, `wait_agent`, and `stop_agent` provide the remaining lifecycle
+operations. Background completion is pushed automatically, so normal operation does not require
+polling.
+
+The built-in `general-purpose` role receives the normal seven coding tools. The built-in
+`explore`, `plan`, and `review` roles receive only `read_file`, `list_files`, `glob`, `grep`, and
+`finish`. Configure additional roles under `[subagents.roles.<name>]`; a role may set a bounded
+prompt, read-only policy, model override on the current provider, and step limit. WeCode refuses
+custom roles from an implicitly discovered project `.wecode.toml`; review the file and pass it
+explicitly with `--config`, or keep trusted role definitions in `~/.wecode/config.toml`.
+
+Every child uses the current provider and existing response-cache implementation, while
+credentials continue to come from the protected user configuration and are never copied into
+prompts or child-process environments. Creating the manager is lazy: it makes no provider request
+and launches no child until delegation is requested. Subagents are excluded from `wecode run` and
+`wecode bench`, so benchmark tools, system prompt, cache namespace, and trajectory behavior remain
+unchanged.
 
 ### MCP tools
 

@@ -208,6 +208,9 @@ fn cache_namespace(
     Ok(match tool_profile {
         ToolProfile::Coding => format!("{config}:{credential_scope}"),
         ToolProfile::Interactive => format!("{config}:interactive:{credential_scope}"),
+        ToolProfile::ReadOnlySubagent => {
+            format!("{config}:subagent-read-only:{credential_scope}")
+        }
     })
 }
 

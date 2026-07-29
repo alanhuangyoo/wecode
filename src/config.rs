@@ -252,6 +252,56 @@ impl Default for LspServerConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SubagentsConfig {
+    pub enabled: bool,
+    pub max_agents: usize,
+    pub max_concurrent: usize,
+    pub max_steps: usize,
+    pub max_runtime_seconds: u64,
+    pub max_output_bytes: usize,
+    pub wait_timeout_seconds: u64,
+    pub roles: BTreeMap<String, SubagentRoleConfig>,
+}
+
+impl Default for SubagentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_agents: 16,
+            max_concurrent: 4,
+            max_steps: 20,
+            max_runtime_seconds: 900,
+            max_output_bytes: 32 * 1_024,
+            wait_timeout_seconds: 30,
+            roles: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SubagentRoleConfig {
+    pub description: String,
+    pub prompt: String,
+    pub read_only: bool,
+    pub model: Option<String>,
+    pub max_steps: Option<usize>,
+}
+
+impl Default for SubagentRoleConfig {
+    fn default() -> Self {
+        Self {
+            description: String::new(),
+            prompt: String::new(),
+            read_only: true,
+            model: None,
+            max_steps: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct McpConfig {
@@ -425,6 +475,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub processes: ProcessesConfig,
     pub lsp: LspConfig,
+    pub subagents: SubagentsConfig,
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub commands: CommandsConfig,
@@ -479,6 +530,17 @@ impl Config {
         {
             bail!(
                 "refusing to auto-start LSP commands from {}; review it, then pass --config {} explicitly or move trusted LSP configuration to {}",
+                path.display(),
+                path.display(),
+                default_config_path().display()
+            );
+        }
+        if enforce_project_trust
+            && automatically_loaded_project
+            && !config.subagents.roles.is_empty()
+        {
+            bail!(
+                "refusing project-defined subagent roles from {}; review it, then pass --config {} explicitly or move trusted subagent roles to {}",
                 path.display(),
                 path.display(),
                 default_config_path().display()
@@ -605,6 +667,51 @@ impl Config {
             }
             if !(1..=300).contains(&server.startup_timeout_seconds) {
                 bail!("lsp server {name:?} startup_timeout_seconds must be between 1 and 300");
+            }
+        }
+        if !(1..=64).contains(&self.subagents.max_agents) {
+            bail!("subagents.max_agents must be between 1 and 64");
+        }
+        if !(1..=16).contains(&self.subagents.max_concurrent)
+            || self.subagents.max_concurrent > self.subagents.max_agents
+        {
+            bail!("subagents.max_concurrent must be between 1 and 16 and cannot exceed max_agents");
+        }
+        if !(1..=100).contains(&self.subagents.max_steps) {
+            bail!("subagents.max_steps must be between 1 and 100");
+        }
+        if !(1..=86_400).contains(&self.subagents.max_runtime_seconds) {
+            bail!("subagents.max_runtime_seconds must be between 1 and 86400");
+        }
+        if !(4 * 1_024..=1_024 * 1_024).contains(&self.subagents.max_output_bytes) {
+            bail!("subagents.max_output_bytes must be between 4096 and 1048576");
+        }
+        if !(1..=60).contains(&self.subagents.wait_timeout_seconds) {
+            bail!("subagents.wait_timeout_seconds must be between 1 and 60");
+        }
+        if self.subagents.roles.len() > 32 {
+            bail!("subagents cannot configure more than 32 custom roles");
+        }
+        for (name, role) in &self.subagents.roles {
+            validate_mcp_name(name, "subagent role")?;
+            if role.description.trim().is_empty() || role.description.len() > 512 {
+                bail!("subagent role {name:?} description must contain between 1 and 512 bytes");
+            }
+            if role.prompt.trim().is_empty() || role.prompt.len() > 64 * 1_024 {
+                bail!("subagent role {name:?} prompt must contain between 1 and 65536 bytes");
+            }
+            if role
+                .model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty() || model.len() > 256)
+            {
+                bail!("subagent role {name:?} model must contain between 1 and 256 bytes");
+            }
+            if role
+                .max_steps
+                .is_some_and(|max_steps| !(1..=100).contains(&max_steps))
+            {
+                bail!("subagent role {name:?} max_steps must be between 1 and 100");
             }
         }
         if self.mcp.servers.len() > 16 {
@@ -1054,6 +1161,48 @@ mod tests {
     }
 
     #[test]
+    fn subagent_config_requires_bounded_valid_roles() {
+        let mut config = Config::default();
+        config.subagents.roles.insert(
+            "security-review".into(),
+            SubagentRoleConfig {
+                description: "Review security-sensitive changes".into(),
+                prompt: "Inspect the requested change and report concrete risks.".into(),
+                read_only: true,
+                model: Some("small-model".into()),
+                max_steps: Some(12),
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config.subagents.max_concurrent = config.subagents.max_agents + 1;
+        assert!(config.validate().is_err());
+        config.subagents.max_concurrent = 4;
+
+        config
+            .subagents
+            .roles
+            .get_mut("security-review")
+            .unwrap()
+            .prompt
+            .clear();
+        assert!(config.validate().is_err());
+        config
+            .subagents
+            .roles
+            .get_mut("security-review")
+            .unwrap()
+            .prompt = "Review.".into();
+        config
+            .subagents
+            .roles
+            .get_mut("security-review")
+            .unwrap()
+            .max_steps = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn active_project_extensions_require_explicit_config_trust() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(".wecode.toml");
@@ -1093,6 +1242,23 @@ extensions = { ".rs" = "rust" }
         .unwrap();
         let error = Config::load(temp.path(), None).unwrap_err();
         assert!(error.to_string().contains("refusing to auto-start LSP"));
+        assert!(Config::load(temp.path(), Some(&path)).is_ok());
+
+        std::fs::write(
+            &path,
+            r#"
+[subagents.roles.fixture]
+description = "Fixture reviewer"
+prompt = "Review the fixture."
+"#,
+        )
+        .unwrap();
+        let error = Config::load(temp.path(), None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing project-defined subagent roles")
+        );
         assert!(Config::load(temp.path(), Some(&path)).is_ok());
 
         std::fs::write(

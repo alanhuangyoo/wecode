@@ -318,6 +318,58 @@ fn ingest_actions(content: &str, result: Option<&str>, facts: &mut SummaryFacts)
                     10,
                 );
             }
+            Action::SpawnAgent {
+                description,
+                agent_type,
+                ..
+            } => {
+                push_fact(
+                    &mut facts.other,
+                    format!(
+                        "Delegated `{}` to `{agent_type}` subagent.",
+                        single_line_excerpt(&description, MAX_FACT_BYTES)
+                    ),
+                    10,
+                );
+            }
+            Action::AgentStatus { agent_id } => {
+                push_fact(
+                    &mut facts.other,
+                    agent_id.map_or_else(
+                        || "Inspected subagent status.".into(),
+                        |id| format!("Inspected subagent `{id}`."),
+                    ),
+                    10,
+                );
+            }
+            Action::SendAgent { agent_id, .. } => {
+                push_fact(
+                    &mut facts.other,
+                    format!("Sent follow-up context to subagent `{agent_id}`."),
+                    10,
+                );
+            }
+            Action::WaitAgent { agent_ids, .. } => {
+                push_fact(
+                    &mut facts.other,
+                    format!(
+                        "Waited for subagents `{}`.",
+                        agent_ids
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    10,
+                );
+            }
+            Action::StopAgent { agent_id } => {
+                push_fact(
+                    &mut facts.other,
+                    format!("Stopped subagent `{agent_id}`."),
+                    10,
+                );
+            }
             Action::Finish { summary } => {
                 push_fact(
                     &mut facts.other,

@@ -29,11 +29,13 @@ use crate::mcp::{McpServerReport, McpServerState};
 use crate::protocol::PlanStatus;
 use crate::session::{SessionCheckpoint, SessionSummary};
 use crate::skills::Skill;
+use crate::subagent::{SubagentEvent, SubagentStatus, SubagentSummary};
 use crate::tui::{self, TuiHandle, TuiMessage, TuiTone};
 use crate::ui::TerminalOutput;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatCommand {
+    Agents,
     Approve,
     ApproveSession,
     Cancel,
@@ -61,6 +63,7 @@ pub enum ChatCommand {
     Skill { name: String, arguments: String },
     Skills,
     Status,
+    StopAgent(Option<u64>),
     StopProcess(Option<u64>),
     Queue,
     Unknown { name: String, arguments: String },
@@ -237,6 +240,8 @@ fn command_completions(
         ("/mcp", "Show MCP servers"),
         ("/lsp", "Show language servers"),
         ("/lsp-restart", "Restart language servers"),
+        ("/agents", "Show delegated subagents"),
+        ("/stop-agent", "Stop a delegated subagent"),
         ("/hooks", "Show lifecycle hooks"),
         ("/commands", "Show reusable prompts"),
         ("/skills", "Show Agent Skills"),
@@ -366,6 +371,8 @@ impl ChatView {
              \n  {:12} Show MCP server and tool status\
              \n  {:12} Show language-server status\
              \n  {:12} Restart language servers\
+             \n  {:12} Show delegated subagents\
+             \n  {:12} Stop a delegated subagent\
              \n  {:12} Show lifecycle hooks\
              \n  {:12} Show reusable prompt commands\
              \n  {:12} Show discovered skills\
@@ -401,6 +408,8 @@ impl ChatView {
             "/mcp",
             "/lsp",
             "/lsp-restart",
+            "/agents",
+            "/stop-agent <id>",
             "/hooks",
             "/commands",
             "/skills",
@@ -613,6 +622,57 @@ impl ChatView {
             event.server,
             one_line(&event.detail)
         ))
+    }
+
+    pub fn show_subagents(&self, agents: &[SubagentSummary]) -> Result<()> {
+        let mut output = format!(
+            "\n{} · {} total\n",
+            Style::new().cyan().bold().apply_to("Subagents"),
+            agents.len()
+        );
+        if agents.is_empty() {
+            output.push_str("  No subagents have been started in this session.\n\n");
+            return self.output.print(output);
+        }
+        for agent in agents {
+            output.push_str(&format!(
+                "  #{:<3} {:10} {:16} {} · {} turn{} · {} ms\n",
+                agent.id,
+                agent.status.as_str(),
+                agent.agent_type,
+                one_line(&agent.description),
+                agent.turns,
+                if agent.turns == 1 { "" } else { "s" },
+                agent.duration_ms
+            ));
+            if let Some(result) = &agent.result {
+                output.push_str(&format!("       {}\n", one_line(result)));
+            } else if let Some(error) = &agent.error {
+                output.push_str(&format!("       ! {}\n", one_line(error)));
+            }
+        }
+        output.push('\n');
+        self.output.print(output)
+    }
+
+    pub fn show_subagent_event(&self, event: &SubagentEvent) -> Result<()> {
+        let tone = match event.status {
+            SubagentStatus::Completed => TuiTone::Success,
+            SubagentStatus::Failed => TuiTone::Warning,
+            SubagentStatus::Cancelled => TuiTone::Dim,
+            SubagentStatus::Queued | SubagentStatus::Running => TuiTone::Normal,
+        };
+        let label = format!(
+            "Agent #{} · {} · {}",
+            event.id,
+            event.agent_type,
+            event.status.as_str()
+        );
+        if self.output.tui_entry(label.clone(), &event.detail, tone) {
+            return Ok(());
+        }
+        self.output
+            .print(format!("  {label} · {}\n", one_line(&event.detail)))
     }
 
     pub fn show_skills(&self, skills: &[Skill]) -> Result<()> {
@@ -1108,7 +1168,7 @@ fn render_welcome(
     welcome_row(
         &mut output,
         width,
-        "tools      repo · LSP · shell · patch · plan · ask · processes · finish",
+        "tools      repo · LSP · agents · shell · patch · plan · ask · processes · finish",
     );
     welcome_row(
         &mut output,
@@ -1156,6 +1216,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         .unwrap_or((line, ""));
     match command {
         "/quit" | "/exit" => ChatInput::Exit,
+        "/agents" => ChatInput::Command(ChatCommand::Agents),
         "/approve" | "/allow" => ChatInput::Command(ChatCommand::Approve),
         "/approve-session" | "/allow-session" | "/always" => {
             ChatInput::Command(ChatCommand::ApproveSession)
@@ -1195,6 +1256,9 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/skills" => ChatInput::Command(ChatCommand::Skills),
         "/stop-process" | "/process-stop" => {
             ChatInput::Command(ChatCommand::StopProcess(argument.parse::<u64>().ok()))
+        }
+        "/stop-agent" | "/agent-stop" => {
+            ChatInput::Command(ChatCommand::StopAgent(argument.parse::<u64>().ok()))
         }
         "/steer" => ChatInput::Task(argument.to_owned()),
         "/model" | "/status" => ChatInput::Command(ChatCommand::Status),
@@ -1290,6 +1354,18 @@ mod tests {
         assert_eq!(
             parse_input("/stop-process nope"),
             ChatInput::Command(ChatCommand::StopProcess(None))
+        );
+        assert_eq!(
+            parse_input("/agents"),
+            ChatInput::Command(ChatCommand::Agents)
+        );
+        assert_eq!(
+            parse_input("/stop-agent 4"),
+            ChatInput::Command(ChatCommand::StopAgent(Some(4)))
+        );
+        assert_eq!(
+            parse_input("/stop-agent nope"),
+            ChatInput::Command(ChatCommand::StopAgent(None))
         );
         assert_eq!(parse_input("/mcp"), ChatInput::Command(ChatCommand::Mcp));
         assert_eq!(parse_input("/lsp"), ChatInput::Command(ChatCommand::Lsp));

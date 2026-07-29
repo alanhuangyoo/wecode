@@ -23,6 +23,7 @@ use wecode::mcp::McpManager;
 use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, ToolProfile, Usage};
 use wecode::protocol::{Action, LspOperation, PlanItem, PlanStatus, QuestionOption, UserQuestion};
 use wecode::skills::SkillCatalog;
+use wecode::subagent::{SubagentManager, SubagentStatus};
 
 struct FakeModel {
     responses: Mutex<VecDeque<String>>,
@@ -162,6 +163,73 @@ struct SteeringGateModel {
     requests: Arc<Mutex<Vec<CompletionRequest>>>,
     started: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+struct GatedChildModel {
+    release: Arc<Notify>,
+}
+
+struct BackgroundParentModel {
+    calls: AtomicUsize,
+    release_child: Arc<Notify>,
+    child_completed: Arc<Notify>,
+}
+
+#[async_trait]
+impl Model for GatedChildModel {
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
+        self.release.notified().await;
+        Ok(ModelResponse {
+            text: String::new(),
+            action: Some(Action::Finish {
+                summary: "background delegated result".into(),
+            }),
+            additional_actions: Vec::new(),
+            usage: Usage::default(),
+            cache_hit: false,
+        })
+    }
+}
+
+#[async_trait]
+impl Model for BackgroundParentModel {
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let action = match call {
+            0 => Action::SpawnAgent {
+                description: "background inspection".into(),
+                prompt: "Inspect the fixture.".into(),
+                agent_type: "explore".into(),
+                background: true,
+                model: None,
+            },
+            1 => {
+                self.release_child.notify_one();
+                self.child_completed.notified().await;
+                Action::Finish {
+                    summary: "premature parent finish".into(),
+                }
+            }
+            _ => Action::Finish {
+                summary: "parent incorporated background result".into(),
+            },
+        };
+        Ok(ModelResponse {
+            text: String::new(),
+            action: Some(action),
+            additional_actions: Vec::new(),
+            usage: Usage::default(),
+            cache_hit: false,
+        })
+    }
 }
 
 #[async_trait]
@@ -615,6 +683,138 @@ async fn independent_read_tools_share_one_parallel_model_step() {
         })
         .collect::<Vec<_>>();
     assert_eq!(actions, ["read_file", "grep"]);
+}
+
+#[tokio::test]
+async fn foreground_subagent_result_reaches_the_parent_model() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let parent_model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::SpawnAgent {
+                description: "inspect fixture".into(),
+                prompt: "Report what the fixture contains.".into(),
+                agent_type: "explore".into(),
+                background: false,
+                model: None,
+            },
+            Action::Finish {
+                summary: "parent used delegated result".into(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let manager = SubagentManager::new_with_model_factory(
+        config.clone(),
+        temp.path().to_path_buf(),
+        |_model, profile| {
+            assert_eq!(profile, ToolProfile::ReadOnlySubagent);
+            Ok(Box::new(NativeFakeModel {
+                responses: Mutex::new(VecDeque::from([Action::Finish {
+                    summary: "delegated fixture result".into(),
+                }])),
+            }))
+        },
+    )
+    .unwrap();
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(parent_model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent
+        .run(
+            "delegate the fixture inspection",
+            RunOptions {
+                subagents: Some(manager.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].system.contains("spawn_agent"));
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("delegated fixture result"))
+        );
+    }
+    assert_eq!(
+        manager.summaries().await[0].status,
+        SubagentStatus::Completed
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_subagent_notification_reopens_parent_finish() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let release_child = Arc::new(Notify::new());
+    let child_completed = Arc::new(Notify::new());
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let manager =
+        SubagentManager::new_with_model_factory(config.clone(), temp.path().to_path_buf(), {
+            let release_child = release_child.clone();
+            move |_model, profile| {
+                assert_eq!(profile, ToolProfile::ReadOnlySubagent);
+                Ok(Box::new(GatedChildModel {
+                    release: release_child.clone(),
+                }))
+            }
+        })
+        .unwrap();
+    manager.set_event_handler({
+        let child_completed = child_completed.clone();
+        move |event| {
+            if event.status == SubagentStatus::Completed {
+                child_completed.notify_one();
+            }
+        }
+    });
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(BackgroundParentModel {
+            calls: AtomicUsize::new(0),
+            release_child,
+            child_completed,
+        }),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent
+        .run(
+            "delegate in the background",
+            RunOptions {
+                subagents: Some(manager.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.steps, 3);
+    assert_eq!(result.summary, "parent incorporated background result");
+    assert!(manager.take_notifications().is_empty());
+    manager.shutdown().await;
 }
 
 #[tokio::test]

@@ -27,6 +27,8 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
   `CLAUDE.md` 和 rules 目录。
 - **语义级代码理解**：自动发现已安装的语言服务器，仅在查询定义、引用、符号、Hover、
   调用层级或诊断时按需启动。
+- **受管理的子代理**：把实现、探索、规划或审查任务交给隔离模型上下文，独立任务可并发，
+  已完成的子代理可保留原对话继续追问。
 - **高缓存命中设计**：稳定的 Prompt 前缀、服务端 Prompt Cache 提示，以及本地精确响应缓存，
   让重复运行更快、更省 Token。
 - **适合跑榜**：支持非交互运行、JSONL 事件与轨迹、最终 Git Patch、验证重试和 JSONL
@@ -120,6 +122,9 @@ Agent 工作时仍可继续编辑。
 /processes   查看受管理的后台进程
 /stop-process <id>
              停止一个后台进程树
+/agents      查看子代理及其运行状态
+/stop-agent <id>
+             取消排队中或运行中的子代理
 /steer       在下一个模型边界修正当前任务
 /followup    将任务排到当前任务结束之后
 /queue       查看待处理的 steer 和 follow-up
@@ -164,7 +169,7 @@ Agent 工作时仍可继续编辑。
 时中断。不支持全屏界面的终端可设置 `WECODE_TUI=0` 使用普通行模式。交互渲染和模型流式事件与
 `wecode run --output jsonl`、`wecode bench`
 完全分离，因此 Benchmark 的事件输出和 Agent 执行不依赖终端 UI 或流式增量事件。
-计划、提问、Skill、后台进程和 LSP 工具只在交互式 `wecode` 会话中暴露；机器执行仍使用
+计划、提问、Skill、后台进程、LSP 和子代理工具只在交互式 `wecode` 会话中暴露；机器执行仍使用
 原来的七工具配置和同一缓存命名空间。
 
 交互 Agent 可以让开发服务器、Watcher 或长时间测试在后台运行，同时继续对话。
@@ -173,6 +178,16 @@ Agent 工作时仍可继续编辑。
 进程完成时会自动显示在时间线，并在下一个安全模型边界通知 Agent，无需反复 sleep 或轮询。
 任务运行中也可使用 `/processes` 和 `/stop-process <id>`。切换会话或退出 WeCode 时，所有
 受管理进程都会被回收。
+
+面对适合拆分的工作，交互 Agent 可以使用四个内置角色：`general-purpose` 可检查、编辑和
+验证；`explore`、`plan`、`review` 为只读角色。前台委派会等待有大小限制的结果；后台委派
+立即返回，在时间线显示进度，并在下一个安全模型边界自动注入完成通知。完成后的子代理会保留
+自己的独立对话，父 Agent 可以继续追问，无需从头开始。父任务运行时也可使用 `/agents` 和
+`/stop-agent <id>`。
+
+所有子代理共用当前工作树。多个可编辑子代理只能处理互不重叠的任务；目前还没有自动 Git
+Worktree 隔离。并发数、记录数、步骤、运行时间、输出、通知队列和等待时间都有硬上限。
+子代理不能递归创建子代理；切换会话或退出 WeCode 时，所有仍在运行的子任务都会被取消。
 
 长对话会在本地压缩为确定且有硬上限的结构化摘要，保留任务意图、检查或修改过的路径、
 验证结果、失败信息和待处理事实。重复压缩会替换上一份摘要，不会产生“摘要套摘要”；
@@ -284,6 +299,23 @@ extensions = { ".rs" = "rust" }
 startup_timeout_seconds = 15
 enabled = true
 
+[subagents]
+enabled = true
+max_agents = 16
+max_concurrent = 4
+max_steps = 20
+max_runtime_seconds = 900
+max_output_bytes = 32768
+wait_timeout_seconds = 30
+
+# 可选自定义角色；名称相同时会覆盖内置角色。
+[subagents.roles.security-review]
+description = "只读安全审查"
+prompt = "检查委派变更中的具体安全风险，并报告准确路径。"
+read_only = true
+model = "provider-model-id"
+max_steps = 12
+
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
@@ -359,6 +391,24 @@ wecode run -C /path/to/repository \
 `~/.wecode/config.toml`。WeCode 不会执行隐式发现的项目 `.wecode.toml` 中配置的 LSP
 命令；请先审查文件，确认可信后再用 `--config` 显式传入。LSP 不会进入 `wecode run` 和
 `wecode bench`，因此它们仍保持完全相同的七工具 Prompt 和缓存路径。
+
+### 受管理的子代理
+
+子代理只在交互会话中启用。`spawn_agent` 支持前台和后台执行，也可以在一个模型轮次中同时
+启动多个互相独立的后台任务。`agent_status`、`send_agent`、`wait_agent` 和 `stop_agent`
+提供其余生命周期操作。后台完成通知会自动推送，正常使用不需要轮询。
+
+内置 `general-purpose` 角色使用普通七个编码工具；`explore`、`plan`、`review` 只拥有
+`read_file`、`list_files`、`glob`、`grep` 和 `finish`。可以在
+`[subagents.roles.<名称>]` 下定义其他角色，并配置有大小限制的 Prompt、只读策略、当前
+Provider 上的模型覆盖和步骤限制。WeCode 不会信任隐式发现的项目 `.wecode.toml` 中的
+自定义角色；请先检查文件，再通过 `--config` 显式传入，或把可信角色放在
+`~/.wecode/config.toml`。
+
+每个子代理复用当前 Provider 和已有响应缓存实现；密钥仍从受保护的用户配置读取，不会被复制
+到 Prompt 或子进程环境。管理器采用懒加载，创建时不会请求 Provider 或启动子代理。
+`wecode run` 与 `wecode bench` 完全不暴露子代理，因此 Benchmark 的工具、系统提示词、
+缓存命名空间和轨迹行为保持不变。
 
 ### MCP 工具
 

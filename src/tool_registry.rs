@@ -10,11 +10,13 @@ pub enum ToolProfile {
     #[default]
     Coding,
     Interactive,
+    ReadOnlySubagent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolConcurrency {
     ParallelRead,
+    ParallelSpawn,
     Exclusive,
     Terminal,
 }
@@ -41,12 +43,23 @@ impl ToolRegistry {
 
     pub fn for_profile(profile: ToolProfile) -> Self {
         let mut registry = Self::builtins();
-        if profile == ToolProfile::Interactive {
-            registry.tools.extend(
-                interactive_definitions()
-                    .into_iter()
-                    .map(|definition| ToolSpec { definition }),
-            );
+        match profile {
+            ToolProfile::Coding => {}
+            ToolProfile::Interactive => {
+                registry.tools.extend(
+                    interactive_definitions()
+                        .into_iter()
+                        .map(|definition| ToolSpec { definition }),
+                );
+            }
+            ToolProfile::ReadOnlySubagent => {
+                registry.tools.retain(|tool| {
+                    matches!(
+                        tool.definition.get("name").and_then(Value::as_str),
+                        Some("read_file" | "list_files" | "glob" | "grep" | "finish")
+                    )
+                });
+            }
         }
         registry
     }
@@ -74,7 +87,17 @@ impl ToolRegistry {
             | Action::ProcessStatus { .. }
             | Action::WriteProcess { .. }
             | Action::StopProcess { .. }
-            | Action::Lsp { .. } => ToolConcurrency::Exclusive,
+            | Action::Lsp { .. }
+            | Action::AgentStatus { .. }
+            | Action::SendAgent { .. }
+            | Action::WaitAgent { .. }
+            | Action::StopAgent { .. }
+            | Action::SpawnAgent {
+                background: false, ..
+            } => ToolConcurrency::Exclusive,
+            Action::SpawnAgent {
+                background: true, ..
+            } => ToolConcurrency::ParallelSpawn,
             Action::Finish { .. } => ToolConcurrency::Terminal,
         }
     }
@@ -86,14 +109,19 @@ impl ToolRegistry {
                 actions.len()
             );
         }
-        if actions.len() > 1
-            && !actions
+        if actions.len() > 1 {
+            let concurrency = Self::concurrency(&actions[0]);
+            if !matches!(
+                concurrency,
+                ToolConcurrency::ParallelRead | ToolConcurrency::ParallelSpawn
+            ) || !actions
                 .iter()
-                .all(|action| Self::concurrency(action) == ToolConcurrency::ParallelRead)
-        {
-            bail!(
-                "only read_file, list_files, glob, and grep may be called together; shell, apply_patch, and finish must run one at a time"
-            );
+                .all(|action| Self::concurrency(action) == concurrency)
+            {
+                bail!(
+                    "only independent repository reads or background spawn_agent calls may be batched; other tools must run one at a time"
+                );
+            }
         }
         Ok(())
     }
@@ -226,6 +254,47 @@ impl ToolRegistry {
                     .get("query")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
+            },
+            "spawn_agent" => Action::SpawnAgent {
+                description: get_string("description"),
+                prompt: get_string("prompt"),
+                agent_type: arguments
+                    .get("agent_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("general-purpose")
+                    .to_owned(),
+                background: arguments
+                    .get("background")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                model: arguments
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            },
+            "agent_status" => Action::AgentStatus {
+                agent_id: arguments.get("agent_id").and_then(Value::as_u64),
+            },
+            "send_agent" => Action::SendAgent {
+                agent_id: arguments
+                    .get("agent_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                message: get_string("message"),
+            },
+            "wait_agent" => Action::WaitAgent {
+                agent_ids: arguments
+                    .get("agent_ids")
+                    .and_then(Value::as_array)
+                    .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+                    .unwrap_or_default(),
+                timeout_seconds: arguments.get("timeout_seconds").and_then(Value::as_u64),
+            },
+            "stop_agent" => Action::StopAgent {
+                agent_id: arguments
+                    .get("agent_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
             },
             "finish" => Action::Finish {
                 summary: get_string("summary"),
@@ -418,6 +487,79 @@ fn interactive_definitions() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "name": "spawn_agent",
+            "description": "Delegate a concrete, self-contained task to an isolated-context subagent. Foreground waits for the result; background returns immediately and sends an automatic completion notification. Multiple independent background spawns may be called together.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "Short 3-8 word task label."},
+                    "prompt": {"type": "string", "description": "Complete task brief with relevant context, scope, expected output, and whether edits are allowed."},
+                    "agent_type": {
+                        "type": "string",
+                        "description": "Role: general-purpose, explore, plan, review, or a configured custom role. Defaults to general-purpose."
+                    },
+                    "background": {"type": "boolean", "description": "Run independently in the background. Completion is delivered automatically."},
+                    "model": {"type": "string", "description": "Optional model override on the current provider."}
+                },
+                "required": ["description", "prompt"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "agent_status",
+            "description": "List subagents or inspect one subagent's bounded status and latest result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "integer", "minimum": 1, "description": "Agent to inspect. Omit to list all agents."}
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "send_agent",
+            "description": "Send additional context to a running subagent at its next safe model boundary, or continue a completed subagent with its preserved conversation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "integer", "minimum": 1},
+                    "message": {"type": "string", "description": "New context or follow-up task."}
+                },
+                "required": ["agent_id", "message"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "wait_agent",
+            "description": "Wait briefly for one or more background subagents when their results are required before useful work can continue. Completion notifications otherwise arrive automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "items": {"type": "integer", "minimum": 1}
+                    },
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60}
+                },
+                "required": ["agent_ids"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "stop_agent",
+            "description": "Cancel a queued or running subagent. Its completed conversation remains inspectable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "integer", "minimum": 1}
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }
+        }),
     ]
 }
 
@@ -579,8 +721,9 @@ mod tests {
     fn interactive_profile_adds_session_tools_without_changing_benchmark_tools() {
         let coding = ToolRegistry::for_profile(ToolProfile::Coding).definitions();
         let interactive = ToolRegistry::for_profile(ToolProfile::Interactive).definitions();
+        let read_only = ToolRegistry::for_profile(ToolProfile::ReadOnlySubagent).definitions();
         assert_eq!(coding.len(), 7);
-        assert_eq!(interactive.len(), 15);
+        assert_eq!(interactive.len(), 20);
         assert_eq!(
             interactive
                 .iter()
@@ -596,7 +739,105 @@ mod tests {
                 "write_process",
                 "stop_process",
                 "lsp",
+                "spawn_agent",
+                "agent_status",
+                "send_agent",
+                "wait_agent",
+                "stop_agent",
             ]
+        );
+        assert_eq!(
+            read_only
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "list_files", "glob", "grep", "finish"]
+        );
+    }
+
+    #[test]
+    fn only_background_subagent_spawns_may_be_batched() {
+        let background = |description: &str| Action::SpawnAgent {
+            description: description.into(),
+            prompt: "Inspect the repository.".into(),
+            agent_type: "explore".into(),
+            background: true,
+            model: None,
+        };
+        assert!(ToolRegistry::validate_batch(&[background("one"), background("two")]).is_ok());
+
+        let mut foreground = background("foreground");
+        if let Action::SpawnAgent {
+            ref mut background, ..
+        } = foreground
+        {
+            *background = false;
+        }
+        assert!(ToolRegistry::validate_batch(&[foreground, background("background")]).is_err());
+        assert!(
+            ToolRegistry::validate_batch(&[
+                background("background"),
+                Action::ReadFile {
+                    path: "src/lib.rs".into(),
+                    offset: None,
+                    limit: None,
+                },
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subagent_calls_preserve_lifecycle_fields() {
+        assert_eq!(
+            ToolRegistry::parse_call(
+                "spawn_agent",
+                json!({
+                    "description": "review parser",
+                    "prompt": "Inspect parser edge cases.",
+                    "agent_type": "review",
+                    "background": true,
+                    "model": "small-model"
+                })
+            )
+            .unwrap(),
+            Action::SpawnAgent {
+                description: "review parser".into(),
+                prompt: "Inspect parser edge cases.".into(),
+                agent_type: "review".into(),
+                background: true,
+                model: Some("small-model".into()),
+            }
+        );
+        assert_eq!(
+            ToolRegistry::parse_call("agent_status", json!({"agent_id": 3})).unwrap(),
+            Action::AgentStatus { agent_id: Some(3) }
+        );
+        assert_eq!(
+            ToolRegistry::parse_call(
+                "send_agent",
+                json!({"agent_id": 3, "message": "Check Windows too."})
+            )
+            .unwrap(),
+            Action::SendAgent {
+                agent_id: 3,
+                message: "Check Windows too.".into(),
+            }
+        );
+        assert_eq!(
+            ToolRegistry::parse_call(
+                "wait_agent",
+                json!({"agent_ids": [2, 3], "timeout_seconds": 12})
+            )
+            .unwrap(),
+            Action::WaitAgent {
+                agent_ids: vec![2, 3],
+                timeout_seconds: Some(12),
+            }
+        );
+        assert_eq!(
+            ToolRegistry::parse_call("stop_agent", json!({"agent_id": 3})).unwrap(),
+            Action::StopAgent { agent_id: 3 }
         );
     }
 

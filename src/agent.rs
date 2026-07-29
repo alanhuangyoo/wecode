@@ -3,7 +3,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,9 +27,11 @@ use crate::model::{
 };
 use crate::protocol::{Action, PlanStatus, parse_action};
 use crate::skills::SkillCatalog;
+use crate::subagent::SubagentManager;
 use crate::tool_registry::ToolRegistry;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
+const READ_ONLY_SUBAGENT_PROMPT: &str = include_str!("../prompts/subagent_readonly.md");
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
@@ -45,6 +47,8 @@ pub struct RunOptions {
     pub user_input: Option<UserInputClient>,
     pub processes: Option<BackgroundProcessManager>,
     pub lsp: Option<LspManager>,
+    pub subagents: Option<SubagentManager>,
+    pub additional_system_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -241,8 +245,17 @@ impl Agent {
         let approval = options.approval.clone();
         let processes = options.processes.clone();
         let lsp = options.lsp.clone();
-        let system_prompt =
+        let subagents = options.subagents.clone();
+        let mut system_prompt =
             system_prompt(self.tool_profile, self.mcp.as_ref(), self.skills.as_ref());
+        if let Some(additional) = options
+            .additional_system_prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(additional);
+        }
 
         for step in 1..=self.config.agent.max_steps {
             if cancellation
@@ -261,6 +274,7 @@ impl Agent {
             steps = step;
             self.deliver_process_notifications(step, &processes, &recorder, &mut messages)?;
             self.deliver_lsp_notifications(step, &lsp, &recorder, &mut messages)?;
+            self.deliver_subagent_notifications(step, &subagents, &recorder, &mut messages)?;
             self.deliver_steering(step, &input_queue, &recorder, &mut messages)?;
             let removed = context.compact(&mut messages);
             if removed > 0 {
@@ -392,14 +406,24 @@ impl Agent {
                 for action in &actions {
                     self.emit_action(step, action, &recorder)?;
                 }
+                let concurrency = ToolRegistry::concurrency(&actions[0]);
                 let batch_budget =
                     (self.config.agent.command_output_bytes / actions.len()).max(1_024);
                 let batch_tools = FileTools::new(self.workspace.clone(), batch_budget);
-                let execution = join_all(
-                    actions
-                        .iter()
-                        .map(|action| execute_read_action(&batch_tools, action)),
-                );
+                let execution = join_all(actions.iter().map(|action| async {
+                    match concurrency {
+                        crate::tool_registry::ToolConcurrency::ParallelRead => {
+                            execute_read_action(&batch_tools, action).await
+                        }
+                        crate::tool_registry::ToolConcurrency::ParallelSpawn => {
+                            execute_background_spawn_action(&subagents, action).await
+                        }
+                        crate::tool_registry::ToolConcurrency::Exclusive
+                        | crate::tool_registry::ToolConcurrency::Terminal => {
+                            unreachable!("validated batches use a parallel concurrency class")
+                        }
+                    }
+                }));
                 let results = if let Some(cancellation) = &cancellation {
                     tokio::select! {
                         biased;
@@ -925,6 +949,96 @@ impl Agent {
                         &mut messages,
                     )?;
                 }
+                Action::SpawnAgent {
+                    description,
+                    prompt,
+                    agent_type,
+                    background,
+                    model,
+                } => {
+                    let started = Instant::now();
+                    let result = match &subagents {
+                        Some(subagents) => {
+                            subagents
+                                .spawn_cancellable(
+                                    description,
+                                    prompt,
+                                    agent_type,
+                                    background,
+                                    model,
+                                    cancellation.clone(),
+                                )
+                                .await
+                        }
+                        None => Err(anyhow::anyhow!("subagents are unavailable in this run")),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
+                Action::AgentStatus { agent_id } => {
+                    let started = Instant::now();
+                    let result = match &subagents {
+                        Some(subagents) => subagents.status(agent_id).await,
+                        None => Err(anyhow::anyhow!("subagents are unavailable in this run")),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
+                Action::SendAgent { agent_id, message } => {
+                    let started = Instant::now();
+                    let result = match &subagents {
+                        Some(subagents) => subagents.send(agent_id, message).await,
+                        None => Err(anyhow::anyhow!("subagents are unavailable in this run")),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
+                Action::WaitAgent {
+                    agent_ids,
+                    timeout_seconds,
+                } => {
+                    let started = Instant::now();
+                    let result = match &subagents {
+                        Some(subagents) => cancellable_execution(
+                            &cancellation,
+                            subagents.wait(&agent_ids, timeout_seconds),
+                        )
+                        .await
+                        .unwrap_or_else(|| Err(anyhow::anyhow!("subagent wait cancelled"))),
+                        None => Err(anyhow::anyhow!("subagents are unavailable in this run")),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
+                Action::StopAgent { agent_id } => {
+                    let started = Instant::now();
+                    let result = match &subagents {
+                        Some(subagents) => subagents.stop(agent_id).await,
+                        None => Err(anyhow::anyhow!("subagents are unavailable in this run")),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
                 Action::Finish {
                     summary: proposed_summary,
                 } => {
@@ -936,9 +1050,15 @@ impl Agent {
                     )?;
                     let lsp_updates =
                         self.deliver_lsp_notifications(step, &lsp, &recorder, &mut messages)?;
+                    let subagent_updates = self.deliver_subagent_notifications(
+                        step,
+                        &subagents,
+                        &recorder,
+                        &mut messages,
+                    )?;
                     let steering =
                         self.deliver_steering(step, &input_queue, &recorder, &mut messages)?;
-                    if process_updates + lsp_updates + steering > 0 {
+                    if process_updates + lsp_updates + subagent_updates + steering > 0 {
                         continue;
                     }
                     if let Some(plan) = &options.plan {
@@ -1320,6 +1440,33 @@ impl Agent {
         Ok(count)
     }
 
+    fn deliver_subagent_notifications(
+        &self,
+        step: usize,
+        subagents: &Option<SubagentManager>,
+        recorder: &JsonlSink,
+        messages: &mut Vec<Message>,
+    ) -> Result<usize> {
+        let Some(subagents) = subagents else {
+            return Ok(0);
+        };
+        let notifications = subagents.take_notifications();
+        if notifications.is_empty() {
+            return Ok(0);
+        }
+        let count = notifications.len();
+        let observation = format!("SUBAGENT NOTIFICATIONS:\n{}", notifications.join("\n\n"));
+        self.emit(
+            recorder,
+            Event::ToolOutput {
+                step,
+                output: observation.clone(),
+            },
+        )?;
+        messages.push(Message::user(observation));
+        Ok(count)
+    }
+
     async fn session_id(&self, task: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.workspace.to_string_lossy().as_bytes());
@@ -1404,8 +1551,10 @@ fn system_prompt(
     mcp: Option<&McpManager>,
     skills: Option<&SkillCatalog>,
 ) -> String {
-    if profile == ToolProfile::Coding {
-        return SYSTEM_PROMPT.to_owned();
+    match profile {
+        ToolProfile::Coding => return SYSTEM_PROMPT.to_owned(),
+        ToolProfile::ReadOnlySubagent => return READ_ONLY_SUBAGENT_PROMPT.to_owned(),
+        ToolProfile::Interactive => {}
     }
     let mut prompt = format!(
         "{SYSTEM_PROMPT}\n\n\
@@ -1427,6 +1576,13 @@ polling repeatedly while a process runs.\n\
 symbols, implementations, call hierarchy, and diagnostics. Prefer it over text search when symbol \
 identity matters. Servers start lazily, and bounded error/warning diagnostics arrive automatically \
 after synchronized edits.\n\
+- spawn_agent delegates a concrete, self-contained task to an isolated context. Use foreground \
+when its result is required next; use background only for independent, non-overlapping work. \
+Multiple independent background agents may be launched in one turn. Available built-in roles are \
+general-purpose (can edit), explore (read-only), plan (read-only), and review (read-only).\n\
+- Background subagent completion is delivered automatically. Do not sleep or poll; agent_status \
+inspects state, send_agent continues the same preserved conversation, wait_agent waits only when \
+no useful independent work remains, and stop_agent cancels owned work.\n\
 Without native tools, these actions are:\n\
 {{\"action\":\"update_plan\",\"explanation\":\"<optional reason>\",\"plan\":[{{\"step\":\"<task step>\",\"status\":\"pending|in_progress|completed\"}}]}}\n\
 {{\"action\":\"request_user_input\",\"questions\":[{{\"id\":\"<snake_case>\",\"header\":\"<short heading>\",\"question\":\"<question>\",\"options\":[{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}},{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}}]}}]}}\n\
@@ -1435,7 +1591,12 @@ Without native tools, these actions are:\n\
 {{\"action\":\"process_status\",\"process_id\":1,\"cursor\":0}}\n\
 {{\"action\":\"write_process\",\"process_id\":1,\"input\":\"<text>\",\"newline\":true}}\n\
 {{\"action\":\"stop_process\",\"process_id\":1}}\n\
-{{\"action\":\"lsp\",\"operation\":\"go_to_definition|find_references|hover|document_symbols|workspace_symbols|go_to_implementation|prepare_call_hierarchy|incoming_calls|outgoing_calls|diagnostics\",\"path\":\"src/file.rs\",\"line\":1,\"character\":1,\"query\":\"<workspace symbol query>\"}}\n"
+{{\"action\":\"lsp\",\"operation\":\"go_to_definition|find_references|hover|document_symbols|workspace_symbols|go_to_implementation|prepare_call_hierarchy|incoming_calls|outgoing_calls|diagnostics\",\"path\":\"src/file.rs\",\"line\":1,\"character\":1,\"query\":\"<workspace symbol query>\"}}\n\
+{{\"action\":\"spawn_agent\",\"description\":\"<short label>\",\"prompt\":\"<complete task brief>\",\"agent_type\":\"general-purpose|explore|plan|review\",\"background\":false,\"model\":\"<optional override>\"}}\n\
+{{\"action\":\"agent_status\",\"agent_id\":1}}\n\
+{{\"action\":\"send_agent\",\"agent_id\":1,\"message\":\"<follow-up context>\"}}\n\
+{{\"action\":\"wait_agent\",\"agent_ids\":[1,2],\"timeout_seconds\":30}}\n\
+{{\"action\":\"stop_agent\",\"agent_id\":1}}\n"
     );
     if let Some(mcp) = mcp {
         let tools = mcp.tools();
@@ -1596,6 +1757,43 @@ fn action_detail(action: &Action) -> String {
                 .unwrap_or_default();
             format!("{} · {path}{position}{query}", operation.as_str())
         }
+        Action::SpawnAgent {
+            description,
+            agent_type,
+            background,
+            model,
+            ..
+        } => format!(
+            "{description} · {agent_type} · {}{}",
+            if *background {
+                "background"
+            } else {
+                "foreground"
+            },
+            model
+                .as_deref()
+                .map(|model| format!(" · {model}"))
+                .unwrap_or_default()
+        ),
+        Action::AgentStatus { agent_id } => agent_id
+            .map(|id| format!("subagent #{id}"))
+            .unwrap_or_else(|| "all subagents".into()),
+        Action::SendAgent { agent_id, message } => {
+            format!("subagent #{agent_id} · {} bytes", message.len())
+        }
+        Action::WaitAgent {
+            agent_ids,
+            timeout_seconds,
+        } => format!(
+            "subagents {} · up to {}s",
+            agent_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            timeout_seconds.unwrap_or(30)
+        ),
+        Action::StopAgent { agent_id } => format!("subagent #{agent_id}"),
         Action::Finish { summary } => summary.clone(),
     }
 }
@@ -1683,10 +1881,54 @@ async fn execute_read_action(file_tools: &FileTools, action: &Action) -> Result<
         | Action::WriteProcess { .. }
         | Action::StopProcess { .. }
         | Action::Lsp { .. }
+        | Action::SpawnAgent { .. }
+        | Action::AgentStatus { .. }
+        | Action::SendAgent { .. }
+        | Action::WaitAgent { .. }
+        | Action::StopAgent { .. }
         | Action::Finish { .. } => {
             unreachable!("only read-only actions enter the parallel executor")
         }
     }
+}
+
+async fn execute_background_spawn_action(
+    subagents: &Option<SubagentManager>,
+    action: &Action,
+) -> Result<ExecutionResult> {
+    let Action::SpawnAgent {
+        description,
+        prompt,
+        agent_type,
+        background: true,
+        model,
+    } = action
+    else {
+        unreachable!("only background spawn actions enter the parallel spawn executor")
+    };
+    let started = Instant::now();
+    let output = match subagents {
+        Some(subagents) => {
+            subagents
+                .spawn(
+                    description.clone(),
+                    prompt.clone(),
+                    agent_type.clone(),
+                    true,
+                    model.clone(),
+                )
+                .await?
+        }
+        None => bail!("subagents are unavailable in this run"),
+    };
+    Ok(ExecutionResult {
+        exit_code: Some(0),
+        stdout: output,
+        stderr: String::new(),
+        duration_ms: started.elapsed().as_millis(),
+        timed_out: false,
+        truncated_bytes: 0,
+    })
 }
 
 fn compact_arguments(arguments: &serde_json::Value) -> String {

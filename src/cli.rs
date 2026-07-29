@@ -29,6 +29,7 @@ use crate::model::{ToolProfile, create_model, create_model_with_tools};
 use crate::session::ChatSession;
 use crate::setup::{SetupOptions, run as run_setup};
 use crate::skills::SkillCatalog;
+use crate::subagent::SubagentManager;
 use crate::ui::TerminalUi;
 
 #[derive(Debug, Parser)]
@@ -345,6 +346,8 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 user_input: None,
                 processes: None,
                 lsp: None,
+                subagents: None,
+                additional_system_prompt: None,
             },
         )
         .await;
@@ -379,6 +382,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let view = shell.view();
     let mut processes = create_background_process_manager(&config, &workspace, &view);
     let mut lsp = create_lsp_manager(&config, &workspace, &view)?;
+    let mut subagents = create_subagent_manager(&config, &workspace, &view)?;
     let (mut session, mut conversation, initial_source) = match start {
         ChatStart::New => (
             ChatSession::create(
@@ -564,6 +568,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::New) => {
                 processes.shutdown_all().await;
                 lsp.shutdown().await;
+                subagents.shutdown().await;
                 let _ = run_hook_event(
                     &hooks,
                     HookEvent::SessionEnd,
@@ -587,6 +592,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 input_queue.clear();
                 processes = create_background_process_manager(&config, &workspace, &view);
                 lsp = create_lsp_manager(&config, &workspace, &view)?;
+                subagents = create_subagent_manager(&config, &workspace, &view)?;
                 let started = run_hook_event(
                     &hooks,
                     HookEvent::SessionStart,
@@ -651,6 +657,9 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 lsp.restart().await;
                 view.notice("Language servers will restart lazily on the next matching request.")?;
             }
+            ChatInput::Command(ChatCommand::Agents) => {
+                view.show_subagents(&subagents.summaries().await)?;
+            }
             ChatInput::Command(ChatCommand::Skills) => view.show_skills(&skills.skills())?,
             ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
             ChatInput::Command(ChatCommand::Processes) => {
@@ -659,6 +668,9 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::StopProcess(process_id)) => {
                 stop_background_process(&processes, process_id, &view).await?;
             }
+            ChatInput::Command(ChatCommand::StopAgent(agent_id)) => {
+                stop_subagent(&subagents, agent_id, &view).await?;
+            }
             ChatInput::Command(ChatCommand::Fork(selector)) => {
                 let source_id = session.summary().id.clone();
                 let previous_session = session.summary().clone();
@@ -666,6 +678,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     Ok((next_session, next_conversation)) => {
                         processes.shutdown_all().await;
                         lsp.shutdown().await;
+                        subagents.shutdown().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -684,6 +697,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         input_queue.clear();
                         processes = create_background_process_manager(&config, &workspace, &view);
                         lsp = create_lsp_manager(&config, &workspace, &view)?;
+                        subagents = create_subagent_manager(&config, &workspace, &view)?;
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -740,6 +754,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     Ok((next_session, next_conversation)) => {
                         processes.shutdown_all().await;
                         lsp.shutdown().await;
+                        subagents.shutdown().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -758,6 +773,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         input_queue.clear();
                         processes = create_background_process_manager(&config, &workspace, &view);
                         lsp = create_lsp_manager(&config, &workspace, &view)?;
+                        subagents = create_subagent_manager(&config, &workspace, &view)?;
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -804,6 +820,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     Ok((next_session, next_conversation)) => {
                         processes.shutdown_all().await;
                         lsp.shutdown().await;
+                        subagents.shutdown().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -822,6 +839,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         input_queue.clear();
                         processes = create_background_process_manager(&config, &workspace, &view);
                         lsp = create_lsp_manager(&config, &workspace, &view)?;
+                        subagents = create_subagent_manager(&config, &workspace, &view)?;
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -949,6 +967,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &mut user_input_requests,
                         &processes,
                         &lsp,
+                        &subagents,
                         &mcp,
                         &skills,
                         &commands,
@@ -1018,6 +1037,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     }
     processes.shutdown_all().await;
     lsp.shutdown().await;
+    subagents.shutdown().await;
     let _ = run_hook_event(
         &hooks,
         HookEvent::SessionEnd,
@@ -1065,6 +1085,19 @@ fn create_lsp_manager(config: &Config, workspace: &Path, view: &ChatView) -> Res
     Ok(manager)
 }
 
+fn create_subagent_manager(
+    config: &Config,
+    workspace: &Path,
+    view: &ChatView,
+) -> Result<SubagentManager> {
+    let manager = SubagentManager::new(config.clone(), workspace.to_path_buf())?;
+    let event_view = view.clone();
+    manager.set_event_handler(move |event| {
+        let _ = event_view.show_subagent_event(&event);
+    });
+    Ok(manager)
+}
+
 async fn stop_background_process(
     processes: &BackgroundProcessManager,
     process_id: Option<u64>,
@@ -1076,6 +1109,22 @@ async fn stop_background_process(
     };
     match processes.stop(process_id).await {
         Ok(_) => view.notice(format!("Stopped background process #{process_id}."))?,
+        Err(error) => view.warning(error.to_string())?,
+    }
+    Ok(())
+}
+
+async fn stop_subagent(
+    subagents: &SubagentManager,
+    agent_id: Option<u64>,
+    view: &ChatView,
+) -> Result<()> {
+    let Some(agent_id) = agent_id else {
+        view.warning("Usage: /stop-agent <id>")?;
+        return Ok(());
+    };
+    match subagents.stop(agent_id).await {
+        Ok(message) => view.notice(message)?,
         Err(error) => view.warning(error.to_string())?,
     }
     Ok(())
@@ -1160,6 +1209,7 @@ async fn run_active_chat_task(
     user_input_requests: &mut tokio::sync::mpsc::UnboundedReceiver<UserInputEnvelope>,
     processes: &BackgroundProcessManager,
     lsp: &LspManager,
+    subagents: &SubagentManager,
     mcp: &McpManager,
     skills: &SkillCatalog,
     commands: &CommandCatalog,
@@ -1181,6 +1231,7 @@ async fn run_active_chat_task(
             user_input: Some(user_input.clone()),
             processes: Some(processes.clone()),
             lsp: Some(lsp.clone()),
+            subagents: Some(subagents.clone()),
             ..Default::default()
         },
         conversation,
@@ -1230,6 +1281,14 @@ async fn run_active_chat_task(
                         view.notice(
                             "Language servers will restart lazily on the next matching request.",
                         )?;
+                        continue;
+                    }
+                    ChatInput::Command(ChatCommand::Agents) => {
+                        view.show_subagents(&subagents.summaries().await)?;
+                        continue;
+                    }
+                    ChatInput::Command(ChatCommand::StopAgent(agent_id)) => {
+                        stop_subagent(subagents, *agent_id, view).await?;
                         continue;
                     }
                     _ => {}
@@ -1437,6 +1496,10 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Lsp)
                     | ChatInput::Command(ChatCommand::LspRestart) => {
                         unreachable!("LSP commands are handled before interaction dispatch")
+                    }
+                    ChatInput::Command(ChatCommand::Agents)
+                    | ChatInput::Command(ChatCommand::StopAgent(_)) => {
+                        unreachable!("subagent commands are handled before interaction dispatch")
                     }
                     ChatInput::Command(ChatCommand::Help) => view.show_help()?,
                     ChatInput::Command(ChatCommand::Approve)
