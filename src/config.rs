@@ -196,6 +196,62 @@ impl Default for ProcessesConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub auto_detect: bool,
+    pub request_timeout_seconds: u64,
+    pub max_message_bytes: usize,
+    pub max_file_bytes: usize,
+    pub max_output_bytes: usize,
+    pub diagnostic_settle_milliseconds: u64,
+    pub servers: BTreeMap<String, LspServerConfig>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_detect: true,
+            request_timeout_seconds: 30,
+            max_message_bytes: 8 * 1_024 * 1_024,
+            max_file_bytes: 8 * 1_024 * 1_024,
+            max_output_bytes: 24_000,
+            diagnostic_settle_milliseconds: 350,
+            servers: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub extensions: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
+    pub initialization_options: Option<serde_json::Value>,
+    pub settings: Option<serde_json::Value>,
+    pub startup_timeout_seconds: u64,
+    pub enabled: bool,
+}
+
+impl Default for LspServerConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            extensions: BTreeMap::new(),
+            env: BTreeMap::new(),
+            initialization_options: None,
+            settings: None,
+            startup_timeout_seconds: 15,
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct McpConfig {
@@ -368,6 +424,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub cache: CacheConfig,
     pub processes: ProcessesConfig,
+    pub lsp: LspConfig,
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub commands: CommandsConfig,
@@ -411,6 +468,17 @@ impl Config {
         {
             bail!(
                 "refusing to auto-start MCP commands from {}; review it, then pass --config {} explicitly or move trusted MCP configuration to {}",
+                path.display(),
+                path.display(),
+                default_config_path().display()
+            );
+        }
+        if enforce_project_trust
+            && automatically_loaded_project
+            && config.lsp.servers.values().any(|server| server.enabled)
+        {
+            bail!(
+                "refusing to auto-start LSP commands from {}; review it, then pass --config {} explicitly or move trusted LSP configuration to {}",
                 path.display(),
                 path.display(),
                 default_config_path().display()
@@ -483,6 +551,61 @@ impl Config {
         }
         if !(4 * 1_024..=16 * 1_024 * 1_024).contains(&self.processes.max_output_bytes) {
             bail!("processes.max_output_bytes must be between 4096 and 16777216");
+        }
+        if !(1..=300).contains(&self.lsp.request_timeout_seconds) {
+            bail!("lsp.request_timeout_seconds must be between 1 and 300");
+        }
+        if !(64 * 1_024..=32 * 1_024 * 1_024).contains(&self.lsp.max_message_bytes) {
+            bail!("lsp.max_message_bytes must be between 65536 and 33554432");
+        }
+        if !(4 * 1_024..=32 * 1_024 * 1_024).contains(&self.lsp.max_file_bytes) {
+            bail!("lsp.max_file_bytes must be between 4096 and 33554432");
+        }
+        if !(4 * 1_024..=1_024 * 1_024).contains(&self.lsp.max_output_bytes) {
+            bail!("lsp.max_output_bytes must be between 4096 and 1048576");
+        }
+        if self.lsp.diagnostic_settle_milliseconds > 5_000 {
+            bail!("lsp.diagnostic_settle_milliseconds cannot exceed 5000");
+        }
+        if self.lsp.servers.len() > 32 {
+            bail!("lsp cannot configure more than 32 servers");
+        }
+        for (name, server) in &self.lsp.servers {
+            validate_mcp_name(name, "server")?;
+            if server.command.trim().is_empty() || server.command.len() > 4_096 {
+                bail!("lsp server {name:?} command must contain between 1 and 4096 bytes");
+            }
+            if server.args.len() > 128
+                || server
+                    .args
+                    .iter()
+                    .any(|argument| argument.len() > 16 * 1_024)
+            {
+                bail!("lsp server {name:?} arguments exceed the configured limits");
+            }
+            if server.extensions.is_empty() || server.extensions.len() > 128 {
+                bail!("lsp server {name:?} must configure between 1 and 128 extensions");
+            }
+            for (extension, language) in &server.extensions {
+                if !extension.starts_with('.')
+                    || extension.len() > 32
+                    || language.trim().is_empty()
+                    || language.len() > 64
+                {
+                    bail!("lsp server {name:?} has an invalid extension mapping");
+                }
+            }
+            if server.env.len() > 128
+                || server
+                    .env
+                    .iter()
+                    .any(|(name, value)| !valid_env_name(name) || value.len() > 16 * 1_024)
+            {
+                bail!("lsp server {name:?} environment exceeds the configured limits");
+            }
+            if !(1..=300).contains(&server.startup_timeout_seconds) {
+                bail!("lsp server {name:?} startup_timeout_seconds must be between 1 and 300");
+            }
         }
         if self.mcp.servers.len() > 16 {
             bail!("mcp cannot configure more than 16 servers");
@@ -905,6 +1028,32 @@ mod tests {
     }
 
     #[test]
+    fn lsp_config_requires_bounded_trusted_server_definitions() {
+        let mut config = Config::default();
+        config.lsp.servers.insert(
+            "rust".into(),
+            LspServerConfig {
+                command: "rust-analyzer".into(),
+                extensions: BTreeMap::from([(".rs".into(), "rust".into())]),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config.lsp.max_message_bytes = 1;
+        assert!(config.validate().is_err());
+        config.lsp.max_message_bytes = 8 * 1_024 * 1_024;
+        config
+            .lsp
+            .servers
+            .get_mut("rust")
+            .unwrap()
+            .extensions
+            .clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn active_project_extensions_require_explicit_config_trust() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(".wecode.toml");
@@ -931,6 +1080,19 @@ paths = ["../external-skills"]
         .unwrap();
         let error = Config::load(temp.path(), None).unwrap_err();
         assert!(error.to_string().contains("refusing external skill paths"));
+        assert!(Config::load(temp.path(), Some(&path)).is_ok());
+
+        std::fs::write(
+            &path,
+            r#"
+[lsp.servers.rust]
+command = "rust-analyzer"
+extensions = { ".rs" = "rust" }
+"#,
+        )
+        .unwrap();
+        let error = Config::load(temp.path(), None).unwrap_err();
+        assert!(error.to_string().contains("refusing to auto-start LSP"));
         assert!(Config::load(temp.path(), Some(&path)).is_ok());
 
         std::fs::write(

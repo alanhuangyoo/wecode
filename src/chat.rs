@@ -24,6 +24,7 @@ use crate::hooks::{HookReport, HookStatus, HookSummary};
 use crate::input_queue::QueueSnapshot;
 use crate::instructions::InstructionSet;
 use crate::interaction::{PlanSnapshot, UserInputRequest};
+use crate::lsp::{LspEvent, LspServerStatus, LspServerSummary};
 use crate::mcp::{McpServerReport, McpServerState};
 use crate::protocol::PlanStatus;
 use crate::session::{SessionCheckpoint, SessionSummary};
@@ -45,6 +46,8 @@ pub enum ChatCommand {
     Help,
     History,
     Hooks,
+    Lsp,
+    LspRestart,
     Mcp,
     Fork(Option<String>),
     New,
@@ -232,6 +235,8 @@ fn command_completions(
         ("/cancel", "Cancel the active task"),
         ("/status", "Show session status"),
         ("/mcp", "Show MCP servers"),
+        ("/lsp", "Show language servers"),
+        ("/lsp-restart", "Restart language servers"),
         ("/hooks", "Show lifecycle hooks"),
         ("/commands", "Show reusable prompts"),
         ("/skills", "Show Agent Skills"),
@@ -359,6 +364,8 @@ impl ChatView {
              \n  {:12} Deny a pending action with optional feedback\
              \n  {:12} Show model, workspace, cache, and context\
              \n  {:12} Show MCP server and tool status\
+             \n  {:12} Show language-server status\
+             \n  {:12} Restart language servers\
              \n  {:12} Show lifecycle hooks\
              \n  {:12} Show reusable prompt commands\
              \n  {:12} Show discovered skills\
@@ -392,6 +399,8 @@ impl ChatView {
             "/deny [reason]",
             "/status",
             "/mcp",
+            "/lsp",
+            "/lsp-restart",
             "/hooks",
             "/commands",
             "/skills",
@@ -552,6 +561,58 @@ impl ChatView {
         }
         output.push('\n');
         self.output.print(output)
+    }
+
+    pub fn show_lsp(&self, servers: &[LspServerSummary]) -> Result<()> {
+        let mut output = format!(
+            "\n{} · {} available\n",
+            Style::new().cyan().bold().apply_to("Language servers"),
+            servers.len()
+        );
+        if servers.is_empty() {
+            output.push_str(
+                "  No installed or configured language servers detected.\n\
+                 \n  Configure [lsp.servers.<name>] or install a supported server.\n\n",
+            );
+            return self.output.print(output);
+        }
+        for server in servers {
+            output.push_str(&format!(
+                "  {:18} {:10} {} · {}\n",
+                server.name,
+                server.status.as_str(),
+                one_line(&server.command),
+                server.extensions.join(", ")
+            ));
+            if let Some(error) = &server.error {
+                output.push_str(&format!("    ! {}\n", one_line(error)));
+            }
+        }
+        output.push_str(
+            "\n  Servers start lazily when the agent queries or edits a matching file.\n\n",
+        );
+        self.output.print(output)
+    }
+
+    pub fn show_lsp_event(&self, event: &LspEvent) -> Result<()> {
+        let tone = match event.status {
+            LspServerStatus::Ready => TuiTone::Success,
+            LspServerStatus::Failed => TuiTone::Warning,
+            LspServerStatus::Available | LspServerStatus::Starting | LspServerStatus::Stopped => {
+                TuiTone::Dim
+            }
+        };
+        if self
+            .output
+            .tui_entry(format!("LSP · {}", event.server), &event.detail, tone)
+        {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "  lsp {} · {}\n",
+            event.server,
+            one_line(&event.detail)
+        ))
     }
 
     pub fn show_skills(&self, skills: &[Skill]) -> Result<()> {
@@ -1047,7 +1108,7 @@ fn render_welcome(
     welcome_row(
         &mut output,
         width,
-        "tools      repo · shell · patch · plan · ask · managed processes · finish",
+        "tools      repo · LSP · shell · patch · plan · ask · processes · finish",
     );
     welcome_row(
         &mut output,
@@ -1113,6 +1174,8 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/help" | "/?" => ChatInput::Command(ChatCommand::Help),
         "/history" => ChatInput::Command(ChatCommand::History),
         "/hooks" => ChatInput::Command(ChatCommand::Hooks),
+        "/lsp" => ChatInput::Command(ChatCommand::Lsp),
+        "/lsp-restart" => ChatInput::Command(ChatCommand::LspRestart),
         "/mcp" => ChatInput::Command(ChatCommand::Mcp),
         "/fork" | "/branch" => ChatInput::Command(ChatCommand::Fork(
             (!argument.is_empty()).then(|| argument.to_owned()),
@@ -1229,6 +1292,11 @@ mod tests {
             ChatInput::Command(ChatCommand::StopProcess(None))
         );
         assert_eq!(parse_input("/mcp"), ChatInput::Command(ChatCommand::Mcp));
+        assert_eq!(parse_input("/lsp"), ChatInput::Command(ChatCommand::Lsp));
+        assert_eq!(
+            parse_input("/lsp-restart"),
+            ChatInput::Command(ChatCommand::LspRestart)
+        );
         assert_eq!(
             parse_input("/hooks"),
             ChatInput::Command(ChatCommand::Hooks)

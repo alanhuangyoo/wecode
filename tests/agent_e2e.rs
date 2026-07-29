@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,14 +11,17 @@ use wecode::approval::{ApprovalClient, ApprovalDecision};
 use wecode::cache::ResponseCache;
 #[cfg(unix)]
 use wecode::config::McpServerConfig;
-use wecode::config::{ApprovalPolicy, CacheConfig, Config, SkillsConfig};
+use wecode::config::{
+    ApprovalPolicy, CacheConfig, Config, LspConfig, LspServerConfig, SkillsConfig,
+};
 use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
 use wecode::input_queue::InputQueue;
 use wecode::interaction::{PlanState, UserInputClient, UserInputResponse, resolve_answers};
+use wecode::lsp::LspManager;
 use wecode::mcp::McpManager;
 use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, ToolProfile, Usage};
-use wecode::protocol::{Action, PlanItem, PlanStatus, QuestionOption, UserQuestion};
+use wecode::protocol::{Action, LspOperation, PlanItem, PlanStatus, QuestionOption, UserQuestion};
 use wecode::skills::SkillCatalog;
 
 struct FakeModel {
@@ -1082,6 +1085,85 @@ async fn interactive_plain_text_is_a_smooth_final_response() {
     assert!(result.success);
     assert_eq!(result.steps, 1);
     assert_eq!(result.summary, "The review is complete.");
+}
+
+#[tokio::test]
+async fn interactive_lsp_result_reaches_the_next_model_turn() {
+    if Command::new("clangd").arg("--version").output().is_err() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    std::fs::write(
+        temp.path().join("sample.c"),
+        "static int add(int a, int b) { return a + b; }\nint main(void) { return add(1, 2); }\n",
+    )
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::Lsp {
+                operation: LspOperation::DocumentSymbols,
+                path: "sample.c".into(),
+                line: None,
+                character: None,
+                query: None,
+            },
+            Action::Finish {
+                summary: "found the C symbols".into(),
+            },
+        ])),
+    };
+    let lsp = LspManager::new(
+        LspConfig {
+            auto_detect: false,
+            servers: BTreeMap::from([(
+                "clangd".into(),
+                LspServerConfig {
+                    command: "clangd".into(),
+                    extensions: BTreeMap::from([(".c".into(), "c".into())]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        },
+        temp.path().to_path_buf(),
+        None,
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent
+        .run(
+            "inspect the symbols in sample.c",
+            RunOptions {
+                lsp: Some(lsp.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.iter().any(|message| {
+            message.content.contains("main") && message.content.contains("add")
+        }));
+    }
+    lsp.shutdown().await;
 }
 
 #[tokio::test]

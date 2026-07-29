@@ -23,6 +23,7 @@ use crate::instructions;
 use crate::interaction::{
     PlanState, UserInputClient, UserInputEnvelope, UserInputResponse, resolve_answers,
 };
+use crate::lsp::LspManager;
 use crate::mcp::McpManager;
 use crate::model::{ToolProfile, create_model, create_model_with_tools};
 use crate::session::ChatSession;
@@ -343,6 +344,7 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 plan: None,
                 user_input: None,
                 processes: None,
+                lsp: None,
             },
         )
         .await;
@@ -376,6 +378,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let shell = ChatShell::new(&commands.commands(), &skills.skills())?;
     let view = shell.view();
     let mut processes = create_background_process_manager(&config, &workspace, &view);
+    let mut lsp = create_lsp_manager(&config, &workspace, &view)?;
     let (mut session, mut conversation, initial_source) = match start {
         ChatStart::New => (
             ChatSession::create(
@@ -560,6 +563,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
             ChatInput::Command(ChatCommand::New) => {
                 processes.shutdown_all().await;
+                lsp.shutdown().await;
                 let _ = run_hook_event(
                     &hooks,
                     HookEvent::SessionEnd,
@@ -582,6 +586,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 plan.clear();
                 input_queue.clear();
                 processes = create_background_process_manager(&config, &workspace, &view);
+                lsp = create_lsp_manager(&config, &workspace, &view)?;
                 let started = run_hook_event(
                     &hooks,
                     HookEvent::SessionStart,
@@ -641,6 +646,11 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
             ChatInput::Command(ChatCommand::Hooks) => view.show_hooks(&hooks.summaries())?,
             ChatInput::Command(ChatCommand::Mcp) => view.show_mcp(&mcp.reports())?,
+            ChatInput::Command(ChatCommand::Lsp) => view.show_lsp(&lsp.summaries().await)?,
+            ChatInput::Command(ChatCommand::LspRestart) => {
+                lsp.restart().await;
+                view.notice("Language servers will restart lazily on the next matching request.")?;
+            }
             ChatInput::Command(ChatCommand::Skills) => view.show_skills(&skills.skills())?,
             ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
             ChatInput::Command(ChatCommand::Processes) => {
@@ -655,6 +665,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 match session.fork(&state_directory, &conversation, selector.as_deref()) {
                     Ok((next_session, next_conversation)) => {
                         processes.shutdown_all().await;
+                        lsp.shutdown().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -672,6 +683,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         processes = create_background_process_manager(&config, &workspace, &view);
+                        lsp = create_lsp_manager(&config, &workspace, &view)?;
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -727,6 +739,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 match session.rewind(&state_directory, &conversation, selector.as_deref()) {
                     Ok((next_session, next_conversation)) => {
                         processes.shutdown_all().await;
+                        lsp.shutdown().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -744,6 +757,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         processes = create_background_process_manager(&config, &workspace, &view);
+                        lsp = create_lsp_manager(&config, &workspace, &view)?;
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -789,6 +803,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 match resumed {
                     Ok((next_session, next_conversation)) => {
                         processes.shutdown_all().await;
+                        lsp.shutdown().await;
                         let _ = run_hook_event(
                             &hooks,
                             HookEvent::SessionEnd,
@@ -806,6 +821,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         processes = create_background_process_manager(&config, &workspace, &view);
+                        lsp = create_lsp_manager(&config, &workspace, &view)?;
                         let started = run_hook_event(
                             &hooks,
                             HookEvent::SessionStart,
@@ -932,6 +948,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &user_input,
                         &mut user_input_requests,
                         &processes,
+                        &lsp,
                         &mcp,
                         &skills,
                         &commands,
@@ -1000,6 +1017,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         }
     }
     processes.shutdown_all().await;
+    lsp.shutdown().await;
     let _ = run_hook_event(
         &hooks,
         HookEvent::SessionEnd,
@@ -1032,6 +1050,19 @@ fn create_background_process_manager(
         let _ = event_view.show_process_event(&event);
     });
     manager
+}
+
+fn create_lsp_manager(config: &Config, workspace: &Path, view: &ChatView) -> Result<LspManager> {
+    let manager = LspManager::new(
+        config.lsp.clone(),
+        workspace.to_path_buf(),
+        Some(config.model.api_key_env.clone()),
+    )?;
+    let event_view = view.clone();
+    manager.set_event_handler(move |event| {
+        let _ = event_view.show_lsp_event(&event);
+    });
+    Ok(manager)
 }
 
 async fn stop_background_process(
@@ -1128,6 +1159,7 @@ async fn run_active_chat_task(
     user_input: &UserInputClient,
     user_input_requests: &mut tokio::sync::mpsc::UnboundedReceiver<UserInputEnvelope>,
     processes: &BackgroundProcessManager,
+    lsp: &LspManager,
     mcp: &McpManager,
     skills: &SkillCatalog,
     commands: &CommandCatalog,
@@ -1148,6 +1180,7 @@ async fn run_active_chat_task(
             plan: Some(plan.clone()),
             user_input: Some(user_input.clone()),
             processes: Some(processes.clone()),
+            lsp: Some(lsp.clone()),
             ..Default::default()
         },
         conversation,
@@ -1186,6 +1219,17 @@ async fn run_active_chat_task(
                     }
                     ChatInput::Command(ChatCommand::StopProcess(process_id)) => {
                         stop_background_process(processes, *process_id, view).await?;
+                        continue;
+                    }
+                    ChatInput::Command(ChatCommand::Lsp) => {
+                        view.show_lsp(&lsp.summaries().await)?;
+                        continue;
+                    }
+                    ChatInput::Command(ChatCommand::LspRestart) => {
+                        lsp.restart().await;
+                        view.notice(
+                            "Language servers will restart lazily on the next matching request.",
+                        )?;
                         continue;
                     }
                     _ => {}
@@ -1389,6 +1433,10 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Processes)
                     | ChatInput::Command(ChatCommand::StopProcess(_)) => {
                         unreachable!("process commands are handled before interaction dispatch")
+                    }
+                    ChatInput::Command(ChatCommand::Lsp)
+                    | ChatInput::Command(ChatCommand::LspRestart) => {
+                        unreachable!("LSP commands are handled before interaction dispatch")
                     }
                     ChatInput::Command(ChatCommand::Help) => view.show_help()?,
                     ChatInput::Command(ChatCommand::Approve)

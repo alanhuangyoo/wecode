@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use futures_util::future::join_all;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::ProcessesConfig;
@@ -20,8 +20,6 @@ const MAX_POLL_BYTES: usize = 16 * 1_024;
 const MAX_NOTIFICATION_BYTES: usize = 4 * 1_024;
 const MAX_NOTIFICATIONS: usize = 64;
 const PROCESS_TICK: Duration = Duration::from_millis(50);
-#[cfg(unix)]
-const TERMINATION_GRACE: Duration = Duration::from_millis(300);
 
 type ProcessEventHandler = Arc<dyn Fn(BackgroundProcessEvent) + Send + Sync>;
 
@@ -251,7 +249,7 @@ impl BackgroundProcessManager {
         };
 
         let mut process = self.inner.executor.prepare_shell_command(command)?;
-        configure_process_group(&mut process);
+        crate::process_tree::configure(&mut process);
         process
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -565,7 +563,7 @@ async fn supervise(
     let completion = loop {
         tokio::select! {
             _ = &mut deadline => {
-                terminate_process_tree(&mut child).await;
+                crate::process_tree::terminate(&mut child).await;
                 break Completion::TimedOut;
             }
             command = commands.recv() => {
@@ -575,11 +573,11 @@ async fn supervise(
                         let _ = response.send(result.map_err(|error| error.to_string()));
                     }
                     Some(ProcessCommand::Stop { response }) => {
-                        terminate_process_tree(&mut child).await;
+                        crate::process_tree::terminate(&mut child).await;
                         break Completion::Killed(response);
                     }
                     None => {
-                        terminate_process_tree(&mut child).await;
+                        crate::process_tree::terminate(&mut child).await;
                         break Completion::Killed(None);
                     }
                 }
@@ -715,54 +713,6 @@ async fn write_process_input(
     }
     stdin.flush().await?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    command.as_std_mut().process_group(0);
-}
-
-#[cfg(windows)]
-fn configure_process_group(_command: &mut Command) {}
-
-#[cfg(unix)]
-async fn terminate_process_tree(child: &mut Child) {
-    let Some(process_id) = child.id() else {
-        return;
-    };
-    send_process_group_signal(process_id, "-TERM").await;
-    tokio::time::sleep(TERMINATION_GRACE).await;
-    send_process_group_signal(process_id, "-KILL").await;
-    let _ = child.kill().await;
-}
-
-#[cfg(unix)]
-async fn send_process_group_signal(process_id: u32, signal: &str) {
-    let _ = Command::new("/bin/kill")
-        .arg(signal)
-        .arg(format!("-{process_id}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-}
-
-#[cfg(windows)]
-async fn terminate_process_tree(child: &mut Child) {
-    if let Some(process_id) = child.id() {
-        let process_id = process_id.to_string();
-        let _ = Command::new("taskkill")
-            .args(["/PID", &process_id, "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-    let _ = child.kill().await;
 }
 
 fn prune_finished(state: &mut ManagerState, max_entries: usize) {

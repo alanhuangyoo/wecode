@@ -25,6 +25,8 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
   缓存标识，避免每轮破坏 Prompt Cache。
 - **理解仓库规范**：从仓库根目录到当前工作区分层加载受限大小的 `AGENTS.md`、
   `CLAUDE.md` 和 rules 目录。
+- **语义级代码理解**：自动发现已安装的语言服务器，仅在查询定义、引用、符号、Hover、
+  调用层级或诊断时按需启动。
 - **高缓存命中设计**：稳定的 Prompt 前缀、服务端 Prompt Cache 提示，以及本地精确响应缓存，
   让重复运行更快、更省 Token。
 - **适合跑榜**：支持非交互运行、JSONL 事件与轨迹、最终 Git Patch、验证重试和 JSONL
@@ -129,6 +131,8 @@ Agent 工作时仍可继续编辑。
 /deny        拒绝操作并可提供原因
 /status      查看模型、工作区、缓存和上下文
 /mcp         查看 MCP 服务器和工具状态
+/lsp         查看已发现、已配置和运行中的语言服务器
+/lsp-restart 停止语言服务器，并在下次需要时重新启动
 /hooks       查看生命周期 Hooks
 /commands    查看可复用 Prompt 命令
 /skills      查看发现的 Agent Skills
@@ -160,8 +164,8 @@ Agent 工作时仍可继续编辑。
 时中断。不支持全屏界面的终端可设置 `WECODE_TUI=0` 使用普通行模式。交互渲染和模型流式事件与
 `wecode run --output jsonl`、`wecode bench`
 完全分离，因此 Benchmark 的事件输出和 Agent 执行不依赖终端 UI 或流式增量事件。
-计划、提问、Skill 和后台进程工具只在交互式 `wecode` 会话中暴露；机器执行仍使用原来的
-七工具配置和同一缓存命名空间。
+计划、提问、Skill、后台进程和 LSP 工具只在交互式 `wecode` 会话中暴露；机器执行仍使用
+原来的七工具配置和同一缓存命名空间。
 
 交互 Agent 可以让开发服务器、Watcher 或长时间测试在后台运行，同时继续对话。
 `start_process` 会返回进程 ID；`process_status` 使用可复用游标增量读取有界输出；
@@ -263,6 +267,23 @@ max_processes = 8
 max_runtime_seconds = 3600
 max_output_bytes = 131072
 
+[lsp]
+enabled = true
+auto_detect = true
+request_timeout_seconds = 30
+max_message_bytes = 8388608
+max_file_bytes = 8388608
+max_output_bytes = 24000
+diagnostic_settle_milliseconds = 350
+
+# 可选：覆盖自动发现映射，或添加其他服务器。
+[lsp.servers.rust]
+command = "rust-analyzer"
+args = []
+extensions = { ".rs" = "rust" }
+startup_timeout_seconds = 15
+enabled = true
+
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
@@ -320,6 +341,24 @@ wecode run -C /path/to/repository \
 状态读取会返回 `next_cursor`、报告已经淘汰的字节，不会把无限日志注入模型上下文。子进程
 不会继承模型服务商的 API Key 环境变量。该功能不会给 `wecode run` 或 `wecode bench`
 增加任何工具。
+
+### 语言服务器智能
+
+交互 Agent 提供一个轻量 `lsp` 工具，支持跳转定义、查找引用、Hover、文档与工作区符号、
+实现、调用层级和诊断。成功应用 Patch 后会同步匹配文件，并在下一个安全模型边界注入有硬
+上限的错误和警告诊断。使用 `/lsp` 查看服务器状态，使用 `/lsp-restart` 清除失败或过期状态。
+
+启用 `auto_detect = true` 后，WeCode 会识别已安装的 `rust-analyzer`、
+`typescript-language-server`、`basedpyright`/`pyright`、`gopls`、`clangd`、
+`sourcekit-lsp`、`lua-language-server`、`zls` 和 `nil`。发现过程不会启动任何进程；
+只有 Agent 查询或编辑匹配的源码文件时才会按需启动。协议消息、源码文件、返回结果、诊断
+队列和已跟踪文档都有硬上限；切换会话或退出时会回收整个语言服务器进程树。语言服务器也
+不会继承常见模型服务商 API Key 环境变量。
+
+`[lsp.servers.<名称>]` 下的配置会优先于自动发现映射。可信命令建议放在用户级
+`~/.wecode/config.toml`。WeCode 不会执行隐式发现的项目 `.wecode.toml` 中配置的 LSP
+命令；请先审查文件，确认可信后再用 `--config` 显式传入。LSP 不会进入 `wecode run` 和
+`wecode bench`，因此它们仍保持完全相同的七工具 Prompt 和缓存路径。
 
 ### MCP 工具
 

@@ -20,6 +20,7 @@ use crate::git::{collect_patch, head_id};
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
 use crate::interaction::{PlanState, UserAnswer, UserInputClient, UserInputResponse};
+use crate::lsp::LspManager;
 use crate::mcp::McpManager;
 use crate::model::{
     CompletionRequest, Model, ModelStream, ModelStreamEvent, ToolProfile, Usage, action_batch_text,
@@ -43,6 +44,7 @@ pub struct RunOptions {
     pub plan: Option<PlanState>,
     pub user_input: Option<UserInputClient>,
     pub processes: Option<BackgroundProcessManager>,
+    pub lsp: Option<LspManager>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -238,6 +240,7 @@ impl Agent {
         let input_queue = options.input_queue.clone();
         let approval = options.approval.clone();
         let processes = options.processes.clone();
+        let lsp = options.lsp.clone();
         let system_prompt =
             system_prompt(self.tool_profile, self.mcp.as_ref(), self.skills.as_ref());
 
@@ -257,6 +260,7 @@ impl Agent {
             }
             steps = step;
             self.deliver_process_notifications(step, &processes, &recorder, &mut messages)?;
+            self.deliver_lsp_notifications(step, &lsp, &recorder, &mut messages)?;
             self.deliver_steering(step, &input_queue, &recorder, &mut messages)?;
             let removed = context.compact(&mut messages);
             if removed > 0 {
@@ -598,8 +602,13 @@ impl Agent {
                             break;
                         }
                     }
+                    let affected_paths = crate::patch::affected_paths(&patch).unwrap_or_default();
                     let result = executor.apply_patch(&patch).await;
+                    let patch_applied = result.is_ok();
                     self.handle_execution(step, result, &recorder, &mut messages)?;
+                    if patch_applied && let Some(lsp) = &lsp {
+                        lsp.sync_paths(&affected_paths).await;
+                    }
                 }
                 Action::UpdatePlan { explanation, plan } => {
                     if let Some(state) = &options.plan {
@@ -892,6 +901,30 @@ impl Agent {
                         &mut messages,
                     )?;
                 }
+                Action::Lsp {
+                    operation,
+                    path,
+                    line,
+                    character,
+                    query,
+                } => {
+                    let started = Instant::now();
+                    let result = match &lsp {
+                        Some(lsp) => cancellable_execution(
+                            &cancellation,
+                            lsp.execute(operation, &path, line, character, query.as_deref()),
+                        )
+                        .await
+                        .unwrap_or_else(|| Err(anyhow::anyhow!("LSP request cancelled"))),
+                        None => Err(anyhow::anyhow!("LSP is unavailable in this run")),
+                    };
+                    self.handle_execution(
+                        step,
+                        background_operation_result(started, result),
+                        &recorder,
+                        &mut messages,
+                    )?;
+                }
                 Action::Finish {
                     summary: proposed_summary,
                 } => {
@@ -901,9 +934,11 @@ impl Agent {
                         &recorder,
                         &mut messages,
                     )?;
+                    let lsp_updates =
+                        self.deliver_lsp_notifications(step, &lsp, &recorder, &mut messages)?;
                     let steering =
                         self.deliver_steering(step, &input_queue, &recorder, &mut messages)?;
-                    if process_updates + steering > 0 {
+                    if process_updates + lsp_updates + steering > 0 {
                         continue;
                     }
                     if let Some(plan) = &options.plan {
@@ -1258,6 +1293,33 @@ impl Agent {
         Ok(count)
     }
 
+    fn deliver_lsp_notifications(
+        &self,
+        step: usize,
+        lsp: &Option<LspManager>,
+        recorder: &JsonlSink,
+        messages: &mut Vec<Message>,
+    ) -> Result<usize> {
+        let Some(lsp) = lsp else {
+            return Ok(0);
+        };
+        let notifications = lsp.take_notifications();
+        if notifications.is_empty() {
+            return Ok(0);
+        }
+        let count = notifications.len();
+        let observation = format!("LSP NOTIFICATIONS:\n{}", notifications.join("\n\n"));
+        self.emit(
+            recorder,
+            Event::ToolOutput {
+                step,
+                output: observation.clone(),
+            },
+        )?;
+        messages.push(Message::user(observation));
+        Ok(count)
+    }
+
     async fn session_id(&self, task: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.workspace.to_string_lossy().as_bytes());
@@ -1361,6 +1423,10 @@ dev servers, watchers, and extended tests; never append shell background operato
 - write_process sends bounded stdin; stop_process terminates the owned child process tree.\n\
 - Completion notifications are delivered automatically. Continue useful work instead of sleeping or \
 polling repeatedly while a process runs.\n\
+- lsp queries semantic code intelligence with one-based positions: definitions, references, hover, \
+symbols, implementations, call hierarchy, and diagnostics. Prefer it over text search when symbol \
+identity matters. Servers start lazily, and bounded error/warning diagnostics arrive automatically \
+after synchronized edits.\n\
 Without native tools, these actions are:\n\
 {{\"action\":\"update_plan\",\"explanation\":\"<optional reason>\",\"plan\":[{{\"step\":\"<task step>\",\"status\":\"pending|in_progress|completed\"}}]}}\n\
 {{\"action\":\"request_user_input\",\"questions\":[{{\"id\":\"<snake_case>\",\"header\":\"<short heading>\",\"question\":\"<question>\",\"options\":[{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}},{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}}]}}]}}\n\
@@ -1368,7 +1434,8 @@ Without native tools, these actions are:\n\
 {{\"action\":\"start_process\",\"command\":\"<foreground command>\",\"description\":\"<purpose>\"}}\n\
 {{\"action\":\"process_status\",\"process_id\":1,\"cursor\":0}}\n\
 {{\"action\":\"write_process\",\"process_id\":1,\"input\":\"<text>\",\"newline\":true}}\n\
-{{\"action\":\"stop_process\",\"process_id\":1}}\n"
+{{\"action\":\"stop_process\",\"process_id\":1}}\n\
+{{\"action\":\"lsp\",\"operation\":\"go_to_definition|find_references|hover|document_symbols|workspace_symbols|go_to_implementation|prepare_call_hierarchy|incoming_calls|outgoing_calls|diagnostics\",\"path\":\"src/file.rs\",\"line\":1,\"character\":1,\"query\":\"<workspace symbol query>\"}}\n"
     );
     if let Some(mcp) = mcp {
         let tools = mcp.tools();
@@ -1512,6 +1579,23 @@ fn action_detail(action: &Action) -> String {
             if *newline { " + newline" } else { "" }
         ),
         Action::StopProcess { process_id } => format!("process {process_id}"),
+        Action::Lsp {
+            operation,
+            path,
+            line,
+            character,
+            query,
+        } => {
+            let position = match (line, character) {
+                (Some(line), Some(character)) => format!(":{line}:{character}"),
+                _ => String::new(),
+            };
+            let query = query
+                .as_deref()
+                .map(|query| format!(" · {query}"))
+                .unwrap_or_default();
+            format!("{} · {path}{position}{query}", operation.as_str())
+        }
         Action::Finish { summary } => summary.clone(),
     }
 }
@@ -1598,6 +1682,7 @@ async fn execute_read_action(file_tools: &FileTools, action: &Action) -> Result<
         | Action::ProcessStatus { .. }
         | Action::WriteProcess { .. }
         | Action::StopProcess { .. }
+        | Action::Lsp { .. }
         | Action::Finish { .. } => {
             unreachable!("only read-only actions enter the parallel executor")
         }
@@ -1624,12 +1709,12 @@ fn looks_like_action_attempt(text: &str) -> bool {
         || text.contains("\"action\"")
 }
 
-async fn cancellable_execution<F>(
+async fn cancellable_execution<F, T>(
     cancellation: &Option<CancellationToken>,
     execution: F,
-) -> Option<Result<ExecutionResult>>
+) -> Option<Result<T>>
 where
-    F: Future<Output = Result<ExecutionResult>>,
+    F: Future<Output = Result<T>>,
 {
     if let Some(cancellation) = cancellation {
         tokio::select! {

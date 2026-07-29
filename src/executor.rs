@@ -112,12 +112,7 @@ impl Executor {
         let (program, args): (&str, &[&str]) = ("/bin/sh", &["-lc", shell_command]);
         let mut command = Command::new(program);
         command.args(args).current_dir(&self.workspace);
-        for name in SECRET_ENV_VARS {
-            command.env_remove(name);
-        }
-        if let Some(name) = &self.extra_secret_env {
-            command.env_remove(name);
-        }
+        scrub_secret_environment(&mut command, self.extra_secret_env.as_deref());
         Ok(command)
     }
 
@@ -176,6 +171,15 @@ impl Executor {
             timed_out,
             truncated_bytes: stdout.omitted.saturating_add(stderr.omitted),
         })
+    }
+}
+
+pub(crate) fn scrub_secret_environment(command: &mut Command, extra_secret_env: Option<&str>) {
+    for name in SECRET_ENV_VARS {
+        command.env_remove(name);
+    }
+    if let Some(name) = extra_secret_env {
+        command.env_remove(name);
     }
 }
 

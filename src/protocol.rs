@@ -39,6 +39,51 @@ pub struct UserQuestion {
     pub options: Vec<QuestionOption>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspOperation {
+    GoToDefinition,
+    FindReferences,
+    Hover,
+    DocumentSymbols,
+    WorkspaceSymbols,
+    GoToImplementation,
+    PrepareCallHierarchy,
+    IncomingCalls,
+    OutgoingCalls,
+    Diagnostics,
+}
+
+impl LspOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GoToDefinition => "go_to_definition",
+            Self::FindReferences => "find_references",
+            Self::Hover => "hover",
+            Self::DocumentSymbols => "document_symbols",
+            Self::WorkspaceSymbols => "workspace_symbols",
+            Self::GoToImplementation => "go_to_implementation",
+            Self::PrepareCallHierarchy => "prepare_call_hierarchy",
+            Self::IncomingCalls => "incoming_calls",
+            Self::OutgoingCalls => "outgoing_calls",
+            Self::Diagnostics => "diagnostics",
+        }
+    }
+
+    pub fn requires_position(self) -> bool {
+        matches!(
+            self,
+            Self::GoToDefinition
+                | Self::FindReferences
+                | Self::Hover
+                | Self::GoToImplementation
+                | Self::PrepareCallHierarchy
+                | Self::IncomingCalls
+                | Self::OutgoingCalls
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
@@ -136,6 +181,16 @@ pub enum Action {
     StopProcess {
         process_id: u64,
     },
+    Lsp {
+        operation: LspOperation,
+        path: String,
+        #[serde(default)]
+        line: Option<u32>,
+        #[serde(default)]
+        character: Option<u32>,
+        #[serde(default)]
+        query: Option<String>,
+    },
     Finish {
         summary: String,
     },
@@ -158,6 +213,7 @@ impl Action {
             Self::ProcessStatus { .. } => "process_status",
             Self::WriteProcess { .. } => "write_process",
             Self::StopProcess { .. } => "stop_process",
+            Self::Lsp { .. } => "lsp",
             Self::Finish { .. } => "finish",
         }
     }
@@ -212,6 +268,15 @@ impl Action {
             Self::ProcessStatus { .. } => "inspect background processes",
             Self::WriteProcess { .. } => "write background process stdin",
             Self::StopProcess { .. } => "stop background process",
+            Self::Lsp {
+                operation, path, ..
+            } => {
+                if path.is_empty() {
+                    operation.as_str()
+                } else {
+                    path
+                }
+            }
             Self::Finish { summary } => summary,
         }
     }
@@ -287,6 +352,30 @@ pub(crate) fn validate_action(action: &Action) -> Result<()> {
         }
         Action::WriteProcess { input, .. } if input.len() > 64 * 1_024 => {
             bail!("background process input cannot exceed 65536 bytes")
+        }
+        Action::Lsp {
+            operation,
+            path,
+            line,
+            character,
+            query,
+        } => {
+            if path.trim().is_empty() {
+                bail!("lsp path cannot be empty");
+            }
+            if path.len() > 4_096 {
+                bail!("lsp path cannot exceed 4096 bytes");
+            }
+            if operation.requires_position()
+                && (line.is_none_or(|line| line == 0)
+                    || character.is_none_or(|character| character == 0))
+            {
+                bail!("this lsp operation requires 1-based line and character");
+            }
+            if query.as_ref().is_some_and(|query| query.len() > 1_024) {
+                bail!("lsp query cannot exceed 1024 bytes");
+            }
+            Ok(())
         }
         Action::Finish { summary } if summary.trim().is_empty() => {
             bail!("finish summary cannot be empty")

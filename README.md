@@ -29,6 +29,9 @@ runtime.
   and retain one stable provider cache identity across follow-up turns.
 - **Repository-aware** — bounded global and hierarchical `AGENTS.md`, `CLAUDE.md`, and rules
   directories are loaded from repository root to the active workspace.
+- **Semantic code intelligence** — installed language servers are detected automatically and
+  started only when definitions, references, symbols, hover, call hierarchy, or diagnostics are
+  needed.
 - **Cache efficient** — stable prompt prefixes, provider-side prompt-cache hints, and an on-disk
   exact-response cache for cheap, fast reruns.
 - **Benchmark ready** — non-interactive execution, JSONL events and trajectories, final Git patch
@@ -137,6 +140,8 @@ composer remains editable while the agent works.
 /deny        Deny the pending action with optional feedback
 /status      Show model, workspace, cache, and context
 /mcp         Show connected MCP servers and tools
+/lsp         Show detected, configured, and running language servers
+/lsp-restart Stop active language servers and restart them lazily
 /hooks       Show configured lifecycle hooks
 /commands    Show reusable prompt commands
 /skills      Show discovered Agent Skills
@@ -173,9 +178,9 @@ application is never interrupted halfway through. Set `WECODE_TUI=0` to use the 
 fallback in a terminal that does not support the full-screen interface.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
-depend on terminal rendering or delta events. Plan, question, skill, and managed-process tools are
-exposed only by interactive `wecode` sessions; machine-oriented runs retain the original seven-tool
-profile and the same cache namespace.
+depend on terminal rendering or delta events. Plan, question, skill, managed-process, and LSP tools
+are exposed only by interactive `wecode` sessions; machine-oriented runs retain the original
+seven-tool profile and the same cache namespace.
 
 Interactive agents can keep development servers, watchers, and long tests running without blocking
 the conversation. `start_process` returns an ID, `process_status` reads bounded output incrementally
@@ -283,6 +288,23 @@ max_processes = 8
 max_runtime_seconds = 3600
 max_output_bytes = 131072
 
+[lsp]
+enabled = true
+auto_detect = true
+request_timeout_seconds = 30
+max_message_bytes = 8388608
+max_file_bytes = 8388608
+max_output_bytes = 24000
+diagnostic_settle_milliseconds = 350
+
+# Optional: override auto-detection or add another server.
+[lsp.servers.rust]
+command = "rust-analyzer"
+args = []
+extensions = { ".rs" = "rust" }
+startup_timeout_seconds = 15
+enabled = true
+
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
@@ -342,6 +364,28 @@ The `[processes]` limits apply only to interactive managed processes. Output is 
 bounded ring buffer; status reads return `next_cursor`, report evicted bytes, and never inject
 unbounded logs into model context. The provider API-key environment variable is removed from child
 processes. This feature does not add tools to `wecode run` or `wecode bench`.
+
+### Language-server intelligence
+
+Interactive agents have one lightweight `lsp` tool for go-to-definition, references, hover,
+document and workspace symbols, implementations, call hierarchy, and diagnostics. Matching files
+are synchronized after successful patches, and bounded error/warning diagnostics are delivered to
+the model at the next safe boundary. Use `/lsp` to inspect availability and `/lsp-restart` to clear
+failed or stale server state.
+
+With `auto_detect = true`, WeCode recognizes installed `rust-analyzer`,
+`typescript-language-server`, `basedpyright`/`pyright`, `gopls`, `clangd`, `sourcekit-lsp`,
+`lua-language-server`, `zls`, and `nil`. Discovery does not launch anything: a server starts only
+after the agent queries or edits a matching source file. Protocol messages, source files, returned
+results, diagnostic queues, and tracked documents all have hard bounds, and server process trees
+are stopped when the session changes or exits. Common provider API-key variables are stripped from
+language-server environments.
+
+Configured servers under `[lsp.servers.<name>]` take precedence over auto-detected mappings. Keep
+trusted commands in `~/.wecode/config.toml`. WeCode refuses to execute configured LSP commands from
+an implicitly discovered project `.wecode.toml`; review it and pass it explicitly with `--config`
+if it is trusted. LSP remains disabled in `wecode run` and `wecode bench`, preserving their exact
+seven-tool prompt and cache path.
 
 ### MCP tools
 

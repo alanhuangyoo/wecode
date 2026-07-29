@@ -11,6 +11,27 @@ pub async fn apply_patch(workspace: &Path, patch: &str) -> Result<String> {
     tokio::task::spawn_blocking(move || apply_patch_sync(&workspace, &patch)).await?
 }
 
+pub fn affected_paths(patch: &str) -> Result<Vec<PathBuf>> {
+    let parsed = parse_patch(patch).context("invalid Codex apply_patch payload")?;
+    let mut paths = Vec::new();
+    for hunk in parsed.hunks {
+        match hunk {
+            Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => paths.push(path),
+            Hunk::UpdateFile {
+                path, move_path, ..
+            } => {
+                paths.push(path);
+                if let Some(move_path) = move_path {
+                    paths.push(move_path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 fn apply_patch_sync(workspace: &Path, patch: &str) -> Result<String> {
     let parsed = parse_patch(patch).context("invalid Codex apply_patch payload")?;
     let mut changed = Vec::with_capacity(parsed.hunks.len());
@@ -143,5 +164,19 @@ mod tests {
                 "*** Begin Patch\n*** Add File: link/escape.txt\n+bad\n*** End Patch";
             assert!(apply_patch(temp.path(), symlink_patch).await.is_err());
         }
+    }
+
+    #[test]
+    fn reports_every_path_affected_by_a_patch() {
+        let patch = "*** Begin Patch\n*** Add File: new.rs\n+new\n*** Update File: old.rs\n*** Move to: moved.rs\n@@\n-old\n+changed\n*** Delete File: gone.rs\n*** End Patch";
+        assert_eq!(
+            affected_paths(patch).unwrap(),
+            vec![
+                PathBuf::from("gone.rs"),
+                PathBuf::from("moved.rs"),
+                PathBuf::from("new.rs"),
+                PathBuf::from("old.rs"),
+            ]
+        );
     }
 }

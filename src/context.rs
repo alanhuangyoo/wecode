@@ -305,6 +305,19 @@ fn ingest_actions(content: &str, result: Option<&str>, facts: &mut SummaryFacts)
                     10,
                 );
             }
+            Action::Lsp {
+                operation, path, ..
+            } => {
+                push_fact(
+                    &mut facts.other,
+                    format!(
+                        "Queried LSP `{}` for `{}`.",
+                        operation.as_str(),
+                        single_line_excerpt(&path, MAX_FACT_BYTES)
+                    ),
+                    10,
+                );
+            }
             Action::Finish { summary } => {
                 push_fact(
                     &mut facts.other,

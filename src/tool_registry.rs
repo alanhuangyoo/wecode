@@ -73,7 +73,8 @@ impl ToolRegistry {
             | Action::StartProcess { .. }
             | Action::ProcessStatus { .. }
             | Action::WriteProcess { .. }
-            | Action::StopProcess { .. } => ToolConcurrency::Exclusive,
+            | Action::StopProcess { .. }
+            | Action::Lsp { .. } => ToolConcurrency::Exclusive,
             Action::Finish { .. } => ToolConcurrency::Terminal,
         }
     }
@@ -206,6 +207,25 @@ impl ToolRegistry {
                     .get("process_id")
                     .and_then(Value::as_u64)
                     .unwrap_or_default(),
+            },
+            "lsp" => Action::Lsp {
+                operation: serde_json::from_value(
+                    arguments.get("operation").cloned().unwrap_or(Value::Null),
+                )
+                .context("lsp operation is missing or invalid")?,
+                path: get_string("path"),
+                line: arguments
+                    .get("line")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                character: arguments
+                    .get("character")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                query: arguments
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
             },
             "finish" => Action::Finish {
                 summary: get_string("summary"),
@@ -365,6 +385,36 @@ fn interactive_definitions() -> Vec<Value> {
                     "process_id": {"type": "integer", "minimum": 1}
                 },
                 "required": ["process_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "lsp",
+            "description": "Query an installed Language Server for semantic code intelligence. Servers start lazily by file type. Positions are 1-based. Diagnostics also arrive automatically after files are synchronized.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": [
+                            "go_to_definition",
+                            "find_references",
+                            "hover",
+                            "document_symbols",
+                            "workspace_symbols",
+                            "go_to_implementation",
+                            "prepare_call_hierarchy",
+                            "incoming_calls",
+                            "outgoing_calls",
+                            "diagnostics"
+                        ]
+                    },
+                    "path": {"type": "string", "description": "Workspace-relative source file used for routing and document synchronization."},
+                    "line": {"type": "integer", "minimum": 1, "description": "1-based line for position operations."},
+                    "character": {"type": "integer", "minimum": 1, "description": "1-based UTF-16 character offset for position operations."},
+                    "query": {"type": "string", "description": "Symbol query for workspace_symbols."}
+                },
+                "required": ["operation", "path"],
                 "additionalProperties": false
             }
         }),
@@ -530,7 +580,7 @@ mod tests {
         let coding = ToolRegistry::for_profile(ToolProfile::Coding).definitions();
         let interactive = ToolRegistry::for_profile(ToolProfile::Interactive).definitions();
         assert_eq!(coding.len(), 7);
-        assert_eq!(interactive.len(), 14);
+        assert_eq!(interactive.len(), 15);
         assert_eq!(
             interactive
                 .iter()
@@ -545,6 +595,7 @@ mod tests {
                 "process_status",
                 "write_process",
                 "stop_process",
+                "lsp",
             ]
         );
     }
@@ -583,6 +634,33 @@ mod tests {
             }
         );
         assert!(ToolRegistry::parse_call("stop_process", json!({"process_id": 0})).is_err());
+    }
+
+    #[test]
+    fn lsp_calls_use_typed_operations_and_one_based_positions() {
+        assert_eq!(
+            ToolRegistry::parse_call(
+                "lsp",
+                json!({
+                    "operation": "go_to_definition",
+                    "path": "src/main.rs",
+                    "line": 10,
+                    "character": 7
+                })
+            )
+            .unwrap(),
+            Action::Lsp {
+                operation: crate::protocol::LspOperation::GoToDefinition,
+                path: "src/main.rs".into(),
+                line: Some(10),
+                character: Some(7),
+                query: None,
+            }
+        );
+        assert!(
+            ToolRegistry::parse_call("lsp", json!({"operation": "hover", "path": "src/main.rs"}))
+                .is_err()
+        );
     }
 
     #[test]
