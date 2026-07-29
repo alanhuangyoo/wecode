@@ -43,7 +43,7 @@ wecode providers
 Rust 1.85 or later is required.
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/alanhuangyoo/wecode.git
 cd wecode
 cargo install --path .
 ```

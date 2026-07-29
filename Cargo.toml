@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "A small, benchmark-oriented coding agent CLI"
 license = "MIT"
+repository = "https://github.com/alanhuangyoo/wecode"
+homepage = "https://github.com/alanhuangyoo/wecode"
 rust-version = "1.85"
 
 [dependencies]

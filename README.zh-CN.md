@@ -40,7 +40,7 @@ wecode providers
 需要 Rust 1.85 或更高版本。
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/alanhuangyoo/wecode.git
 cd wecode
 cargo install --path .
 ```
