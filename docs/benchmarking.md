@@ -47,6 +47,11 @@ Independent native read tools can execute concurrently inside one model step. Th
 are returned in provider call order and share one hard output budget, so trajectories remain
 deterministic and bounded. Repository mutations never execute in a parallel batch.
 
+Interactive-only `update_plan` and `request_user_input` tools are not included in `run --output
+jsonl` or `bench`. Those paths keep the original seven native tools, system prompt, and exact-cache
+namespace, so terminal interaction work cannot silently alter benchmark trajectories or invalidate
+existing benchmark cache entries.
+
 ## Terminal-Bench integration
 
 Run one task per container and pass the task instruction on stdin. Terminal-Bench may require

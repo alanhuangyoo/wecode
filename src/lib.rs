@@ -13,6 +13,7 @@ pub mod file_tools;
 pub mod git;
 pub mod input_queue;
 pub mod instructions;
+pub mod interaction;
 pub mod model;
 pub mod patch;
 pub mod protocol;

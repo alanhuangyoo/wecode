@@ -18,6 +18,8 @@ use crate::config::{
 };
 use crate::input_queue::QueueSnapshot;
 use crate::instructions::InstructionSet;
+use crate::interaction::{PlanSnapshot, UserInputRequest};
+use crate::protocol::PlanStatus;
 use crate::session::{SessionCheckpoint, SessionSummary};
 use crate::tui::{self, TuiHandle, TuiMessage, TuiTone};
 use crate::ui::TerminalOutput;
@@ -36,6 +38,7 @@ pub enum ChatCommand {
     History,
     Fork(Option<String>),
     New,
+    Plan,
     Rename(String),
     Rewind(Option<String>),
     Resume(Option<String>),
@@ -249,6 +252,7 @@ impl ChatView {
              \n  {:12} List checkpoints in the current session\
              \n  {:12} Fork from now or a selected checkpoint\
              \n  {:12} Rewind safely by forking from an earlier checkpoint\
+             \n  {:12} Show the current task plan\
              \n  {:12} Steer the active task at the next model boundary\
              \n  {:12} Queue work for after the active task\
              \n  {:12} Show pending steer and follow-up messages\
@@ -274,6 +278,7 @@ impl ChatView {
             "/checkpoints",
             "/fork [checkpoint]",
             "/rewind [checkpoint]",
+            "/plan",
             "/steer <text>",
             "/followup <text>",
             "/queue",
@@ -466,6 +471,10 @@ impl ChatView {
     }
 
     pub fn show_approval(&self, request: &ApprovalRequest) -> Result<()> {
+        self.output.set_tui_composer(
+            Some(" Approval decision ".into()),
+            Some("Type /approve, /approve-session, or /deny [reason]".into()),
+        );
         if self.output.tui_entry(
             "APPROVAL REQUIRED",
             format!(
@@ -490,6 +499,90 @@ impl ChatView {
             Style::new().cyan().apply_to("/approve-session"),
             Style::new().cyan().apply_to("/deny [reason]"),
         ))
+    }
+
+    pub fn show_question(&self, request: &UserInputRequest) -> Result<()> {
+        let mut body = String::new();
+        for (question_index, question) in request.questions.iter().enumerate() {
+            if question_index > 0 {
+                body.push('\n');
+            }
+            body.push_str(&format!("{} · {}\n", question.header, question.question));
+            for (option_index, option) in question.options.iter().enumerate() {
+                body.push_str(&format!(
+                    "  {}. {} — {}\n",
+                    option_index + 1,
+                    option.label,
+                    option.description
+                ));
+            }
+        }
+        if request.questions.len() > 1 {
+            body.push_str("\nAnswer each question in order, separated with semicolons.");
+        } else {
+            body.push_str("\nReply with an option number or type another answer.");
+        }
+        self.output.set_tui_composer(
+            Some(" Answer WeCode ".into()),
+            Some(
+                if request.questions.len() > 1 {
+                    "Answer each question; separate answers with semicolons"
+                } else {
+                    "Type an option number or a free-form answer"
+                }
+                .into(),
+            ),
+        );
+        if self.output.tui_entry("QUESTION", &body, TuiTone::Warning) {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "\n{}\n{}\n",
+            Style::new()
+                .magenta()
+                .bold()
+                .apply_to(format!("Question #{}", request.id)),
+            body
+        ))
+    }
+
+    pub fn clear_interaction_prompt(&self) {
+        self.output.set_tui_composer(None, None);
+    }
+
+    pub fn sync_plan(&self, plan: &PlanSnapshot) -> bool {
+        let lines = plan
+            .items
+            .iter()
+            .map(|item| {
+                let marker = match item.status {
+                    PlanStatus::Pending => "○",
+                    PlanStatus::InProgress => "◉",
+                    PlanStatus::Completed => "✓",
+                };
+                format!("{marker} {}", item.step)
+            })
+            .collect::<Vec<_>>();
+        self.output
+            .set_tui_plan((!lines.is_empty()).then_some(lines))
+    }
+
+    pub fn show_plan(&self, plan: &PlanSnapshot) -> Result<()> {
+        if plan.items.is_empty() {
+            return self.notice("No plan has been created for this session.");
+        }
+        if self.sync_plan(plan) {
+            return Ok(());
+        }
+        let mut output = format!("\n{}\n", Style::new().cyan().bold().apply_to("Plan"));
+        if let Some(explanation) = &plan.explanation {
+            output.push_str(&format!("  {explanation}\n"));
+        }
+        for item in &plan.items {
+            output.push_str(&format!("  [{}] {}\n", item.status.as_str(), item.step));
+        }
+        output.push('\n');
+        self.output.print(output)
     }
 
     pub fn notice(&self, message: impl AsRef<str>) -> Result<()> {
@@ -607,7 +700,7 @@ fn render_welcome(
     welcome_row(
         &mut output,
         width,
-        "tools      read · list · glob · grep · shell · patch · finish",
+        "tools      read · list · glob · grep · shell · patch · plan · ask · finish",
     );
     welcome_row(
         &mut output,
@@ -675,6 +768,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
             (!argument.is_empty()).then(|| argument.to_owned()),
         )),
         "/queue" => ChatInput::Command(ChatCommand::Queue),
+        "/plan" | "/todo" | "/todos" => ChatInput::Command(ChatCommand::Plan),
         "/rename" | "/name" => ChatInput::Command(ChatCommand::Rename(argument.to_owned())),
         "/resume" => ChatInput::Command(ChatCommand::Resume(
             (!argument.is_empty()).then(|| argument.to_owned()),
@@ -761,6 +855,7 @@ mod tests {
             parse_input("/rewind"),
             ChatInput::Command(ChatCommand::Rewind(None))
         );
+        assert_eq!(parse_input("/plan"), ChatInput::Command(ChatCommand::Plan));
         assert_eq!(
             parse_input("/model"),
             ChatInput::Command(ChatCommand::Status)

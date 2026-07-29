@@ -14,6 +14,7 @@ use crate::cache::ResponseCache;
 use crate::config::{ModelConfig, ProviderFamily};
 use crate::context::Message;
 use crate::protocol::Action;
+pub use crate::tool_registry::ToolProfile;
 pub(crate) use crate::tool_registry::ToolRegistry;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -126,23 +127,39 @@ pub fn create_model(
     api_key: Option<String>,
     cache: ResponseCache,
 ) -> Result<Box<dyn Model>> {
-    let namespace = cache_namespace(config, api_key.as_deref())?;
+    create_model_with_profile(config, api_key, cache, ToolProfile::Coding)
+}
+
+pub fn create_model_with_profile(
+    config: &ModelConfig,
+    api_key: Option<String>,
+    cache: ResponseCache,
+    tool_profile: ToolProfile,
+) -> Result<Box<dyn Model>> {
+    let namespace = cache_namespace(config, api_key.as_deref(), tool_profile)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .user_agent(concat!("wecode/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let inner: Arc<dyn RawModel> = match config.family {
-        ProviderFamily::OpenAiCompatible => {
-            Arc::new(openai::OpenAiModel::new(config.clone(), api_key, client))
-        }
+        ProviderFamily::OpenAiCompatible => Arc::new(openai::OpenAiModel::new(
+            config.clone(),
+            api_key,
+            client,
+            tool_profile,
+        )),
         ProviderFamily::Anthropic => Arc::new(anthropic::AnthropicModel::new(
             config.clone(),
             api_key,
             client,
+            tool_profile,
         )),
-        ProviderFamily::Gemini => {
-            Arc::new(gemini::GeminiModel::new(config.clone(), api_key, client))
-        }
+        ProviderFamily::Gemini => Arc::new(gemini::GeminiModel::new(
+            config.clone(),
+            api_key,
+            client,
+            tool_profile,
+        )),
     };
     Ok(Box::new(CachedModel {
         inner,
@@ -151,14 +168,19 @@ pub fn create_model(
     }))
 }
 
-fn cache_namespace(config: &ModelConfig, api_key: Option<&str>) -> Result<String> {
+fn cache_namespace(
+    config: &ModelConfig,
+    api_key: Option<&str>,
+    tool_profile: ToolProfile,
+) -> Result<String> {
     let credential_scope = api_key
         .map(credential_fingerprint)
         .unwrap_or_else(|| "anonymous".into());
-    Ok(format!(
-        "{}:{credential_scope}",
-        serde_json::to_string(config)?
-    ))
+    let config = serde_json::to_string(config)?;
+    Ok(match tool_profile {
+        ToolProfile::Coding => format!("{config}:{credential_scope}"),
+        ToolProfile::Interactive => format!("{config}:interactive:{credential_scope}"),
+    })
 }
 
 fn credential_fingerprint(api_key: &str) -> String {
@@ -181,8 +203,8 @@ fn merge_adjacent_messages(messages: &[Message]) -> Vec<Message> {
     result
 }
 
-pub(crate) fn tool_definitions() -> Vec<serde_json::Value> {
-    ToolRegistry::builtins().definitions()
+pub(crate) fn tool_definitions(profile: ToolProfile) -> Vec<serde_json::Value> {
+    ToolRegistry::for_profile(profile).definitions()
 }
 
 pub(crate) fn action_from_tool_call(name: &str, arguments: serde_json::Value) -> Result<Action> {
@@ -267,20 +289,32 @@ mod tests {
     #[test]
     fn cache_namespace_is_scoped_to_credentials_without_exposing_them() {
         let config = ModelConfig::default();
-        let first = cache_namespace(&config, Some("test-key-one")).unwrap();
-        let second = cache_namespace(&config, Some("test-key-two")).unwrap();
+        let first = cache_namespace(&config, Some("test-key-one"), ToolProfile::Coding).unwrap();
+        let second = cache_namespace(&config, Some("test-key-two"), ToolProfile::Coding).unwrap();
 
         assert_ne!(first, second);
         assert!(!first.contains("test-key-one"));
         assert_eq!(
             first,
-            cache_namespace(&config, Some("test-key-one")).unwrap()
+            format!(
+                "{}:{}",
+                serde_json::to_string(&config).unwrap(),
+                credential_fingerprint("test-key-one")
+            )
+        );
+        assert_eq!(
+            first,
+            cache_namespace(&config, Some("test-key-one"), ToolProfile::Coding).unwrap()
+        );
+        assert_ne!(
+            first,
+            cache_namespace(&config, Some("test-key-one"), ToolProfile::Interactive).unwrap()
         );
     }
 
     #[test]
     fn native_tool_definitions_map_to_actions() {
-        assert_eq!(tool_definitions().len(), 7);
+        assert_eq!(tool_definitions(ToolProfile::Coding).len(), 7);
         assert_eq!(
             action_from_tool_call(
                 "shell",

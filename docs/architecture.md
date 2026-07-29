@@ -23,7 +23,7 @@ Interactive shell -> append-only session log -> resume / checkpoint / fork
 Composer -> steer queue (next model boundary) / follow-up queue (next turn)
         |
         v
-Approval broker -> allow once / session grant / deny with feedback
+Plan state + question broker + approval broker
 ```
 
 ## Runtime boundaries
@@ -55,12 +55,18 @@ Approval broker -> allow once / session grant / deny with feedback
 - Approval requests use an in-process request/response channel rather than blocking stdin inside
   the agent. The composer remains responsive, decisions are paired by request ID, and dropped
   reviewers resolve to denial instead of hanging the run.
+- Interactive plans are model-visible, locally validated, restored from conversation actions, and
+  rendered in a fixed TUI panel. Question requests use a separate request/response channel and
+  temporarily turn the composer into a numbered-choice or free-form answer box.
+- Tool profiles are explicit. Interactive sessions add `update_plan` and `request_user_input`;
+  `run --output jsonl` and `bench` retain the seven-tool coding profile, unchanged system prompt,
+  and backward-compatible exact-cache namespace.
 - Runtime trajectories and caches are stored outside the target repository unless explicitly
   redirected.
 
 ## Agent loop
 
-The agent starts from a task and workspace description, then repeatedly requests one of seven
+The agent starts from a task and workspace description, then repeatedly requests one of seven core
 actions:
 
 1. `read_file`, `list_files`, `glob`, and `grep` inspect the workspace through bounded native
@@ -68,6 +74,11 @@ actions:
 2. `shell` runs build, test, version-control, and repository-specific commands.
 3. `apply_patch` performs a bounded, path-checked file change.
 4. `finish` returns the final summary after optional verification succeeds.
+
+Interactive sessions additionally expose `update_plan` and `request_user_input`. Both are
+exclusive control actions: they cannot be batched with repository reads or mutations. A dropped
+question reviewer resolves safely instead of leaving the agent hung. Once a plan exists, an
+incomplete plan prevents `finish` and becomes a tool observation so the model can reconcile it.
 
 Every turn emits typed events. Human mode opts into model deltas and renders compact live progress
 in the terminal. JSONL and benchmark sinks do not request deltas, so they retain the buffered

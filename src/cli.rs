@@ -17,7 +17,10 @@ use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
-use crate::model::create_model;
+use crate::interaction::{
+    PlanState, UserInputClient, UserInputEnvelope, UserInputResponse, resolve_answers,
+};
+use crate::model::{ToolProfile, create_model, create_model_with_profile};
 use crate::session::ChatSession;
 use crate::setup::{SetupOptions, run as run_setup};
 use crate::ui::TerminalUi;
@@ -332,6 +335,8 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 cancellation: Some(cancellation),
                 input_queue: None,
                 approval,
+                plan: None,
+                user_input: None,
             },
         )
         .await;
@@ -374,7 +379,10 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let mut agent: Option<Agent> = None;
     let input_queue = InputQueue::new();
     let (approval, mut approval_requests) = ApprovalClient::channel();
+    let (user_input, mut user_input_requests) = UserInputClient::channel();
+    let mut plan = PlanState::restore(conversation.messages());
     view.welcome(&config, &workspace, session.summary(), &instruction_set)?;
+    view.sync_plan(&plan.current());
     let mut inputs = shell.into_input_stream();
 
     loop {
@@ -395,6 +403,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     &config.model.model,
                 )?;
                 conversation = Conversation::default();
+                plan.clear();
                 input_queue.clear();
                 view.clear_screen(&config, &workspace, session.summary(), &instruction_set)?;
                 view.notice("Started a new session.")?;
@@ -424,12 +433,14 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
             ChatInput::Command(ChatCommand::Help) => view.show_help()?,
             ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
+            ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
             ChatInput::Command(ChatCommand::Fork(selector)) => {
                 let source_id = session.summary().id.clone();
                 match session.fork(&state_directory, &conversation, selector.as_deref()) {
                     Ok((next_session, next_conversation)) => {
                         session = next_session;
                         conversation = next_conversation;
+                        plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         view.clear_screen(
                             &config,
@@ -437,6 +448,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             session.summary(),
                             &instruction_set,
                         )?;
+                        view.sync_plan(&plan.current());
                         view.notice(format!(
                             "Forked session {} from {} with {} messages.",
                             session.summary().id,
@@ -464,6 +476,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     Ok((next_session, next_conversation)) => {
                         session = next_session;
                         conversation = next_conversation;
+                        plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         view.clear_screen(
                             &config,
@@ -471,6 +484,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             session.summary(),
                             &instruction_set,
                         )?;
+                        view.sync_plan(&plan.current());
                         view.notice(format!(
                             "Rewound safely into session {} from {} at {} messages; the original session is unchanged.",
                             session.summary().id,
@@ -488,6 +502,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     Ok((next_session, next_conversation)) => {
                         session = next_session;
                         conversation = next_conversation;
+                        plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         view.clear_screen(
                             &config,
@@ -495,6 +510,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             session.summary(),
                             &instruction_set,
                         )?;
+                        view.sync_plan(&plan.current());
                         view.notice(format!(
                             "Resumed session {} with {} messages.",
                             session.summary().id,
@@ -538,12 +554,18 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         }
                     };
                     let cache = ResponseCache::new(config.cache.clone())?;
-                    let model = create_model(&config.model, api_key, cache)?;
-                    agent = Some(Agent::new(
+                    let model = create_model_with_profile(
+                        &config.model,
+                        api_key,
+                        cache,
+                        ToolProfile::Interactive,
+                    )?;
+                    agent = Some(Agent::new_with_profile(
                         config.clone(),
                         model,
                         Box::new(TerminalUi::chat(view.output())),
                         workspace.clone(),
+                        ToolProfile::Interactive,
                     ));
                 }
 
@@ -560,6 +582,9 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &input_queue,
                         &approval,
                         &mut approval_requests,
+                        &plan,
+                        &user_input,
+                        &mut user_input_requests,
                         &mut inputs,
                         &view,
                     )
@@ -606,6 +631,9 @@ async fn run_active_chat_task(
     input_queue: &InputQueue,
     approval: &ApprovalClient,
     approval_requests: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalEnvelope>,
+    plan: &PlanState,
+    user_input: &UserInputClient,
+    user_input_requests: &mut tokio::sync::mpsc::UnboundedReceiver<UserInputEnvelope>,
     inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
     view: &ChatView,
 ) -> Result<ActiveChatResult> {
@@ -619,6 +647,8 @@ async fn run_active_chat_task(
             cancellation: Some(cancellation.clone()),
             input_queue: Some(input_queue.clone()),
             approval: Some(approval.clone()),
+            plan: Some(plan.clone()),
+            user_input: Some(user_input.clone()),
             ..Default::default()
         },
         conversation,
@@ -626,6 +656,7 @@ async fn run_active_chat_task(
     tokio::pin!(run);
     let mut exit_requested = false;
     let mut pending_approval: Option<ApprovalEnvelope> = None;
+    let mut pending_user_input: Option<UserInputEnvelope> = None;
 
     let result = loop {
         tokio::select! {
@@ -634,6 +665,12 @@ async fn run_active_chat_task(
                 if let Some(request) = request {
                     view.show_approval(&request.request)?;
                     pending_approval = Some(request);
+                }
+            }
+            request = user_input_requests.recv(), if pending_user_input.is_none() => {
+                if let Some(request) = request {
+                    view.show_question(&request.request)?;
+                    pending_user_input = Some(request);
                 }
             }
             input = inputs.recv() => {
@@ -693,6 +730,7 @@ async fn run_active_chat_task(
                             .take()
                             .expect("pending approval exists")
                             .resolve(decision);
+                        view.clear_interaction_prompt();
                         continue;
                     }
                     if matches!(
@@ -706,6 +744,60 @@ async fn run_active_chat_task(
                             "Resolve the approval with /approve, /approve-session, or /deny.",
                         )?;
                         continue;
+                    }
+                }
+                if let Some(request) = pending_user_input.as_ref() {
+                    match &input {
+                        ChatInput::Task(answer) | ChatInput::FollowUp(answer) => {
+                            match resolve_answers(&request.request, answer) {
+                                Ok(answers) => {
+                                    pending_user_input
+                                        .take()
+                                        .expect("pending user input exists")
+                                        .resolve(UserInputResponse::Answered(answers));
+                                    view.clear_interaction_prompt();
+                                }
+                                Err(error) => view.warning(error)?,
+                            }
+                            continue;
+                        }
+                        ChatInput::Interrupted | ChatInput::Command(ChatCommand::Cancel) => {
+                            pending_user_input
+                                .take()
+                                .expect("pending user input exists")
+                                .resolve(UserInputResponse::Cancelled {
+                                    reason: "active run cancelled".into(),
+                                });
+                            view.clear_interaction_prompt();
+                            cancellation.cancel();
+                            continue;
+                        }
+                        ChatInput::Exit => {
+                            pending_user_input
+                                .take()
+                                .expect("pending user input exists")
+                                .resolve(UserInputResponse::Cancelled {
+                                    reason: "interactive session closed".into(),
+                                });
+                            view.clear_interaction_prompt();
+                            exit_requested = true;
+                            cancellation.cancel();
+                            continue;
+                        }
+                        ChatInput::Command(ChatCommand::Help) => {
+                            view.show_help()?;
+                            continue;
+                        }
+                        ChatInput::Command(ChatCommand::Plan) => {
+                            view.show_plan(&plan.current())?;
+                            continue;
+                        }
+                        _ => {
+                            view.warning(
+                                "Answer the pending question, or use /cancel to stop the task.",
+                            )?;
+                            continue;
+                        }
                     }
                 }
                 match input {
@@ -761,6 +853,7 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
                     ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
                     ChatInput::Command(ChatCommand::Rules) => view.show_rules(instruction_set)?,
+                    ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
                     ChatInput::Command(ChatCommand::Checkpoints) => {
                         view.show_checkpoints(session.checkpoints())?;
                     }
@@ -788,11 +881,22 @@ async fn run_active_chat_task(
             reason: "active run ended".into(),
         });
     }
+    if let Some(request) = pending_user_input.take() {
+        request.resolve(UserInputResponse::Cancelled {
+            reason: "active run ended".into(),
+        });
+    }
     while let Ok(request) = approval_requests.try_recv() {
         request.resolve(ApprovalDecision::Deny {
             reason: "active run ended".into(),
         });
     }
+    while let Ok(request) = user_input_requests.try_recv() {
+        request.resolve(UserInputResponse::Cancelled {
+            reason: "active run ended".into(),
+        });
+    }
+    view.clear_interaction_prompt();
     let reason = match result {
         Ok(result) => result.reason,
         Err(error) => {

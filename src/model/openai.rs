@@ -6,7 +6,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, Usage,
+    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, ToolProfile, Usage,
     action_batch_text, action_from_tool_call, tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode, WireApi};
@@ -17,14 +17,21 @@ pub struct OpenAiModel {
     config: ModelConfig,
     api_key: Option<String>,
     client: reqwest::Client,
+    tool_profile: ToolProfile,
 }
 
 impl OpenAiModel {
-    pub fn new(config: ModelConfig, api_key: Option<String>, client: reqwest::Client) -> Self {
+    pub fn new(
+        config: ModelConfig,
+        api_key: Option<String>,
+        client: reqwest::Client,
+        tool_profile: ToolProfile,
+    ) -> Self {
         Self {
             config,
             api_key,
             client,
+            tool_profile,
         }
     }
 
@@ -70,7 +77,7 @@ impl OpenAiModel {
         }
         if self.config.native_tools {
             body["tools"] = Value::Array(
-                tool_definitions()
+                tool_definitions(self.tool_profile)
                     .into_iter()
                     .map(|definition| json!({"type": "function", "function": definition}))
                     .collect(),
@@ -113,7 +120,7 @@ impl OpenAiModel {
         }
         if self.config.native_tools {
             body["tools"] = Value::Array(
-                tool_definitions()
+                tool_definitions(self.tool_profile)
                     .into_iter()
                     .map(|mut definition| {
                         definition["type"] = json!("function");

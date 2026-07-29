@@ -1,9 +1,16 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::protocol::{Action, validate_action};
+use crate::protocol::{Action, PlanItem, UserQuestion, validate_action};
 
 pub const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolProfile {
+    #[default]
+    Coding,
+    Interactive,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolConcurrency {
@@ -32,6 +39,18 @@ impl ToolRegistry {
         }
     }
 
+    pub fn for_profile(profile: ToolProfile) -> Self {
+        let mut registry = Self::builtins();
+        if profile == ToolProfile::Interactive {
+            registry.tools.extend(
+                interactive_definitions()
+                    .into_iter()
+                    .map(|definition| ToolSpec { definition }),
+            );
+        }
+        registry
+    }
+
     pub fn definitions(&self) -> Vec<Value> {
         self.tools
             .iter()
@@ -45,7 +64,10 @@ impl ToolRegistry {
             | Action::ListFiles { .. }
             | Action::Glob { .. }
             | Action::Grep { .. } => ToolConcurrency::ParallelRead,
-            Action::Shell { .. } | Action::Patch { .. } => ToolConcurrency::Exclusive,
+            Action::Shell { .. }
+            | Action::Patch { .. }
+            | Action::UpdatePlan { .. }
+            | Action::RequestUserInput { .. } => ToolConcurrency::Exclusive,
             Action::Finish { .. } => ToolConcurrency::Terminal,
         }
     }
@@ -129,6 +151,22 @@ impl ToolRegistry {
                 patch: get_string("patch"),
                 description: get_string("description"),
             },
+            "update_plan" => Action::UpdatePlan {
+                explanation: arguments
+                    .get("explanation")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                plan: serde_json::from_value::<Vec<PlanItem>>(
+                    arguments.get("plan").cloned().unwrap_or(Value::Null),
+                )
+                .context("update_plan returned invalid plan items")?,
+            },
+            "request_user_input" | "question" => Action::RequestUserInput {
+                questions: serde_json::from_value::<Vec<UserQuestion>>(
+                    arguments.get("questions").cloned().unwrap_or(Value::Null),
+                )
+                .context("request_user_input returned invalid questions")?,
+            },
             "finish" => Action::Finish {
                 summary: get_string("summary"),
             },
@@ -137,6 +175,80 @@ impl ToolRegistry {
         validate_action(&action)?;
         Ok(action)
     }
+}
+
+fn interactive_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "update_plan",
+            "description": "Create or update the visible task plan. Use it for multi-step work and keep statuses current. At most one step may be in progress.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "explanation": {"type": "string", "description": "Optional short reason for this plan update."},
+                    "plan": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": {"type": "string", "description": "Concise task step."},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"]
+                                }
+                            },
+                            "required": ["step", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["plan"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "request_user_input",
+            "description": "Ask one to three concise questions only when a user choice materially changes the result. Wait for the answers before continuing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "Stable lowercase snake_case identifier."},
+                                "header": {"type": "string", "description": "Short UI heading."},
+                                "question": {"type": "string", "description": "One clear question."},
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 4,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string", "description": "Short choice label."},
+                                            "description": {"type": "string", "description": "One-sentence tradeoff."}
+                                        },
+                                        "required": ["label", "description"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "required": ["id", "header", "question", "options"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["questions"],
+                "additionalProperties": false
+            }
+        }),
+    ]
 }
 
 fn builtin_definitions() -> Vec<Value> {
@@ -290,6 +402,22 @@ mod tests {
                 },
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn interactive_profile_adds_plan_and_question_without_changing_coding_tools() {
+        let coding = ToolRegistry::for_profile(ToolProfile::Coding).definitions();
+        let interactive = ToolRegistry::for_profile(ToolProfile::Interactive).definitions();
+        assert_eq!(coding.len(), 7);
+        assert_eq!(interactive.len(), 9);
+        assert_eq!(
+            interactive
+                .iter()
+                .skip(coding.len())
+                .filter_map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["update_plan", "request_user_input"]
         );
     }
 }

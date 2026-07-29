@@ -108,9 +108,10 @@ printf '%s' "Find and fix the parser bug." | \
 ## Interactive session
 
 The interactive interface keeps follow-up context while repository mutations remain visible to the
-next turn. Its fixed header shows the active model, workspace, session, and protocol; the scrollable
-timeline separates your messages, model activity, shell commands, patches, output, verification,
-and final responses; and the bordered composer remains editable while the agent works.
+next turn. Its fixed header shows the active model, workspace, session, and protocol; a live plan
+panel tracks multi-step work; the scrollable timeline separates your messages, model activity,
+shell commands, patches, output, verification, questions, and final responses; and the bordered
+composer remains editable while the agent works.
 
 ```text
 /new         Start a fresh saved session
@@ -121,6 +122,7 @@ and final responses; and the bordered composer remains editable while the agent 
 /checkpoints List checkpoints in the current session
 /fork        Fork from now or from a selected checkpoint
 /rewind      Rewind safely by forking from an earlier checkpoint
+/plan        Show the current task plan
 /steer       Steer the active task at the next model boundary
 /followup    Queue work for after the active task
 /queue       Show pending steer and follow-up messages
@@ -145,6 +147,13 @@ stored at `~/.wecode/history`. WeCode automatically creates a checkpoint before 
 current conversation), and `/rewind [checkpoint]` creates and switches to a fork of an earlier
 state. Rewind never truncates or rewrites the original append-only session.
 
+For substantial work, the agent can create and maintain a plan that remains visible above the
+timeline; `/plan` shows it in the line-oriented fallback. When a choice materially changes the
+result, the agent can pause and present two to four concrete options. Reply with an option number
+or a free-form answer; for several questions, separate answers with semicolons. The composer changes
+its title and key hints while an answer or approval is pending. If a plan exists, the harness asks
+the model to mark every remaining step accurately before accepting `finish`.
+
 During a running turn, press `Ctrl-C` once to cancel the active
 model request or shell command and return to the prompt; edits already applied are preserved.
 The composer remains editable while the agent works: regular `Enter` steers the active task,
@@ -155,7 +164,9 @@ application is never interrupted halfway through. Set `WECODE_TUI=0` to use the 
 fallback in a terminal that does not support the full-screen interface.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
-depend on terminal rendering or delta events.
+depend on terminal rendering or delta events. Plan and question tools are exposed only by
+interactive `wecode` sessions; machine-oriented runs retain the original seven-tool profile and
+the same cache namespace.
 
 Long conversations are compacted locally into a deterministic, bounded summary that retains task
 intent, inspected or edited paths, validation results, failures, and pending facts. Repeated

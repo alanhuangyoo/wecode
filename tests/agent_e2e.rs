@@ -13,8 +13,9 @@ use wecode::config::{ApprovalPolicy, CacheConfig, Config};
 use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
 use wecode::input_queue::InputQueue;
-use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, Usage};
-use wecode::protocol::Action;
+use wecode::interaction::{PlanState, UserInputClient, UserInputResponse, resolve_answers};
+use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, ToolProfile, Usage};
+use wecode::protocol::{Action, PlanItem, PlanStatus, QuestionOption, UserQuestion};
 
 struct FakeModel {
     responses: Mutex<VecDeque<String>>,
@@ -295,6 +296,162 @@ async fn native_tool_action_applies_codex_patch_and_finishes() {
     assert_eq!(result.steps, 2);
     assert!(result.patch.contains("native.txt"));
     assert!(result.patch.contains("+native tools work"));
+}
+
+#[tokio::test]
+async fn interactive_plan_updates_state_and_model_context() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let plan = PlanState::default();
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::UpdatePlan {
+                explanation: Some("Track the work visibly.".into()),
+                plan: vec![
+                    PlanItem {
+                        step: "Inspect the fixture".into(),
+                        status: PlanStatus::Completed,
+                    },
+                    PlanItem {
+                        step: "Report the result".into(),
+                        status: PlanStatus::InProgress,
+                    },
+                ],
+            },
+            Action::Finish {
+                summary: "premature".into(),
+            },
+            Action::UpdatePlan {
+                explanation: Some("All planned work is complete.".into()),
+                plan: vec![
+                    PlanItem {
+                        step: "Inspect the fixture".into(),
+                        status: PlanStatus::Completed,
+                    },
+                    PlanItem {
+                        step: "Report the result".into(),
+                        status: PlanStatus::Completed,
+                    },
+                ],
+            },
+            Action::Finish {
+                summary: "plan was updated".into(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent
+        .run(
+            "show a plan",
+            RunOptions {
+                plan: Some(plan.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(
+        plan.current()
+            .items
+            .iter()
+            .all(|item| item.status == PlanStatus::Completed)
+    );
+    let requests = requests.lock().unwrap();
+    assert!(requests[0].system.contains("request_user_input"));
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("PLAN UPDATED:"))
+    );
+    assert!(
+        requests[2]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("PLAN INCOMPLETE:"))
+    );
+    assert_eq!(requests.len(), 4);
+}
+
+#[tokio::test]
+async fn interactive_question_waits_for_and_returns_the_user_choice() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::RequestUserInput {
+                questions: vec![UserQuestion {
+                    id: "approach".into(),
+                    header: "Approach".into(),
+                    question: "Which approach should I use?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "Compatible".into(),
+                            description: "Preserve the public API.".into(),
+                        },
+                        QuestionOption {
+                            label: "Rewrite".into(),
+                            description: "Allow a breaking redesign.".into(),
+                        },
+                    ],
+                }],
+            },
+            Action::Finish {
+                summary: "used the compatible approach".into(),
+            },
+        ])),
+    };
+    let (user_input, mut input_requests) = UserInputClient::channel();
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+    let run = agent.run(
+        "ask before choosing",
+        RunOptions {
+            user_input: Some(user_input),
+            ..Default::default()
+        },
+    );
+    tokio::pin!(run);
+    let envelope = tokio::select! {
+        request = input_requests.recv() => request.expect("user input request"),
+        result = &mut run => panic!("run ended before user input: {result:?}"),
+    };
+    let answers = resolve_answers(&envelope.request, "1").unwrap();
+    envelope.resolve(UserInputResponse::Answered(answers));
+    let result = run.await.unwrap();
+
+    assert!(result.success);
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("approach: Compatible"))
+    );
 }
 
 #[tokio::test]

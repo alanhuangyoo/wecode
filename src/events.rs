@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::interaction::UserAnswer;
 use crate::model::Usage;
+use crate::protocol::{PlanItem, UserQuestion};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -52,6 +54,21 @@ pub enum Event {
         id: u64,
         step: usize,
         decision: String,
+    },
+    PlanUpdated {
+        step: usize,
+        explanation: Option<String>,
+        plan: Vec<PlanItem>,
+    },
+    UserInputRequested {
+        id: u64,
+        step: usize,
+        questions: Vec<UserQuestion>,
+    },
+    UserInputResolved {
+        id: u64,
+        step: usize,
+        answers: Vec<UserAnswer>,
     },
     ToolCompleted {
         step: usize,

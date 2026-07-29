@@ -113,6 +113,22 @@ impl TerminalOutput {
         }
     }
 
+    pub fn set_tui_plan(&self, plan: Option<Vec<String>>) -> bool {
+        let TerminalOutputInner::Tui(handle) = self.inner.as_ref() else {
+            return false;
+        };
+        handle.set_plan(plan);
+        true
+    }
+
+    pub fn set_tui_composer(&self, title: Option<String>, placeholder: Option<String>) -> bool {
+        let TerminalOutputInner::Tui(handle) = self.inner.as_ref() else {
+            return false;
+        };
+        handle.set_composer(title, placeholder);
+        true
+    }
+
     pub fn tui_entry(
         &self,
         label: impl Into<String>,
@@ -169,6 +185,7 @@ impl TerminalUi {
 
     fn start_spinner(&self, step: usize) -> Result<()> {
         self.stop_spinner();
+        self.output.set_tui_composer(None, None);
         self.stream_preview
             .lock()
             .expect("stream preview lock poisoned")
@@ -359,6 +376,63 @@ impl EventSink for TerminalUi {
                     Style::new().yellow().apply_to("◆")
                 ))?;
             }
+            Event::PlanUpdated {
+                explanation, plan, ..
+            } => {
+                self.stop_spinner();
+                let lines = plan
+                    .iter()
+                    .map(|item| {
+                        let marker = match item.status {
+                            crate::protocol::PlanStatus::Pending => "○",
+                            crate::protocol::PlanStatus::InProgress => "◉",
+                            crate::protocol::PlanStatus::Completed => "✓",
+                        };
+                        format!("{marker} {}", item.step)
+                    })
+                    .collect::<Vec<_>>();
+                if self.output.set_tui_plan(Some(lines)) {
+                    if let Some(explanation) = explanation {
+                        self.output.tui_entry("PLAN", explanation, TuiTone::Normal);
+                    }
+                    return Ok(());
+                }
+                let mut body = explanation.clone().unwrap_or_default();
+                for item in plan {
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(&format!("[{}] {}", item.status.as_str(), item.step));
+                }
+                self.output
+                    .print(render_panel("Plan", &body, PanelTone::Cyan, 22))?;
+            }
+            Event::UserInputRequested { id, questions, .. } => {
+                self.stop_spinner();
+                if self.mode == UiMode::Run {
+                    let body = questions
+                        .iter()
+                        .map(|question| question.question.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.output.print(render_panel(
+                        &format!("Question #{id}"),
+                        &body,
+                        PanelTone::Yellow,
+                        12,
+                    ))?;
+                }
+            }
+            Event::UserInputResolved { answers, .. } => {
+                let text = answers
+                    .iter()
+                    .map(|answer| format!("{}: {}", answer.question_id, answer.answer))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if self.output.tui_entry("ANSWER", text, TuiTone::Normal) {
+                    return Ok(());
+                }
+            }
             Event::ToolCompleted {
                 exit_code,
                 duration_ms,
@@ -406,6 +480,9 @@ impl EventSink for TerminalUi {
                 ))?;
             }
             Event::ToolOutput { output, .. } => {
+                if self.output.is_tui() && output.starts_with("PLAN UPDATED:") {
+                    return Ok(());
+                }
                 let recovering = output.starts_with("FORMAT ERROR:");
                 if self.output.tui_entry(
                     if recovering { "RECOVERING" } else { "OUTPUT" },

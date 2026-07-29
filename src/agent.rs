@@ -18,10 +18,11 @@ use crate::file_tools::FileTools;
 use crate::git::{collect_patch, head_id};
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
+use crate::interaction::{PlanState, UserAnswer, UserInputClient, UserInputResponse};
 use crate::model::{
-    CompletionRequest, Model, ModelStream, ModelStreamEvent, Usage, action_batch_text,
+    CompletionRequest, Model, ModelStream, ModelStreamEvent, ToolProfile, Usage, action_batch_text,
 };
-use crate::protocol::{Action, parse_action};
+use crate::protocol::{Action, PlanStatus, parse_action};
 use crate::tool_registry::ToolRegistry;
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
@@ -36,6 +37,8 @@ pub struct RunOptions {
     pub cancellation: Option<CancellationToken>,
     pub input_queue: Option<InputQueue>,
     pub approval: Option<ApprovalClient>,
+    pub plan: Option<PlanState>,
+    pub user_input: Option<UserInputClient>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -80,6 +83,7 @@ pub struct Agent {
     model: Box<dyn Model>,
     sink: Box<dyn EventSink>,
     workspace: PathBuf,
+    tool_profile: ToolProfile,
 }
 
 impl Agent {
@@ -89,11 +93,22 @@ impl Agent {
         sink: Box<dyn EventSink>,
         workspace: PathBuf,
     ) -> Self {
+        Self::new_with_profile(config, model, sink, workspace, ToolProfile::Coding)
+    }
+
+    pub fn new_with_profile(
+        config: Config,
+        model: Box<dyn Model>,
+        sink: Box<dyn EventSink>,
+        workspace: PathBuf,
+        tool_profile: ToolProfile,
+    ) -> Self {
         Self {
             config,
             model,
             sink,
             workspace,
+            tool_profile,
         }
     }
 
@@ -175,6 +190,7 @@ impl Agent {
         let cancellation = options.cancellation.clone();
         let input_queue = options.input_queue.clone();
         let approval = options.approval.clone();
+        let system_prompt = system_prompt(self.tool_profile);
 
         for step in 1..=self.config.agent.max_steps {
             if cancellation
@@ -207,7 +223,7 @@ impl Agent {
                 step,
             });
             let request = CompletionRequest {
-                system: SYSTEM_PROMPT.to_owned(),
+                system: system_prompt.clone(),
                 messages: messages.clone(),
                 session_id: session_id.clone(),
             };
@@ -525,11 +541,118 @@ impl Agent {
                     let result = executor.apply_patch(&patch).await;
                     self.handle_execution(step, result, &recorder, &mut messages)?;
                 }
+                Action::UpdatePlan { explanation, plan } => {
+                    if let Some(state) = &options.plan {
+                        state.update(explanation.clone(), plan.clone());
+                    }
+                    self.emit(
+                        &recorder,
+                        Event::PlanUpdated {
+                            step,
+                            explanation,
+                            plan: plan.clone(),
+                        },
+                    )?;
+                    let observation = format_plan_observation(&plan);
+                    self.emit(
+                        &recorder,
+                        Event::ToolOutput {
+                            step,
+                            output: observation.clone(),
+                        },
+                    )?;
+                    messages.push(Message::user(observation));
+                }
+                Action::RequestUserInput { questions } => {
+                    let Some(user_input) = &options.user_input else {
+                        let observation = "USER INPUT UNAVAILABLE: This run is non-interactive. Continue with the safest reasonable assumption and do not retry request_user_input.".to_owned();
+                        self.emit(
+                            &recorder,
+                            Event::ToolOutput {
+                                step,
+                                output: observation.clone(),
+                            },
+                        )?;
+                        messages.push(Message::user(observation));
+                        continue;
+                    };
+                    let request = user_input.prepare(questions);
+                    self.emit(
+                        &recorder,
+                        Event::UserInputRequested {
+                            id: request.id,
+                            step,
+                            questions: request.questions.clone(),
+                        },
+                    )?;
+                    let response = user_input.request(request.clone());
+                    let response = if let Some(cancellation) = &cancellation {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => None,
+                            response = response => Some(response),
+                        }
+                    } else {
+                        Some(response.await)
+                    };
+                    let Some(response) = response else {
+                        summary = "cancelled by user".into();
+                        reason = "cancelled".into();
+                        self.emit(&recorder, Event::RunCancelled { step })?;
+                        break;
+                    };
+                    let observation = match response {
+                        UserInputResponse::Answered(answers) => {
+                            self.emit(
+                                &recorder,
+                                Event::UserInputResolved {
+                                    id: request.id,
+                                    step,
+                                    answers: answers.clone(),
+                                },
+                            )?;
+                            format_user_answers(&answers)
+                        }
+                        UserInputResponse::Cancelled { reason } => {
+                            format!(
+                                "USER INPUT CANCELLED: {reason}\nContinue with the safest reasonable assumption."
+                            )
+                        }
+                    };
+                    self.emit(
+                        &recorder,
+                        Event::ToolOutput {
+                            step,
+                            output: observation.clone(),
+                        },
+                    )?;
+                    messages.push(Message::user(observation));
+                }
                 Action::Finish {
                     summary: proposed_summary,
                 } => {
                     if self.deliver_steering(step, &input_queue, &recorder, &mut messages)? > 0 {
                         continue;
+                    }
+                    if let Some(plan) = &options.plan {
+                        let plan = plan.current();
+                        if !plan.items.is_empty()
+                            && plan
+                                .items
+                                .iter()
+                                .any(|item| item.status != PlanStatus::Completed)
+                        {
+                            let observation = "PLAN INCOMPLETE: Before finishing, call update_plan and mark every completed step accurately.".to_owned();
+                            self.emit(
+                                &recorder,
+                                Event::ToolOutput {
+                                    step,
+                                    output: observation.clone(),
+                                },
+                            )?;
+                            messages.push(Message::user(observation));
+                            continue;
+                        }
                     }
                     if let Some(verify) = &options.verify {
                         let verification = executor.shell(verify);
@@ -912,6 +1035,24 @@ fn initial_prompt(task: &str, workspace: &std::path::Path, verify: Option<&str>)
     Ok(prompt)
 }
 
+fn system_prompt(profile: ToolProfile) -> String {
+    if profile == ToolProfile::Coding {
+        return SYSTEM_PROMPT.to_owned();
+    }
+    format!(
+        "{SYSTEM_PROMPT}\n\n\
+Interactive session additions override the earlier seven-action limit:\n\
+- update_plan keeps a concise multi-step plan visible to the user. Use it for substantial work, \
+keep exactly one step in progress, and mark completed work promptly.\n\
+- request_user_input asks one to three focused questions when a user choice materially changes the \
+result. Prefer one question, provide concrete options, and do not ask when a safe reasonable \
+assumption will work.\n\
+Without native tools, these actions are:\n\
+{{\"action\":\"update_plan\",\"explanation\":\"<optional reason>\",\"plan\":[{{\"step\":\"<task step>\",\"status\":\"pending|in_progress|completed\"}}]}}\n\
+{{\"action\":\"request_user_input\",\"questions\":[{{\"id\":\"<snake_case>\",\"header\":\"<short heading>\",\"question\":\"<question>\",\"options\":[{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}},{{\"label\":\"<choice>\",\"description\":\"<tradeoff>\"}}]}}]}}\n"
+    )
+}
+
 fn follow_up_prompt(task: &str, verify: Option<&str>) -> String {
     let mut prompt = format!("Follow-up request:\n{task}\n");
     if let Some(verify) = verify {
@@ -982,8 +1123,47 @@ fn action_detail(action: &Action) -> String {
                 files.join(", ")
             }
         }
+        Action::UpdatePlan { plan, .. } => plan
+            .iter()
+            .map(|item| {
+                let marker = match item.status {
+                    PlanStatus::Pending => "○",
+                    PlanStatus::InProgress => "◉",
+                    PlanStatus::Completed => "✓",
+                };
+                format!("{marker} {}", item.step)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Action::RequestUserInput { questions } => questions
+            .iter()
+            .map(|question| question.question.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
         Action::Finish { summary } => summary.clone(),
     }
+}
+
+fn format_plan_observation(plan: &[crate::protocol::PlanItem]) -> String {
+    let mut output = String::from("PLAN UPDATED:");
+    for item in plan {
+        output.push_str("\n- [");
+        output.push_str(item.status.as_str());
+        output.push_str("] ");
+        output.push_str(item.step.trim());
+    }
+    output
+}
+
+fn format_user_answers(answers: &[UserAnswer]) -> String {
+    let mut output = String::from("USER ANSWERS:");
+    for answer in answers {
+        output.push_str("\n- ");
+        output.push_str(&answer.question_id);
+        output.push_str(": ");
+        output.push_str(answer.answer.trim());
+    }
+    output
 }
 
 async fn execute_read_action(file_tools: &FileTools, action: &Action) -> Result<ExecutionResult> {
@@ -1022,7 +1202,11 @@ async fn execute_read_action(file_tools: &FileTools, action: &Action) -> Result<
                 )
                 .await
         }
-        Action::Shell { .. } | Action::Patch { .. } | Action::Finish { .. } => {
+        Action::Shell { .. }
+        | Action::Patch { .. }
+        | Action::UpdatePlan { .. }
+        | Action::RequestUserInput { .. }
+        | Action::Finish { .. } => {
             unreachable!("only read-only actions enter the parallel executor")
         }
     }

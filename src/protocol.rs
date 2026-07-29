@@ -1,6 +1,44 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl PlanStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in progress",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PlanItem {
+    pub step: String,
+    pub status: PlanStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UserQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
@@ -55,6 +93,14 @@ pub enum Action {
         #[serde(default)]
         description: String,
     },
+    UpdatePlan {
+        #[serde(default)]
+        explanation: Option<String>,
+        plan: Vec<PlanItem>,
+    },
+    RequestUserInput {
+        questions: Vec<UserQuestion>,
+    },
     Finish {
         summary: String,
     },
@@ -69,6 +115,8 @@ impl Action {
             Self::Grep { .. } => "grep",
             Self::Shell { .. } => "shell",
             Self::Patch { .. } => "patch",
+            Self::UpdatePlan { .. } => "update_plan",
+            Self::RequestUserInput { .. } => "request_user_input",
             Self::Finish { .. } => "finish",
         }
     }
@@ -92,6 +140,20 @@ impl Action {
                     "apply patch"
                 } else {
                     description
+                }
+            }
+            Self::UpdatePlan { plan, .. } => {
+                if plan.len() == 1 {
+                    "1 plan step"
+                } else {
+                    "plan updated"
+                }
+            }
+            Self::RequestUserInput { questions } => {
+                if questions.len() == 1 {
+                    "1 question"
+                } else {
+                    "questions for user"
                 }
             }
             Self::Finish { summary } => summary,
@@ -125,11 +187,78 @@ pub(crate) fn validate_action(action: &Action) -> Result<()> {
             bail!("shell command cannot be empty")
         }
         Action::Patch { patch, .. } if patch.trim().is_empty() => bail!("patch cannot be empty"),
+        Action::UpdatePlan { plan, .. } => validate_plan(plan),
+        Action::RequestUserInput { questions } => validate_questions(questions),
         Action::Finish { summary } if summary.trim().is_empty() => {
             bail!("finish summary cannot be empty")
         }
         _ => Ok(()),
     }
+}
+
+fn validate_plan(plan: &[PlanItem]) -> Result<()> {
+    if plan.is_empty() || plan.len() > 20 {
+        bail!("plan must contain between 1 and 20 steps");
+    }
+    if plan
+        .iter()
+        .filter(|item| item.status == PlanStatus::InProgress)
+        .count()
+        > 1
+    {
+        bail!("at most one plan step may be in progress");
+    }
+    for item in plan {
+        let length = item.step.chars().count();
+        if item.step.trim().is_empty() || length > 200 {
+            bail!("plan step text must contain between 1 and 200 characters");
+        }
+    }
+    Ok(())
+}
+
+fn validate_questions(questions: &[UserQuestion]) -> Result<()> {
+    if questions.is_empty() || questions.len() > 3 {
+        bail!("request_user_input must contain between 1 and 3 questions");
+    }
+    for (index, question) in questions.iter().enumerate() {
+        if !valid_question_id(&question.id) {
+            bail!("question IDs must use lowercase snake_case");
+        }
+        if questions[..index]
+            .iter()
+            .any(|previous| previous.id == question.id)
+        {
+            bail!("question IDs must be unique");
+        }
+        if question.header.trim().is_empty() || question.header.chars().count() > 20 {
+            bail!("question headers must contain between 1 and 20 characters");
+        }
+        if question.question.trim().is_empty() || question.question.chars().count() > 500 {
+            bail!("question text must contain between 1 and 500 characters");
+        }
+        if question.options.len() < 2 || question.options.len() > 4 {
+            bail!("each question must contain between 2 and 4 options");
+        }
+        for option in &question.options {
+            if option.label.trim().is_empty() || option.label.chars().count() > 80 {
+                bail!("option labels must contain between 1 and 80 characters");
+            }
+            if option.description.trim().is_empty() || option.description.chars().count() > 240 {
+                bail!("option descriptions must contain between 1 and 240 characters");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_question_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && id.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
 }
 
 fn default_path() -> String {
@@ -189,6 +318,41 @@ mod tests {
                 context: None,
                 limit: None,
             }
+        );
+    }
+
+    #[test]
+    fn validates_interactive_plan_and_question_actions() {
+        assert_eq!(
+            parse_action(
+                r#"{"action":"update_plan","plan":[{"step":"inspect","status":"in_progress"},{"step":"test","status":"pending"}]}"#
+            )
+            .unwrap(),
+            Action::UpdatePlan {
+                explanation: None,
+                plan: vec![
+                    PlanItem {
+                        step: "inspect".into(),
+                        status: PlanStatus::InProgress,
+                    },
+                    PlanItem {
+                        step: "test".into(),
+                        status: PlanStatus::Pending,
+                    },
+                ],
+            }
+        );
+        assert!(
+            parse_action(
+                r#"{"action":"update_plan","plan":[{"step":"a","status":"in_progress"},{"step":"b","status":"in_progress"}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_action(
+                r#"{"action":"request_user_input","questions":[{"id":"bad-id","header":"Choice","question":"Choose?","options":[{"label":"A","description":"First."},{"label":"B","description":"Second."}]}]}"#
+            )
+            .is_err()
         );
     }
 }

@@ -52,6 +52,11 @@ pub(crate) enum TuiMessage {
     },
     Metrics(Option<String>),
     Status(Option<String>),
+    Plan(Option<Vec<String>>),
+    Composer {
+        title: Option<String>,
+        placeholder: Option<String>,
+    },
 }
 
 impl TuiHandle {
@@ -82,6 +87,16 @@ impl TuiHandle {
 
     pub fn set_metrics(&self, metrics: Option<String>) {
         let _ = self.sender.send(TuiMessage::Metrics(metrics));
+    }
+
+    pub fn set_plan(&self, plan: Option<Vec<String>>) {
+        let _ = self.sender.send(TuiMessage::Plan(plan));
+    }
+
+    pub fn set_composer(&self, title: Option<String>, placeholder: Option<String>) {
+        let _ = self
+            .sender
+            .send(TuiMessage::Composer { title, placeholder });
     }
 }
 
@@ -171,6 +186,9 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
                 state.metrics = None;
                 state.scroll = 0;
                 state.status = None;
+                state.plan = None;
+                state.composer_title = None;
+                state.composer_placeholder = None;
                 changed = true;
             }
             Ok(TuiMessage::Header { primary, secondary }) => {
@@ -184,6 +202,15 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
             }
             Ok(TuiMessage::Status(status)) => {
                 state.status = status;
+                changed = true;
+            }
+            Ok(TuiMessage::Plan(plan)) => {
+                state.plan = plan;
+                changed = true;
+            }
+            Ok(TuiMessage::Composer { title, placeholder }) => {
+                state.composer_title = title;
+                state.composer_placeholder = placeholder;
                 changed = true;
             }
             Err(TryRecvError::Disconnected) => {
@@ -246,11 +273,14 @@ struct TranscriptEntry {
 
 struct TuiState {
     composer: Composer,
+    composer_placeholder: Option<String>,
+    composer_title: Option<String>,
     header_primary: String,
     header_secondary: String,
     history: Vec<String>,
     history_index: Option<usize>,
     metrics: Option<String>,
+    plan: Option<Vec<String>>,
     scroll: u16,
     status: Option<String>,
     transcript: Vec<TranscriptEntry>,
@@ -260,11 +290,14 @@ impl TuiState {
     fn new(history: Vec<String>) -> Self {
         Self {
             composer: Composer::default(),
+            composer_placeholder: None,
+            composer_title: None,
             header_primary: format!("WeCode {}", env!("CARGO_PKG_VERSION")),
             header_secondary: "Lightweight coding agent".into(),
             history,
             history_index: None,
             metrics: None,
+            plan: None,
             scroll: 0,
             status: None,
             transcript: Vec::new(),
@@ -544,20 +577,70 @@ fn char_to_byte(value: &str, character_index: usize) -> usize {
 fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
     let composer_height = composer_height(&state.composer.text, area.width);
+    let mut constraints = vec![Constraint::Length(3)];
+    if let Some(plan) = &state.plan {
+        constraints.push(Constraint::Length(
+            u16::try_from(plan.len()).unwrap_or(u16::MAX).clamp(1, 5) + 2,
+        ));
+    }
+    constraints.extend([
+        Constraint::Min(3),
+        Constraint::Length(composer_height),
+        Constraint::Length(1),
+    ]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(composer_height),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(area);
 
     draw_header(frame, chunks[0], state);
-    draw_transcript(frame, chunks[1], state);
-    draw_composer(frame, chunks[2], state);
-    draw_footer(frame, chunks[3], state);
+    let mut index = 1;
+    if state.plan.is_some() {
+        draw_plan(frame, chunks[index], state);
+        index += 1;
+    }
+    draw_transcript(frame, chunks[index], state);
+    draw_composer(frame, chunks[index + 1], state);
+    draw_footer(frame, chunks[index + 2], state);
+}
+
+fn draw_plan(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let plan = state.plan.as_deref().unwrap_or_default();
+    let visible = if plan.len() > 5 { 4 } else { plan.len() };
+    let mut lines = plan
+        .iter()
+        .take(visible)
+        .map(|item| {
+            let color = if item.starts_with('✓') {
+                Color::Green
+            } else if item.starts_with('◉') {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            Line::from(Span::styled(format!(" {item}"), Style::default().fg(color)))
+        })
+        .collect::<Vec<_>>();
+    if plan.len() > visible {
+        lines.push(Line::from(Span::styled(
+            format!(" … {} more steps", plan.len() - visible),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(
+                    " Plan ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        area,
+    );
 }
 
 fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
@@ -650,12 +733,19 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
 
 fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     let running = state.status.is_some();
-    let color = if running { Color::Yellow } else { Color::Cyan };
-    let title = if running {
+    let overridden = state.composer_title.is_some();
+    let color = if overridden {
+        Color::Magenta
+    } else if running {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    let title = state.composer_title.as_deref().unwrap_or(if running {
         " Steer active task "
     } else {
         " Message "
-    };
+    });
     let block = Block::default()
         .title(Span::styled(
             title,
@@ -668,13 +758,14 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(block, area);
 
     if state.composer.text.is_empty() {
+        let placeholder = state.composer_placeholder.as_deref().unwrap_or(if running {
+            "Type to steer, or Alt-Enter to queue the next task"
+        } else {
+            "Ask WeCode to do anything in this repository"
+        });
         frame.render_widget(
             Paragraph::new(Span::styled(
-                if running {
-                    "Type to steer, or Alt-Enter to queue the next task"
-                } else {
-                    "Ask WeCode to do anything in this repository"
-                },
+                placeholder,
                 Style::default().fg(Color::DarkGray),
             )),
             inner,
@@ -699,7 +790,19 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    if let Some(status) = &state.status {
+    if state.composer_title.is_some() {
+        let spans = vec![
+            key(" Enter "),
+            hint("answer"),
+            separator(),
+            key(" Ctrl-J "),
+            hint("newline"),
+            separator(),
+            key(" Ctrl-C "),
+            hint("cancel task"),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    } else if let Some(status) = &state.status {
         let spans = vec![
             Span::raw(" "),
             Span::styled(
@@ -930,5 +1033,33 @@ mod tests {
         assert!(rendered.contains("Message"));
         assert!(rendered.contains("Alt-Enter"));
         assert!(rendered.contains("cached"));
+    }
+
+    #[test]
+    fn plan_panel_and_question_composer_remain_visible_together() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new());
+        state.plan = Some(vec![
+            "✓ Inspect repository".into(),
+            "◉ Implement parser".into(),
+            "○ Run tests".into(),
+        ]);
+        state.composer_title = Some(" Answer WeCode ".into());
+        state.composer_placeholder = Some("Type 1, 2, or another answer".into());
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Plan"));
+        assert!(rendered.contains("Implement parser"));
+        assert!(rendered.contains("Answer WeCode"));
+        assert!(rendered.contains("another answer"));
+        assert!(rendered.contains("cancel task"));
     }
 }

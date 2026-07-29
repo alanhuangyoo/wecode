@@ -6,7 +6,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, Usage,
+    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, ToolProfile, Usage,
     action_batch_text, action_from_tool_call, merge_adjacent_messages, tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode};
@@ -17,14 +17,21 @@ pub struct AnthropicModel {
     config: ModelConfig,
     api_key: Option<String>,
     client: reqwest::Client,
+    tool_profile: ToolProfile,
 }
 
 impl AnthropicModel {
-    pub fn new(config: ModelConfig, api_key: Option<String>, client: reqwest::Client) -> Self {
+    pub fn new(
+        config: ModelConfig,
+        api_key: Option<String>,
+        client: reqwest::Client,
+        tool_profile: ToolProfile,
+    ) -> Self {
         Self {
             config,
             api_key,
             client,
+            tool_profile,
         }
     }
 
@@ -87,7 +94,7 @@ impl AnthropicModel {
         }
         if self.config.native_tools {
             body["tools"] = Value::Array(
-                tool_definitions()
+                tool_definitions(self.tool_profile)
                     .into_iter()
                     .map(|definition| {
                         json!({
