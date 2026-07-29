@@ -535,6 +535,11 @@ mod tests {
             assert_eq!(outcome.additional_context, vec!["review carefully"]);
             assert_eq!(outcome.reports[0].status, HookStatus::Completed);
         }
+        #[cfg(windows)]
+        {
+            assert!(!outcome.blocked);
+            assert_eq!(outcome.reports[0].status, HookStatus::Completed);
+        }
     }
 
     #[tokio::test]
