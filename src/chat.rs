@@ -8,13 +8,19 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, default_history_path,
 };
+use crate::instructions::InstructionSet;
+use crate::session::SessionSummary;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatCommand {
-    Clear,
     Config,
     Help,
     History,
+    New,
+    Rename(String),
+    Resume(Option<String>),
+    Rules,
+    Sessions,
     Status,
 }
 
@@ -52,7 +58,13 @@ impl ChatShell {
         })
     }
 
-    pub fn welcome(&self, config: &Config, workspace: &Path) {
+    pub fn welcome(
+        &self,
+        config: &Config,
+        workspace: &Path,
+        session: &SessionSummary,
+        instructions: &InstructionSet,
+    ) {
         let cyan = Style::new().cyan().bold();
         let dim = Style::new().dim();
         let width = (Term::stdout().size().1 as usize).clamp(48, 92);
@@ -73,9 +85,21 @@ impl ChatShell {
         welcome_row(
             width,
             &format!(
+                "session    {} · {}",
+                short_id(&session.id),
+                session.title.as_deref().unwrap_or("new session")
+            ),
+        );
+        welcome_row(
+            width,
+            &format!(
                 "protocol   {}",
                 protocol_name(config.model.family, config.model.wire_api)
             ),
+        );
+        welcome_row(
+            width,
+            &format!("rules      {} instruction files", instructions.files.len()),
         );
         welcome_row(width, "tools      shell · apply_patch · finish");
         println!("{}", cyan.apply_to(format!("╰{rule}╯")));
@@ -117,9 +141,15 @@ impl ChatShell {
         Ok(parse_input(line))
     }
 
-    pub fn clear_screen(&self, config: &Config, workspace: &Path) -> Result<()> {
+    pub fn clear_screen(
+        &self,
+        config: &Config,
+        workspace: &Path,
+        session: &SessionSummary,
+        instructions: &InstructionSet,
+    ) -> Result<()> {
         Term::stdout().clear_screen()?;
-        self.welcome(config, workspace);
+        self.welcome(config, workspace, session, instructions);
         Ok(())
     }
 
@@ -127,14 +157,22 @@ impl ChatShell {
         println!(
             "\n{}\n\
              \n  {:12} Start a fresh conversation\
+             \n  {:12} Resume the latest or selected session\
+             \n  {:12} List recent sessions for this workspace\
+             \n  {:12} Rename the current session\
              \n  {:12} Show model, workspace, cache, and context\
+             \n  {:12} Show loaded project instruction files\
              \n  {:12} Show the active config path\
              \n  {:12} Show the history file\
              \n  {:12} Show this help\
              \n  {:12} Exit WeCode\n",
             Style::new().cyan().bold().apply_to("Commands"),
-            "/clear",
+            "/new",
+            "/resume [id]",
+            "/sessions",
+            "/rename <name>",
             "/status",
+            "/rules",
             "/config",
             "/history",
             "/help",
@@ -142,17 +180,65 @@ impl ChatShell {
         );
     }
 
-    pub fn show_status(&self, config: &Config, workspace: &Path, context_messages: usize) {
+    pub fn show_status(
+        &self,
+        config: &Config,
+        workspace: &Path,
+        session: &SessionSummary,
+        instructions: &InstructionSet,
+        context_messages: usize,
+    ) {
         println!(
-            "\n{}\n  provider   {}\n  model      {}\n  protocol   {}\n  workspace  {}\n  cache      {}\n  context    {} messages\n",
+            "\n{}\n  id         {}\n  title      {}\n  provider   {}\n  model      {}\n  protocol   {}\n  workspace  {}\n  rules      {} files\n  cache      {}\n  context    {} messages\n  file       {}\n",
             Style::new().cyan().bold().apply_to("Session"),
+            session.id,
+            session.title.as_deref().unwrap_or("untitled"),
             config.model.provider,
             config.model.model,
             protocol_name(config.model.family, config.model.wire_api),
             workspace.display(),
+            instructions.files.len(),
             cache_mode_name(config.cache.mode),
             context_messages,
+            session.path.display(),
         );
+    }
+
+    pub fn show_rules(&self, instructions: &InstructionSet) {
+        println!("\n{}", Style::new().cyan().bold().apply_to("Project rules"));
+        if instructions.files.is_empty() {
+            println!("  No AGENTS.md, CLAUDE.md, or rules files loaded.\n");
+            return;
+        }
+        for file in &instructions.files {
+            let suffix = if file.truncated { " (truncated)" } else { "" };
+            println!(
+                "  {}  ~{} tokens{suffix}",
+                file.path.display(),
+                xai_token_estimation::estimate_tokens(&file.content)
+            );
+        }
+        println!();
+    }
+
+    pub fn show_sessions(&self, sessions: &[SessionSummary]) {
+        println!(
+            "\n{}",
+            Style::new().cyan().bold().apply_to("Recent sessions")
+        );
+        if sessions.is_empty() {
+            println!("  No saved sessions for this workspace.\n");
+            return;
+        }
+        for session in sessions.iter().take(20) {
+            println!(
+                "  {:10} {:>4} messages  {}",
+                short_id(&session.id),
+                session.message_count,
+                session.title.as_deref().unwrap_or("untitled"),
+            );
+        }
+        println!("\n  Resume with /resume <id>.\n");
     }
 
     pub fn show_config_path(&self) {
@@ -227,12 +313,22 @@ fn truncate_chars(value: &str, width: usize) -> String {
 }
 
 fn parse_input(line: &str) -> ChatInput {
-    match line {
+    let (command, argument) = line
+        .split_once(char::is_whitespace)
+        .map(|(command, argument)| (command, argument.trim()))
+        .unwrap_or((line, ""));
+    match command {
         "/quit" | "/exit" => ChatInput::Exit,
-        "/clear" | "/new" => ChatInput::Command(ChatCommand::Clear),
+        "/clear" | "/new" => ChatInput::Command(ChatCommand::New),
         "/config" => ChatInput::Command(ChatCommand::Config),
         "/help" | "/?" => ChatInput::Command(ChatCommand::Help),
         "/history" => ChatInput::Command(ChatCommand::History),
+        "/rename" | "/name" => ChatInput::Command(ChatCommand::Rename(argument.to_owned())),
+        "/resume" => ChatInput::Command(ChatCommand::Resume(
+            (!argument.is_empty()).then(|| argument.to_owned()),
+        )),
+        "/rules" | "/instructions" => ChatInput::Command(ChatCommand::Rules),
+        "/sessions" => ChatInput::Command(ChatCommand::Sessions),
         "/model" | "/status" => ChatInput::Command(ChatCommand::Status),
         command if command.starts_with('/') => {
             eprintln!(
@@ -241,8 +337,12 @@ fn parse_input(line: &str) -> ChatInput {
             );
             ChatInput::Interrupted
         }
-        task => ChatInput::Task(task.to_owned()),
+        _ => ChatInput::Task(line.to_owned()),
     }
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 fn protocol_name(family: ProviderFamily, wire: WireApi) -> &'static str {
@@ -271,7 +371,15 @@ mod tests {
 
     #[test]
     fn parses_chat_commands_and_tasks() {
-        assert_eq!(parse_input("/new"), ChatInput::Command(ChatCommand::Clear));
+        assert_eq!(parse_input("/new"), ChatInput::Command(ChatCommand::New));
+        assert_eq!(
+            parse_input("/resume abc123"),
+            ChatInput::Command(ChatCommand::Resume(Some("abc123".into())))
+        );
+        assert_eq!(
+            parse_input("/rename parser cleanup"),
+            ChatInput::Command(ChatCommand::Rename("parser cleanup".into()))
+        );
         assert_eq!(
             parse_input("/model"),
             ChatInput::Command(ChatCommand::Status)

@@ -3,7 +3,7 @@
 WeCode keeps the runtime deliberately small and separates model access from repository mutation:
 
 ```text
-CLI / benchmark manifest
+CLI / benchmark manifest -> project instruction discovery
         |
         v
 Agent loop -> Context window -> Model trait -> Provider protocol -> HTTP
@@ -13,6 +13,8 @@ Executor -> isolated process      exact-response cache
         |
         v
 Git patch + JSONL trajectory
+
+Interactive shell -> append-only session log -> resume / follow-up context
 ```
 
 ## Runtime boundaries
@@ -24,6 +26,8 @@ Git patch + JSONL trajectory
 - Model responses may be cached; command results and filesystem reads are never cached across
   repository mutations.
 - Context compaction is local and deterministic and does not require another model call.
+- Project instructions are ordered, content-deduplicated, and bounded before entering context.
+- Interactive conversations use an append-only JSONL session log and a stable provider cache key.
 - Runtime trajectories and caches are stored outside the target repository unless explicitly
   redirected.
 

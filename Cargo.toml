@@ -2,7 +2,7 @@
 name = "wecode"
 version = "0.1.0"
 edition = "2024"
-description = "A small, benchmark-oriented coding agent CLI"
+description = "A fast, lightweight coding agent CLI built in Rust"
 license = "MIT"
 repository = "https://github.com/alanhuangyoo/wecode"
 homepage = "https://github.com/alanhuangyoo/wecode"

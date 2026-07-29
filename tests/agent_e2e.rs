@@ -213,7 +213,10 @@ async fn interactive_conversation_preserves_follow_up_context() {
     agent
         .run_in_conversation(
             "inspect the project",
-            RunOptions::default(),
+            RunOptions {
+                session_id: Some("stable-chat-session".into()),
+                ..Default::default()
+            },
             &mut conversation,
         )
         .await
@@ -221,7 +224,10 @@ async fn interactive_conversation_preserves_follow_up_context() {
     agent
         .run_in_conversation(
             "now explain the result",
-            RunOptions::default(),
+            RunOptions {
+                session_id: Some("stable-chat-session".into()),
+                ..Default::default()
+            },
             &mut conversation,
         )
         .await
@@ -230,6 +236,8 @@ async fn interactive_conversation_preserves_follow_up_context() {
     assert_eq!(conversation.message_count(), 4);
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].session_id, "stable-chat-session");
+    assert_eq!(requests[1].session_id, "stable-chat-session");
     assert!(
         requests[1]
             .messages
@@ -241,6 +249,51 @@ async fn interactive_conversation_preserves_follow_up_context() {
             .messages
             .iter()
             .any(|message| message.content.contains("now explain the result"))
+    );
+}
+
+#[tokio::test]
+async fn project_instructions_are_injected_into_the_initial_context() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    std::fs::write(
+        temp.path().join("AGENTS.md"),
+        "Run cargo fmt before finishing.",
+    )
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([Action::Finish {
+            summary: "instructions loaded".into(),
+        }])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+    );
+
+    agent
+        .run("inspect the project", RunOptions::default())
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].messages[0]
+            .content
+            .contains("Run cargo fmt before finishing.")
+    );
+    assert!(
+        requests[0].messages[0]
+            .content
+            .contains("<project_instructions")
     );
 }
 

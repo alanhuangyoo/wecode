@@ -12,7 +12,9 @@ use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, provider_preset,
 };
 use crate::events::{EventSink, JsonlSink};
+use crate::instructions;
 use crate::model::create_model;
+use crate::session::ChatSession;
 use crate::setup::{SetupOptions, run as run_setup};
 use crate::ui::TerminalUi;
 
@@ -29,6 +31,10 @@ pub enum Command {
     Run(RunArgs),
     /// Start the interactive coding-agent session.
     Chat(ChatArgs),
+    /// Resume the latest or a selected interactive session.
+    Resume(ResumeArgs),
+    /// List saved interactive sessions for a workspace.
+    Sessions(SessionsArgs),
     /// Run tasks from a JSONL benchmark manifest.
     Bench(BenchArgs),
     /// Print provider presets.
@@ -148,6 +154,20 @@ pub struct ChatArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ResumeArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Session ID prefix or exact title. Uses the latest session when omitted.
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionsArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Debug, Args)]
 pub struct BenchArgs {
     #[command(flatten)]
     pub common: CommonArgs,
@@ -219,7 +239,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         },
     })) {
         Command::Run(args) => run_once(args).await,
-        Command::Chat(args) => chat(args).await,
+        Command::Chat(args) => chat(args.common, ChatStart::New).await,
+        Command::Resume(args) => chat(args.common, ChatStart::Resume(args.session)).await,
+        Command::Sessions(args) => list_sessions(args),
         Command::Bench(args) => bench(args).await,
         Command::Providers => {
             print_providers();
@@ -265,6 +287,7 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 patch_out: args.patch_out,
                 result_out: args.result_out,
                 task_id: None,
+                session_id: None,
             },
         )
         .await?;
@@ -274,29 +297,97 @@ async fn run_once(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-async fn chat(args: ChatArgs) -> Result<()> {
-    let (config, workspace) = resolve_config(&args.common)?;
+enum ChatStart {
+    New,
+    Resume(Option<String>),
+}
+
+async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
+    let (config, workspace) = resolve_config(&common)?;
+    let instruction_set = instructions::discover(&workspace)?;
+    let state_directory = config.agent.trajectory_directory.clone();
     let mut shell = ChatShell::new()?;
-    let mut conversation = Conversation::default();
+    let (mut session, mut conversation) = match start {
+        ChatStart::New => (
+            ChatSession::create(
+                &state_directory,
+                &workspace,
+                &config.model.provider,
+                &config.model.model,
+            )?,
+            Conversation::default(),
+        ),
+        ChatStart::Resume(selector) => {
+            ChatSession::resume(&state_directory, &workspace, selector.as_deref())?
+        }
+    };
     let mut agent: Option<Agent> = None;
-    shell.welcome(&config, &workspace);
+    shell.welcome(&config, &workspace, session.summary(), &instruction_set);
 
     loop {
         match shell.read_input()? {
             ChatInput::Exit => break,
             ChatInput::Interrupted => continue,
-            ChatInput::Command(ChatCommand::Clear) => {
-                conversation.clear();
-                shell.clear_screen(&config, &workspace)?;
-                println!("  Conversation cleared.\n");
+            ChatInput::Command(ChatCommand::New) => {
+                session = ChatSession::create(
+                    &state_directory,
+                    &workspace,
+                    &config.model.provider,
+                    &config.model.model,
+                )?;
+                conversation = Conversation::default();
+                shell.clear_screen(&config, &workspace, session.summary(), &instruction_set)?;
+                println!("  Started a new session.\n");
             }
             ChatInput::Command(ChatCommand::Config) => shell.show_config_path(),
             ChatInput::Command(ChatCommand::Help) => shell.show_help(),
             ChatInput::Command(ChatCommand::History) => shell.show_history_path(),
+            ChatInput::Command(ChatCommand::Rename(title)) => {
+                if title.is_empty() {
+                    eprintln!("  Usage: /rename <title>");
+                } else {
+                    session.rename(&title)?;
+                    println!("  Session renamed to {title:?}.\n");
+                }
+            }
+            ChatInput::Command(ChatCommand::Resume(selector)) => {
+                let resumed =
+                    ChatSession::resume(&state_directory, &workspace, selector.as_deref());
+                match resumed {
+                    Ok((next_session, next_conversation)) => {
+                        session = next_session;
+                        conversation = next_conversation;
+                        shell.clear_screen(
+                            &config,
+                            &workspace,
+                            session.summary(),
+                            &instruction_set,
+                        )?;
+                        println!(
+                            "  Resumed session {} with {} messages.\n",
+                            session.summary().id,
+                            conversation.message_count()
+                        );
+                    }
+                    Err(error) => eprintln!("  {error}\n"),
+                }
+            }
+            ChatInput::Command(ChatCommand::Rules) => shell.show_rules(&instruction_set),
+            ChatInput::Command(ChatCommand::Sessions) => {
+                let sessions = ChatSession::list(&state_directory, &workspace)?;
+                shell.show_sessions(&sessions);
+            }
             ChatInput::Command(ChatCommand::Status) => {
-                shell.show_status(&config, &workspace, conversation.message_count());
+                shell.show_status(
+                    &config,
+                    &workspace,
+                    session.summary(),
+                    &instruction_set,
+                    conversation.message_count(),
+                );
             }
             ChatInput::Task(task) => {
+                session.set_initial_title(&task)?;
                 if agent.is_none() {
                     let api_key = match config.api_key() {
                         Ok(api_key) => api_key,
@@ -317,13 +408,40 @@ async fn chat(args: ChatArgs) -> Result<()> {
                 let result = agent
                     .as_mut()
                     .expect("chat agent initialized")
-                    .run_in_conversation(&task, RunOptions::default(), &mut conversation)
+                    .run_in_conversation(
+                        &task,
+                        RunOptions {
+                            session_id: Some(session.summary().id.clone()),
+                            ..Default::default()
+                        },
+                        &mut conversation,
+                    )
                     .await;
+                session.save(&conversation)?;
                 if let Err(error) = result {
                     eprintln!("error: {error:#}");
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn list_sessions(args: SessionsArgs) -> Result<()> {
+    let (config, workspace) = resolve_config(&args.common)?;
+    let sessions = ChatSession::list(&config.agent.trajectory_directory, &workspace)?;
+    if sessions.is_empty() {
+        println!("no saved sessions for {}", workspace.display());
+        return Ok(());
+    }
+    println!("{:<10} {:>8}  TITLE", "ID", "MESSAGES");
+    for session in sessions {
+        println!(
+            "{:<10} {:>8}  {}",
+            session.id.get(..8).unwrap_or(&session.id),
+            session.message_count,
+            session.title.as_deref().unwrap_or("untitled")
+        );
     }
     Ok(())
 }
@@ -534,6 +652,18 @@ mod tests {
         assert_eq!(args.provider.as_deref(), Some("openai"));
         assert_eq!(args.model.as_deref(), Some("gpt-test"));
         assert!(args.skip_key);
+    }
+
+    #[test]
+    fn parses_session_commands() {
+        let resume = Cli::try_parse_from(["wecode", "resume", "abc123"]).unwrap();
+        let Some(Command::Resume(args)) = resume.command else {
+            panic!("expected resume command");
+        };
+        assert_eq!(args.session.as_deref(), Some("abc123"));
+
+        let sessions = Cli::try_parse_from(["wecode", "sessions", "-C", "."]).unwrap();
+        assert!(matches!(sessions.command, Some(Command::Sessions(_))));
     }
 
     #[test]

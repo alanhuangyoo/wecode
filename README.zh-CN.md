@@ -21,6 +21,10 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
   JSON 文本动作协议兜底。
 - **专门设计的终端交互**：支持对话历史、多轮上下文、工具与输出卡片、Thinking 状态和
   斜杠命令，同时避免笨重的全屏 TUI。
+- **持久化会话**：对话自动保存为可读的 JSONL，可列出和恢复；多轮对话使用稳定的服务端
+  缓存标识，避免每轮破坏 Prompt Cache。
+- **理解仓库规范**：从仓库根目录到当前工作区分层加载受限大小的 `AGENTS.md`、
+  `CLAUDE.md` 和 rules 目录。
 - **高缓存命中设计**：稳定的 Prompt 前缀、服务端 Prompt Cache 提示，以及本地精确响应缓存，
   让重复运行更快、更省 Token。
 - **适合跑榜**：支持非交互运行、JSONL 事件与轨迹、最终 Git Patch、验证重试和 JSONL
@@ -99,16 +103,36 @@ printf '%s' "定位并修复解析器错误。" | \
 文件编辑、命令输出、验证和最终回答会显示在不同的终端卡片中。
 
 ```text
-/clear       清空上下文，开始新对话
+/new         创建新的持久化会话
+/resume [id] 恢复最近或指定会话
+/sessions    列出当前工作区的最近会话
+/rename      设置当前会话标题
 /status      查看模型、工作区、缓存和上下文
+/rules       查看已加载的项目规则
 /config      查看当前配置文件
 /history     查看输入历史文件
 /help        查看所有命令
 /quit        退出
 ```
 
-输入历史保存在 `~/.wecode/history`。交互渲染与 `wecode run --output jsonl`、`wecode bench`
+会话自动保存在 `~/.wecode/sessions/chat/`。也可以在终端使用 `wecode resume [会话ID]`
+恢复会话，或用 `wecode sessions` 查看最近会话。输入历史保存在 `~/.wecode/history`。
+交互渲染与 `wecode run --output jsonl`、`wecode bench`
 完全分离，因此 Benchmark 的事件输出和 Agent 执行不依赖终端 UI。
+
+## 项目规则
+
+WeCode 会自动加载仓库指令，并同时应用于交互任务和 Benchmark 任务。全局规则最先加载，
+随后按仓库根目录到当前工作区的顺序加载项目规则，因此更深层目录的指令优先级更高。
+
+支持的来源包括：
+
+- `~/.wecode/AGENTS.md`、`~/.wecode/CLAUDE.md` 和 `~/.wecode/rules/*.md`
+- 项目各层级的 `AGENTS.md`、`CLAUDE.md` 和 `CLAUDE.local.md`
+- 项目各层级的 `.wecode/rules/*.md` 和 `.claude/rules/*.md`
+
+交互会话中可用 `/rules` 查看实际加载的文件。每个文件和规则总量都有硬限制，避免仓库上下文
+无限增长。
 
 ## 配置
 
@@ -246,6 +270,8 @@ WeCode 不会重置或清理工作树。仓库检出、任务隔离和评分应�
 ```text
 wecode run        执行一个自主编码任务
 wecode chat       启动交互会话
+wecode resume     恢复最近或指定会话
+wecode sessions   列出当前工作区的已保存会话
 wecode bench      执行 JSONL 任务清单
 wecode providers  查看模型服务预设
 wecode cache      查看或清理响应缓存

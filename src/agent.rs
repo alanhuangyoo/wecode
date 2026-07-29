@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -11,6 +11,7 @@ use crate::context::{ContextWindow, Message};
 use crate::events::{Event, EventSink, JsonlSink};
 use crate::executor::{ExecutionResult, Executor};
 use crate::git::{collect_patch, head_id};
+use crate::instructions;
 use crate::model::{CompletionRequest, Model, Usage, action_text};
 use crate::protocol::{Action, parse_action};
 
@@ -22,6 +23,7 @@ pub struct RunOptions {
     pub patch_out: Option<PathBuf>,
     pub result_out: Option<PathBuf>,
     pub task_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -38,7 +40,7 @@ pub struct RunResult {
     pub usage: Usage,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Conversation {
     messages: Vec<Message>,
 }
@@ -50,6 +52,14 @@ impl Conversation {
 
     pub fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    pub(crate) fn from_messages(messages: Vec<Message>) -> Self {
+        Self { messages }
+    }
+
+    pub(crate) fn messages(&self) -> &[Message] {
+        &self.messages
     }
 }
 
@@ -95,8 +105,12 @@ impl Agent {
         conversation: Option<&mut Conversation>,
     ) -> Result<RunResult> {
         let started = Instant::now();
-        let session_id = self.session_id(task).await;
-        let recorder = self.open_recorder(&session_id)?;
+        let persistent_session = options.session_id.is_some();
+        let session_id = match &options.session_id {
+            Some(session_id) => session_id.clone(),
+            None => self.session_id(task).await,
+        };
+        let recorder = self.open_recorder(&session_id, persistent_session)?;
         self.emit(
             &recorder,
             Event::RunStarted {
@@ -132,7 +146,7 @@ impl Agent {
                 task,
                 &self.workspace,
                 options.verify.as_deref(),
-            ))],
+            )?)],
         };
         let mut format_errors = 0;
         let mut verify_failures = 0;
@@ -401,11 +415,15 @@ impl Agent {
         format!("{:x}", hasher.finalize())[..24].to_owned()
     }
 
-    fn open_recorder(&self, session_id: &str) -> Result<JsonlSink> {
+    fn open_recorder(&self, session_id: &str, append: bool) -> Result<JsonlSink> {
         let directory = self.config.agent.trajectory_directory.clone();
         std::fs::create_dir_all(&directory)?;
         let path = directory.join(format!("{session_id}.jsonl"));
-        let file = File::create(path)?;
+        let file = if append {
+            OpenOptions::new().create(true).append(true).open(path)?
+        } else {
+            File::create(path)?
+        };
         Ok(JsonlSink::new(Box::new(file)))
     }
 
@@ -415,7 +433,7 @@ impl Agent {
     }
 }
 
-fn initial_prompt(task: &str, workspace: &std::path::Path, verify: Option<&str>) -> String {
+fn initial_prompt(task: &str, workspace: &std::path::Path, verify: Option<&str>) -> Result<String> {
     let mut prompt = format!(
         "Task:\n{task}\n\nWorkspace: {}\nPlatform: {} / {}\n",
         workspace.display(),
@@ -427,7 +445,8 @@ fn initial_prompt(task: &str, workspace: &std::path::Path, verify: Option<&str>)
         prompt.push_str(verify);
         prompt.push('\n');
     }
-    prompt
+    prompt.push_str(&instructions::discover(workspace)?.render());
+    Ok(prompt)
 }
 
 fn follow_up_prompt(task: &str, verify: Option<&str>) -> String {

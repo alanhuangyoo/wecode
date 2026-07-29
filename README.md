@@ -23,6 +23,10 @@ runtime.
   text-action fallback for gateways without tool-call support.
 - **Purpose-built terminal UX** — conversation history, persistent follow-up context, structured
   tool/output panels, live thinking status, and slash commands without a full-screen TUI.
+- **Durable sessions** — conversations auto-save as inspectable JSONL, can be listed or resumed,
+  and retain one stable provider cache identity across follow-up turns.
+- **Repository-aware** — bounded global and hierarchical `AGENTS.md`, `CLAUDE.md`, and rules
+  directories are loaded from repository root to the active workspace.
 - **Cache efficient** — stable prompt prefixes, provider-side prompt-cache hints, and an on-disk
   exact-response cache for cheap, fast reruns.
 - **Benchmark ready** — non-interactive execution, JSONL events and trajectories, final Git patch
@@ -105,17 +109,38 @@ next turn. It separates model activity, shell commands, patches, command output,
 the final response into compact terminal panels.
 
 ```text
-/clear       Start a fresh conversation
+/new         Start a fresh saved session
+/resume [id] Resume the latest or selected session
+/sessions    List recent sessions for this workspace
+/rename      Give the current session a title
 /status      Show model, workspace, cache, and context
+/rules       Show loaded project instruction files
 /config      Show the active config path
 /history     Show the history file
 /help        Show all commands
 /quit        Exit
 ```
 
-Input history is stored at `~/.wecode/history`. The interactive renderer is isolated from
+Sessions auto-save under `~/.wecode/sessions/chat/`. Resume outside the interactive interface with
+`wecode resume [session-id]`, or inspect recent sessions with `wecode sessions`. Input history is
+stored at `~/.wecode/history`. The interactive renderer is isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
 depend on terminal rendering.
+
+## Project instructions
+
+WeCode loads repository instructions automatically and injects them into both interactive and
+benchmark tasks. Global files load first, followed by project files from repository root to the
+active workspace, so deeper instructions take precedence.
+
+Recognized sources include:
+
+- `~/.wecode/AGENTS.md`, `~/.wecode/CLAUDE.md`, and `~/.wecode/rules/*.md`
+- `AGENTS.md`, `CLAUDE.md`, and `CLAUDE.local.md` at each project level
+- `.wecode/rules/*.md` and `.claude/rules/*.md` at each project level
+
+Use `/rules` to inspect the exact files loaded for an interactive session. Each file and the total
+instruction payload have hard size limits so repository context remains predictable.
 
 ## Configuration
 
@@ -259,6 +284,8 @@ recommended evaluation workflow.
 ```text
 wecode run        Run one autonomous coding task
 wecode chat       Start an interactive session
+wecode resume     Resume the latest or a selected session
+wecode sessions   List saved sessions for this workspace
 wecode bench      Run a JSONL task manifest
 wecode providers  List provider presets
 wecode cache      Inspect or prune the response cache
