@@ -117,6 +117,10 @@ and final responses; and the bordered composer remains editable while the agent 
 /resume [id] Resume the latest or selected session
 /sessions    List recent sessions for this workspace
 /rename      Give the current session a title
+/checkpoint  Save a named checkpoint at the current conversation
+/checkpoints List checkpoints in the current session
+/fork        Fork from now or from a selected checkpoint
+/rewind      Rewind safely by forking from an earlier checkpoint
 /steer       Steer the active task at the next model boundary
 /followup    Queue work for after the active task
 /queue       Show pending steer and follow-up messages
@@ -136,7 +140,12 @@ and final responses; and the bordered composer remains editable while the agent 
 
 Sessions auto-save under `~/.wecode/sessions/chat/`. Resume outside the interactive interface with
 `wecode resume [session-id]`, or inspect recent sessions with `wecode sessions`. Input history is
-stored at `~/.wecode/history`. During a running turn, press `Ctrl-C` once to cancel the active
+stored at `~/.wecode/history`. WeCode automatically creates a checkpoint before every task.
+`/checkpoint [name]` adds a manual marker, `/fork [checkpoint]` branches from a marker (or the
+current conversation), and `/rewind [checkpoint]` creates and switches to a fork of an earlier
+state. Rewind never truncates or rewrites the original append-only session.
+
+During a running turn, press `Ctrl-C` once to cancel the active
 model request or shell command and return to the prompt; edits already applied are preserved.
 The composer remains editable while the agent works: regular `Enter` steers the active task,
 `Ctrl-J` inserts a newline, `Alt-Enter` queues a follow-up, `PageUp`/`PageDown` scroll the timeline,
@@ -147,6 +156,11 @@ fallback in a terminal that does not support the full-screen interface.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
 depend on terminal rendering or delta events.
+
+Long conversations are compacted locally into a deterministic, bounded summary that retains task
+intent, inspected or edited paths, validation results, failures, and pending facts. Repeated
+compaction replaces the previous summary instead of nesting summaries, while the original task
+message remains a stable provider-cache prefix.
 
 ## Repository tools
 

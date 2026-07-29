@@ -18,7 +18,7 @@ use crate::config::{
 };
 use crate::input_queue::QueueSnapshot;
 use crate::instructions::InstructionSet;
-use crate::session::SessionSummary;
+use crate::session::{SessionCheckpoint, SessionSummary};
 use crate::tui::{self, TuiHandle, TuiMessage, TuiTone};
 use crate::ui::TerminalOutput;
 
@@ -27,13 +27,17 @@ pub enum ChatCommand {
     Approve,
     ApproveSession,
     Cancel,
+    Checkpoint(Option<String>),
+    Checkpoints,
     ClearQueue,
     Config,
     Deny(String),
     Help,
     History,
+    Fork(Option<String>),
     New,
     Rename(String),
+    Rewind(Option<String>),
     Resume(Option<String>),
     Rules,
     Sessions,
@@ -241,6 +245,10 @@ impl ChatView {
              \n  {:12} Resume the latest or selected session\
              \n  {:12} List recent sessions for this workspace\
              \n  {:12} Rename the current session\
+             \n  {:12} Save a named conversation checkpoint\
+             \n  {:12} List checkpoints in the current session\
+             \n  {:12} Fork from now or a selected checkpoint\
+             \n  {:12} Rewind safely by forking from an earlier checkpoint\
              \n  {:12} Steer the active task at the next model boundary\
              \n  {:12} Queue work for after the active task\
              \n  {:12} Show pending steer and follow-up messages\
@@ -262,6 +270,10 @@ impl ChatView {
             "/resume [id]",
             "/sessions",
             "/rename <name>",
+            "/checkpoint [name]",
+            "/checkpoints",
+            "/fork [checkpoint]",
+            "/rewind [checkpoint]",
             "/steer <text>",
             "/followup <text>",
             "/queue",
@@ -289,9 +301,10 @@ impl ChatView {
         queue: &QueueSnapshot,
     ) -> Result<()> {
         self.output.print(format!(
-            "\n{}\n  id         {}\n  title      {}\n  provider   {}\n  model      {}\n  protocol   {}\n  workspace  {}\n  rules      {} files\n  cache      {}\n  context    {} messages\n  file       {}\n",
+            "\n{}\n  id          {}\n  parent      {}\n  title       {}\n  provider    {}\n  model       {}\n  protocol    {}\n  workspace   {}\n  rules       {} files\n  cache       {}\n  context     {} messages\n  checkpoints {}\n  file        {}\n",
             Style::new().cyan().bold().apply_to("Session"),
             session.id,
+            session.parent_session_id.as_deref().unwrap_or("none"),
             session.title.as_deref().unwrap_or("untitled"),
             config.model.provider,
             config.model.model,
@@ -300,6 +313,7 @@ impl ChatView {
             instructions.files.len(),
             cache_mode_name(config.cache.mode),
             context_messages,
+            session.checkpoint_count,
             session.path.display(),
         ))?;
         if !queue.is_empty() {
@@ -341,13 +355,43 @@ impl ChatView {
         output.push('\n');
         for session in sessions.iter().take(20) {
             output.push_str(&format!(
-                "  {:10} {:>4} messages  {}\n",
+                "  {:10} {:>4} messages  {:>2} checkpoints  {}{}\n",
                 short_id(&session.id),
                 session.message_count,
+                session.checkpoint_count,
                 session.title.as_deref().unwrap_or("untitled"),
+                session
+                    .parent_session_id
+                    .as_deref()
+                    .map(|parent| format!("  ← {}", short_id(parent)))
+                    .unwrap_or_default(),
             ));
         }
         output.push_str("\n  Resume with /resume <id>.\n\n");
+        self.output.print(output)
+    }
+
+    pub fn show_checkpoints(&self, checkpoints: &[SessionCheckpoint]) -> Result<()> {
+        let mut output = format!("\n{}", Style::new().cyan().bold().apply_to("Checkpoints"));
+        if checkpoints.is_empty() {
+            output.push_str("\n  No checkpoints in this session.\n\n");
+            return self.output.print(output);
+        }
+        output.push('\n');
+        for checkpoint in checkpoints.iter().rev().take(30) {
+            output.push_str(&format!(
+                "  {:8} {:>4} messages  {}{}\n",
+                checkpoint.id,
+                checkpoint.message_count,
+                checkpoint.label,
+                if checkpoint.automatic {
+                    "  · auto"
+                } else {
+                    ""
+                },
+            ));
+        }
+        output.push_str("\n  Use /rewind <id> or /fork <id>.\n\n");
         self.output.print(output)
     }
 
@@ -616,6 +660,10 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
             ChatInput::Command(ChatCommand::ApproveSession)
         }
         "/cancel" | "/stop" => ChatInput::Command(ChatCommand::Cancel),
+        "/checkpoint" | "/mark" => ChatInput::Command(ChatCommand::Checkpoint(
+            (!argument.is_empty()).then(|| argument.to_owned()),
+        )),
+        "/checkpoints" | "/marks" => ChatInput::Command(ChatCommand::Checkpoints),
         "/clear-queue" => ChatInput::Command(ChatCommand::ClearQueue),
         "/clear" | "/new" => ChatInput::Command(ChatCommand::New),
         "/config" => ChatInput::Command(ChatCommand::Config),
@@ -623,9 +671,15 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/followup" | "/follow-up" | "/later" => ChatInput::FollowUp(argument.to_owned()),
         "/help" | "/?" => ChatInput::Command(ChatCommand::Help),
         "/history" => ChatInput::Command(ChatCommand::History),
+        "/fork" | "/branch" => ChatInput::Command(ChatCommand::Fork(
+            (!argument.is_empty()).then(|| argument.to_owned()),
+        )),
         "/queue" => ChatInput::Command(ChatCommand::Queue),
         "/rename" | "/name" => ChatInput::Command(ChatCommand::Rename(argument.to_owned())),
         "/resume" => ChatInput::Command(ChatCommand::Resume(
+            (!argument.is_empty()).then(|| argument.to_owned()),
+        )),
+        "/rewind" | "/rollback" => ChatInput::Command(ChatCommand::Rewind(
             (!argument.is_empty()).then(|| argument.to_owned()),
         )),
         "/rules" | "/instructions" => ChatInput::Command(ChatCommand::Rules),
@@ -694,6 +748,18 @@ mod tests {
         assert_eq!(
             parse_input("/rename parser cleanup"),
             ChatInput::Command(ChatCommand::Rename("parser cleanup".into()))
+        );
+        assert_eq!(
+            parse_input("/checkpoint before refactor"),
+            ChatInput::Command(ChatCommand::Checkpoint(Some("before refactor".into())))
+        );
+        assert_eq!(
+            parse_input("/fork cp-0002"),
+            ChatInput::Command(ChatCommand::Fork(Some("cp-0002".into())))
+        );
+        assert_eq!(
+            parse_input("/rewind"),
+            ChatInput::Command(ChatCommand::Rewind(None))
         );
         assert_eq!(
             parse_input("/model"),

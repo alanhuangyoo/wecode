@@ -402,6 +402,16 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::Cancel) => {
                 view.notice("No task is running.")?;
             }
+            ChatInput::Command(ChatCommand::Checkpoint(label)) => {
+                let checkpoint = session.checkpoint(label.as_deref(), &conversation, false)?;
+                view.notice(format!(
+                    "Saved checkpoint {} at {} messages: {}.",
+                    checkpoint.id, checkpoint.message_count, checkpoint.label
+                ))?;
+            }
+            ChatInput::Command(ChatCommand::Checkpoints) => {
+                view.show_checkpoints(session.checkpoints())?;
+            }
             ChatInput::Command(ChatCommand::Approve)
             | ChatInput::Command(ChatCommand::ApproveSession)
             | ChatInput::Command(ChatCommand::Deny(_)) => {
@@ -414,6 +424,29 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
             ChatInput::Command(ChatCommand::Help) => view.show_help()?,
             ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
+            ChatInput::Command(ChatCommand::Fork(selector)) => {
+                let source_id = session.summary().id.clone();
+                match session.fork(&state_directory, &conversation, selector.as_deref()) {
+                    Ok((next_session, next_conversation)) => {
+                        session = next_session;
+                        conversation = next_conversation;
+                        input_queue.clear();
+                        view.clear_screen(
+                            &config,
+                            &workspace,
+                            session.summary(),
+                            &instruction_set,
+                        )?;
+                        view.notice(format!(
+                            "Forked session {} from {} with {} messages.",
+                            session.summary().id,
+                            source_id,
+                            conversation.message_count()
+                        ))?;
+                    }
+                    Err(error) => view.warning(error.to_string())?,
+                }
+            }
             ChatInput::Command(ChatCommand::Queue) => {
                 view.show_queue(&input_queue.snapshot())?;
             }
@@ -423,6 +456,29 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 } else {
                     session.rename(&title)?;
                     view.notice(format!("Session renamed to {title:?}."))?;
+                }
+            }
+            ChatInput::Command(ChatCommand::Rewind(selector)) => {
+                let source_id = session.summary().id.clone();
+                match session.rewind(&state_directory, &conversation, selector.as_deref()) {
+                    Ok((next_session, next_conversation)) => {
+                        session = next_session;
+                        conversation = next_conversation;
+                        input_queue.clear();
+                        view.clear_screen(
+                            &config,
+                            &workspace,
+                            session.summary(),
+                            &instruction_set,
+                        )?;
+                        view.notice(format!(
+                            "Rewound safely into session {} from {} at {} messages; the original session is unchanged.",
+                            session.summary().id,
+                            source_id,
+                            conversation.message_count()
+                        ))?;
+                    }
+                    Err(error) => view.warning(error.to_string())?,
                 }
             }
             ChatInput::Command(ChatCommand::Resume(selector)) => {
@@ -468,6 +524,11 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
             ChatInput::FollowUp(task) | ChatInput::Task(task) => {
                 session.set_initial_title(&task)?;
+                session.checkpoint(
+                    Some(&automatic_checkpoint_label(&task)),
+                    &conversation,
+                    true,
+                )?;
                 if agent.is_none() {
                     let api_key = match config.api_key() {
                         Ok(api_key) => api_key,
@@ -700,12 +761,18 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
                     ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
                     ChatInput::Command(ChatCommand::Rules) => view.show_rules(instruction_set)?,
+                    ChatInput::Command(ChatCommand::Checkpoints) => {
+                        view.show_checkpoints(session.checkpoints())?;
+                    }
                     ChatInput::Command(ChatCommand::Sessions) => {
                         view.warning("Use /sessions after the active task finishes.")?;
                     }
                     ChatInput::Command(ChatCommand::New)
+                    | ChatInput::Command(ChatCommand::Checkpoint(_))
+                    | ChatInput::Command(ChatCommand::Fork(_))
                     | ChatInput::Command(ChatCommand::Rename(_))
-                    | ChatInput::Command(ChatCommand::Resume(_)) => {
+                    | ChatInput::Command(ChatCommand::Resume(_))
+                    | ChatInput::Command(ChatCommand::Rewind(_)) => {
                         view.warning("That command is available after the active task finishes.")?;
                     }
                     ChatInput::Command(ChatCommand::Unknown(command)) => {
@@ -748,6 +815,12 @@ fn combined_follow_up(inputs: &[QueuedInput]) -> String {
         result.push_str(&format!("\n{}. {}", index + 1, input.text.trim()));
     }
     result
+}
+
+fn automatic_checkpoint_label(task: &str) -> String {
+    let task = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    let excerpt = task.chars().take(64).collect::<String>();
+    format!("before: {excerpt}")
 }
 
 fn spawn_cancellation_signal(cancellation: CancellationToken) -> tokio::task::JoinHandle<()> {

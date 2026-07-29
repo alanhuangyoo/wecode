@@ -109,6 +109,10 @@ printf '%s' "定位并修复解析器错误。" | \
 /resume [id] 恢复最近或指定会话
 /sessions    列出当前工作区的最近会话
 /rename      设置当前会话标题
+/checkpoint  在当前对话位置保存命名检查点
+/checkpoints 列出当前会话的检查点
+/fork        从当前位置或指定检查点创建分支
+/rewind      通过分支安全回到更早的检查点
 /steer       在下一个模型边界修正当前任务
 /followup    将任务排到当前任务结束之后
 /queue       查看待处理的 steer 和 follow-up
@@ -128,6 +132,10 @@ printf '%s' "定位并修复解析器错误。" | \
 
 会话自动保存在 `~/.wecode/sessions/chat/`。也可以在终端使用 `wecode resume [会话ID]`
 恢复会话，或用 `wecode sessions` 查看最近会话。输入历史保存在 `~/.wecode/history`。
+每个任务开始前，WeCode 都会自动创建检查点。`/checkpoint [名称]` 可添加手动检查点，
+`/fork [检查点]` 会从检查点（不传参数时为当前位置）创建分支，`/rewind [检查点]`
+会创建并切换到更早状态的分支。Rewind 永远不会截断或改写原始的 append-only 会话。
+
 任务运行中按一次 `Ctrl-C` 会取消当前模型请求或 Shell 命令并返回输入框；已经应用的修改
 会保留。Agent 工作时输入框仍然可编辑：普通 `Enter` 会 steer 当前任务，`Ctrl-J` 插入换行，
 `Alt-Enter` 会把消息放入 follow-up 队列，`PageUp`/`PageDown` 可滚动时间线；不支持组合键的
@@ -135,6 +143,10 @@ printf '%s' "定位并修复解析器错误。" | \
 时中断。不支持全屏界面的终端可设置 `WECODE_TUI=0` 使用普通行模式。交互渲染和模型流式事件与
 `wecode run --output jsonl`、`wecode bench`
 完全分离，因此 Benchmark 的事件输出和 Agent 执行不依赖终端 UI 或流式增量事件。
+
+长对话会在本地压缩为确定且有硬上限的结构化摘要，保留任务意图、检查或修改过的路径、
+验证结果、失败信息和待处理事实。重复压缩会替换上一份摘要，不会产生“摘要套摘要”；
+最初的任务消息保持不变，可作为稳定的 Provider 缓存前缀。
 
 ## 仓库工具
 

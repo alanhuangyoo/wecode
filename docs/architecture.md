@@ -17,7 +17,7 @@ parallel reads / exclusive writes
         v
 Git patch + JSONL trajectory
 
-Interactive shell -> append-only session log -> resume / follow-up context
+Interactive shell -> append-only session log -> resume / checkpoint / fork
         |
         v
 Composer -> steer queue (next model boundary) / follow-up queue (next turn)
@@ -36,9 +36,15 @@ Approval broker -> allow once / session grant / deny with feedback
 - Provider implementations cannot mutate the repository directly.
 - Model responses may be cached; command results and filesystem reads are never cached across
   repository mutations.
-- Context compaction is local and deterministic and does not require another model call.
+- Context compaction is local, deterministic, hard-bounded, and does not require another model
+  call. It preserves the original task as a stable cache prefix and replaces the prior structured
+  summary instead of recursively summarizing summaries.
 - Project instructions are ordered, content-deduplicated, and bounded before entering context.
 - Interactive conversations use an append-only JSONL session log and a stable provider cache key.
+- Every task creates an automatic checkpoint. Manual checkpoints record the logical message state
+  at that point; compaction is persisted as an appended snapshot record.
+- Fork and rewind create a new child session from a checkpoint or the current state. They never
+  truncate or rewrite the source log, so every branch remains resumable and auditable.
 - Interactive model calls can stream normalized text/reasoning deltas into the terminal renderer.
 - A dedicated input thread keeps line editing and history responsive while the Tokio agent loop
   runs. Rustyline's external-printer path redraws the composer around asynchronous agent events.
