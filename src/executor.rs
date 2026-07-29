@@ -89,11 +89,23 @@ impl Executor {
         if self.deny_dangerous_commands {
             reject_dangerous_command(command)?;
         }
+        self.shell_with_stdin(command, None).await
+    }
+
+    pub async fn shell_with_input(&self, command: &str, stdin: &[u8]) -> Result<ExecutionResult> {
+        self.shell_with_stdin(command, Some(stdin)).await
+    }
+
+    async fn shell_with_stdin(
+        &self,
+        command: &str,
+        stdin: Option<&[u8]>,
+    ) -> Result<ExecutionResult> {
         #[cfg(windows)]
         let (program, args): (&str, &[&str]) = ("cmd", &["/D", "/S", "/C", command]);
         #[cfg(not(windows))]
         let (program, args): (&str, &[&str]) = ("/bin/sh", &["-lc", command]);
-        self.run(program, args, None).await
+        self.run(program, args, stdin).await
     }
 
     pub async fn apply_patch(&self, patch: &str) -> Result<ExecutionResult> {

@@ -260,6 +260,87 @@ impl Default for CommandsConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    pub enabled: bool,
+    pub max_output_bytes: usize,
+    #[serde(rename = "SessionStart", alias = "session_start")]
+    pub session_start: Vec<HookCommandConfig>,
+    #[serde(rename = "UserPromptSubmit", alias = "user_prompt_submit")]
+    pub user_prompt_submit: Vec<HookCommandConfig>,
+    #[serde(rename = "Stop", alias = "stop")]
+    pub stop: Vec<HookCommandConfig>,
+    #[serde(rename = "SessionEnd", alias = "session_end")]
+    pub session_end: Vec<HookCommandConfig>,
+}
+
+impl HooksConfig {
+    pub fn has_commands(&self) -> bool {
+        [
+            &self.session_start,
+            &self.user_prompt_submit,
+            &self.stop,
+            &self.session_end,
+        ]
+        .into_iter()
+        .any(|commands| commands.iter().any(|command| command.enabled))
+    }
+
+    pub fn command_count(&self) -> usize {
+        [
+            &self.session_start,
+            &self.user_prompt_submit,
+            &self.stop,
+            &self.session_end,
+        ]
+        .into_iter()
+        .map(Vec::len)
+        .sum()
+    }
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_output_bytes: 32 * 1_024,
+            session_start: Vec::new(),
+            user_prompt_submit: Vec::new(),
+            stop: Vec::new(),
+            session_end: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HookCommandConfig {
+    pub command: String,
+    pub command_windows: Option<String>,
+    pub matcher: Option<String>,
+    pub timeout_seconds: u64,
+    pub r#async: bool,
+    pub fail_closed: bool,
+    pub enabled: bool,
+    pub status_message: Option<String>,
+}
+
+impl Default for HookCommandConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            command_windows: None,
+            matcher: None,
+            timeout_seconds: 10,
+            r#async: false,
+            fail_closed: false,
+            enabled: true,
+            status_message: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -269,10 +350,23 @@ pub struct Config {
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub commands: CommandsConfig,
+    pub hooks: HooksConfig,
 }
 
 impl Config {
     pub fn load(workspace: &Path, explicit: Option<&Path>) -> Result<Self> {
+        Self::load_inner(workspace, explicit, true)
+    }
+
+    pub fn load_passive(workspace: &Path, explicit: Option<&Path>) -> Result<Self> {
+        Self::load_inner(workspace, explicit, false)
+    }
+
+    fn load_inner(
+        workspace: &Path,
+        explicit: Option<&Path>,
+        enforce_project_trust: bool,
+    ) -> Result<Self> {
         let project = workspace.join(".wecode.toml");
         let (path, automatically_loaded_project) = if let Some(explicit) = explicit {
             (Some(explicit.to_path_buf()), false)
@@ -290,7 +384,9 @@ impl Config {
             .with_context(|| format!("failed to read config {}", path.display()))?;
         let config: Self = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
-        if automatically_loaded_project && config.mcp.servers.values().any(|server| server.enabled)
+        if enforce_project_trust
+            && automatically_loaded_project
+            && config.mcp.servers.values().any(|server| server.enabled)
         {
             bail!(
                 "refusing to auto-start MCP commands from {}; review it, then pass --config {} explicitly or move trusted MCP configuration to {}",
@@ -299,7 +395,8 @@ impl Config {
                 default_config_path().display()
             );
         }
-        if automatically_loaded_project && !config.skills.paths.is_empty() {
+        if enforce_project_trust && automatically_loaded_project && !config.skills.paths.is_empty()
+        {
             bail!(
                 "refusing external skill paths from {}; review it, then pass --config {} explicitly or move trusted skill paths to {}",
                 path.display(),
@@ -307,9 +404,24 @@ impl Config {
                 default_config_path().display()
             );
         }
-        if automatically_loaded_project && !config.commands.paths.is_empty() {
+        if enforce_project_trust
+            && automatically_loaded_project
+            && !config.commands.paths.is_empty()
+        {
             bail!(
                 "refusing external command paths from {}; review it, then pass --config {} explicitly or move trusted command paths to {}",
+                path.display(),
+                path.display(),
+                default_config_path().display()
+            );
+        }
+        if enforce_project_trust
+            && automatically_loaded_project
+            && config.hooks.enabled
+            && config.hooks.has_commands()
+        {
+            bail!(
+                "refusing to execute hooks from {}; review it, then pass --config {} explicitly or move trusted hooks to {}",
                 path.display(),
                 path.display(),
                 default_config_path().display()
@@ -393,6 +505,52 @@ impl Config {
         }
         if !(1_024..=1_024 * 1_024).contains(&self.commands.max_file_bytes) {
             bail!("commands.max_file_bytes must be between 1024 and 1048576");
+        }
+        if self.hooks.command_count() > 64 {
+            bail!("hooks cannot configure more than 64 commands");
+        }
+        if !(1_024..=1_024 * 1_024).contains(&self.hooks.max_output_bytes) {
+            bail!("hooks.max_output_bytes must be between 1024 and 1048576");
+        }
+        for hook in [
+            &self.hooks.session_start,
+            &self.hooks.user_prompt_submit,
+            &self.hooks.stop,
+            &self.hooks.session_end,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if hook.command.trim().is_empty() || hook.command.len() > 4_096 {
+                bail!("hook command must contain between 1 and 4096 bytes");
+            }
+            if hook
+                .command_windows
+                .as_ref()
+                .is_some_and(|command| command.trim().is_empty() || command.len() > 4_096)
+            {
+                bail!("hook command_windows must contain between 1 and 4096 bytes");
+            }
+            if !(1..=300).contains(&hook.timeout_seconds) {
+                bail!("hook timeout_seconds must be between 1 and 300");
+            }
+            if hook.r#async && hook.fail_closed {
+                bail!("asynchronous hooks cannot use fail_closed");
+            }
+            if let Some(matcher) = &hook.matcher {
+                if matcher.len() > 1_024 {
+                    bail!("hook matcher cannot exceed 1024 bytes");
+                }
+                regex::Regex::new(matcher)
+                    .with_context(|| format!("invalid hook matcher {matcher:?}"))?;
+            }
+            if hook
+                .status_message
+                .as_ref()
+                .is_some_and(|message| message.len() > 256)
+            {
+                bail!("hook status_message cannot exceed 256 bytes");
+            }
         }
         Ok(())
     }
@@ -741,6 +899,40 @@ paths = ["../external-commands"]
                 .contains("refusing external command paths")
         );
         assert!(Config::load(temp.path(), Some(&path)).is_ok());
+
+        std::fs::write(
+            &path,
+            r#"
+[[hooks.UserPromptSubmit]]
+command = "policy-hook"
+fail_closed = true
+"#,
+        )
+        .unwrap();
+        let error = Config::load(temp.path(), None).unwrap_err();
+        assert!(error.to_string().contains("refusing to execute hooks"));
+        assert!(Config::load(temp.path(), Some(&path)).is_ok());
+        let passive = Config::load_passive(temp.path(), None).unwrap();
+        assert_eq!(passive.hooks.user_prompt_submit.len(), 1);
+    }
+
+    #[test]
+    fn hook_config_validates_matchers_timeouts_and_async_policy() {
+        let mut config = Config::default();
+        config.hooks.user_prompt_submit = vec![HookCommandConfig {
+            command: "hook".into(),
+            matcher: Some("[".into()),
+            ..Default::default()
+        }];
+        assert!(config.validate().is_err());
+
+        config.hooks.user_prompt_submit[0].matcher = Some("review".into());
+        config.hooks.user_prompt_submit[0].r#async = true;
+        config.hooks.user_prompt_submit[0].fail_closed = true;
+        assert!(config.validate().is_err());
+
+        config.hooks.user_prompt_submit[0].fail_closed = false;
+        assert!(config.validate().is_ok());
     }
 
     #[cfg(unix)]

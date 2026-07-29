@@ -12,6 +12,7 @@ pub mod events;
 pub mod executor;
 pub mod file_tools;
 pub mod git;
+pub mod hooks;
 pub mod input_queue;
 pub mod instructions;
 pub mod interaction;

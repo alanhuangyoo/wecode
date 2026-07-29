@@ -134,6 +134,7 @@ composer remains editable while the agent works.
 /deny        Deny the pending action with optional feedback
 /status      Show model, workspace, cache, and context
 /mcp         Show connected MCP servers and tools
+/hooks       Show configured lifecycle hooks
 /commands    Show reusable prompt commands
 /skills      Show discovered Agent Skills
 /skill:<name>
@@ -290,6 +291,19 @@ compatibility_directories = true
 paths = []
 max_commands = 128
 max_file_bytes = 65536
+
+[hooks]
+enabled = true
+max_output_bytes = 32768
+
+[[hooks.UserPromptSubmit]]
+command = "./scripts/prompt-policy.sh"
+command_windows = "powershell -File scripts/prompt-policy.ps1"
+matcher = "deploy|release"
+timeout_seconds = 10
+async = false
+fail_closed = true
+status_message = "prompt policy"
 ```
 
 Provider-specific variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`
@@ -369,6 +383,30 @@ from an automatically loaded project config require explicit trust.
 
 Prompt commands are expanded only in interactive chat. Benchmark prompts, tools, and cache
 namespaces remain unchanged.
+
+### Lifecycle hooks
+
+WeCode runs bounded command hooks for `SessionStart`, `UserPromptSubmit`, `Stop`, and `SessionEnd`.
+Each hook receives a small JSON object on stdin containing the event name, session ID, workspace,
+provider, model, source, and only the event-specific prompt or stop reason. Known provider API-key
+environment variables are removed from the child process.
+
+Hooks support regular-expression matchers, platform-specific Windows commands, per-command
+timeouts, hard output limits, visible status messages, fail-open or fail-closed behavior, and
+non-blocking asynchronous notifications. Async hooks cannot be fail-closed because their result is
+intentionally not awaited.
+
+Exit code `2`, `{"continue":false}`, or `{"decision":"block"}` blocks a prompt or asks the agent
+to continue instead of stopping. Successful JSON output may add bounded model context with
+`additionalContext`; `suppressOutput` hides routine stdout from the timeline. Stop hooks are capped
+at three continuation turns to prevent loops. `/hooks` shows the active event catalog.
+
+Automatically loaded project config cannot execute hooks. Review a project `.wecode.toml` and pass
+it explicitly with `--config`, or keep trusted hooks in `~/.wecode/config.toml`.
+
+Hooks are interactive-only. `wecode run` and `wecode bench` may deserialize the shared config, but
+they do not discover, construct, or execute hooks, and project Hook declarations do not alter the
+benchmark tool registry or prompt path.
 
 ## Approvals
 

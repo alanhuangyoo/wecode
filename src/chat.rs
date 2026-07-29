@@ -17,6 +17,7 @@ use crate::commands::PromptCommand;
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, default_history_path,
 };
+use crate::hooks::{HookReport, HookStatus, HookSummary};
 use crate::input_queue::QueueSnapshot;
 use crate::instructions::InstructionSet;
 use crate::interaction::{PlanSnapshot, UserInputRequest};
@@ -40,6 +41,7 @@ pub enum ChatCommand {
     Deny(String),
     Help,
     History,
+    Hooks,
     Mcp,
     Fork(Option<String>),
     New,
@@ -71,6 +73,7 @@ pub struct ChatShell {
     history_path: PathBuf,
     output: TerminalOutput,
     tui_receiver: Option<std::sync::mpsc::Receiver<TuiMessage>>,
+    completions: Vec<tui::CommandCompletion>,
 }
 
 #[derive(Clone)]
@@ -80,7 +83,7 @@ pub struct ChatView {
 }
 
 impl ChatShell {
-    pub fn new() -> Result<Self> {
+    pub fn new(commands: &[PromptCommand], skills: &[Skill]) -> Result<Self> {
         let history_path = default_history_path();
         if let Some(parent) = history_path.parent() {
             create_private_directory(parent)?;
@@ -125,6 +128,7 @@ impl ChatShell {
             history_path,
             output,
             tui_receiver,
+            completions: command_completions(commands, skills),
         })
     }
 
@@ -139,8 +143,11 @@ impl ChatShell {
         let (sender, receiver) = mpsc::unbounded_channel();
         if let Some(tui_receiver) = self.tui_receiver.take() {
             let history_path = self.history_path.clone();
+            let completions = self.completions.clone();
             thread::spawn(move || {
-                if let Err(error) = tui::run(tui_receiver, sender.clone(), history_path) {
+                if let Err(error) =
+                    tui::run(tui_receiver, sender.clone(), history_path, completions)
+                {
                     let _ = sender.send(Err(error));
                 }
             });
@@ -198,6 +205,53 @@ impl ChatShell {
         }
         Ok(input)
     }
+}
+
+fn command_completions(
+    commands: &[PromptCommand],
+    skills: &[Skill],
+) -> Vec<tui::CommandCompletion> {
+    let builtins = [
+        ("/new", "Start a fresh conversation"),
+        ("/resume", "Resume a saved session"),
+        ("/sessions", "List saved sessions"),
+        ("/checkpoint", "Save a conversation checkpoint"),
+        ("/checkpoints", "List checkpoints"),
+        ("/fork", "Fork from a checkpoint"),
+        ("/rewind", "Rewind safely by forking"),
+        ("/plan", "Show the current plan"),
+        ("/queue", "Show queued messages"),
+        ("/clear-queue", "Clear queued messages"),
+        ("/cancel", "Cancel the active task"),
+        ("/status", "Show session status"),
+        ("/mcp", "Show MCP servers"),
+        ("/hooks", "Show lifecycle hooks"),
+        ("/commands", "Show reusable prompts"),
+        ("/skills", "Show Agent Skills"),
+        ("/rules", "Show project rules"),
+        ("/config", "Show the active config"),
+        ("/history", "Show input history"),
+        ("/help", "Show command help"),
+        ("/quit", "Exit WeCode"),
+    ];
+    let mut output = builtins
+        .into_iter()
+        .map(|(command, description)| tui::CommandCompletion {
+            command: command.into(),
+            description: description.into(),
+        })
+        .collect::<Vec<_>>();
+    output.extend(commands.iter().map(|command| tui::CommandCompletion {
+        command: format!("/{}", command.name),
+        description: command.description.clone(),
+    }));
+    output.extend(skills.iter().map(|skill| tui::CommandCompletion {
+        command: format!("/skill:{}", skill.name),
+        description: skill.description.clone(),
+    }));
+    output.sort_by(|left, right| left.command.cmp(&right.command));
+    output.dedup_by(|left, right| left.command == right.command);
+    output
 }
 
 impl ChatView {
@@ -296,6 +350,7 @@ impl ChatView {
              \n  {:12} Deny a pending action with optional feedback\
              \n  {:12} Show model, workspace, cache, and context\
              \n  {:12} Show MCP server and tool status\
+             \n  {:12} Show lifecycle hooks\
              \n  {:12} Show reusable prompt commands\
              \n  {:12} Show discovered skills\
              \n  {:12} Invoke a skill with optional arguments\
@@ -326,6 +381,7 @@ impl ChatView {
             "/deny [reason]",
             "/status",
             "/mcp",
+            "/hooks",
             "/commands",
             "/skills",
             "/skill:<name>",
@@ -472,6 +528,80 @@ impl ChatView {
         }
         output.push_str("\n  Invoke directly, for example /review src/.\n\n");
         self.output.print(output)
+    }
+
+    pub fn show_hooks(&self, hooks: &[HookSummary]) -> Result<()> {
+        let mut output = format!(
+            "\n{} · {} enabled\n",
+            Style::new().cyan().bold().apply_to("Lifecycle hooks"),
+            hooks.len()
+        );
+        if hooks.is_empty() {
+            output.push_str("  No lifecycle hooks configured.\n\n");
+            return self.output.print(output);
+        }
+        for hook in hooks {
+            output.push_str(&format!(
+                "  {:18} {:12} {}{}{}\n",
+                hook.event.as_str(),
+                hook.label,
+                hook.matcher
+                    .as_deref()
+                    .map(|matcher| format!("/{matcher}/"))
+                    .unwrap_or_else(|| "all".into()),
+                if hook.asynchronous { " · async" } else { "" },
+                if hook.fail_closed {
+                    " · fail-closed"
+                } else {
+                    ""
+                }
+            ));
+        }
+        output.push('\n');
+        self.output.print(output)
+    }
+
+    pub fn show_hook_reports(&self, reports: &[HookReport]) -> Result<()> {
+        for report in reports {
+            let detail = if report.suppress_output {
+                format!(
+                    "{} · {} · {}ms",
+                    report.event.as_str(),
+                    report.status.as_str(),
+                    report.duration_ms
+                )
+            } else {
+                let output = if !report.stderr.trim().is_empty() {
+                    one_line(&report.stderr)
+                } else {
+                    one_line(&report.stdout)
+                };
+                format!(
+                    "{} · {} · {}ms{}",
+                    report.event.as_str(),
+                    report.status.as_str(),
+                    report.duration_ms,
+                    if output.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {output}")
+                    }
+                )
+            };
+            let tone = match report.status {
+                HookStatus::Started | HookStatus::Completed => TuiTone::Dim,
+                HookStatus::Blocked | HookStatus::Failed | HookStatus::TimedOut => TuiTone::Warning,
+            };
+            if self
+                .output
+                .tui_entry(format!("HOOK · {}", report.label), &detail, tone)
+            {
+                continue;
+            }
+            self.output
+                .print(format!("  hook {} · {detail}\n", report.label))?;
+        }
+        Ok(())
     }
 
     pub fn show_sessions(&self, sessions: &[SessionSummary]) -> Result<()> {
@@ -903,6 +1033,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/followup" | "/follow-up" | "/later" => ChatInput::FollowUp(argument.to_owned()),
         "/help" | "/?" => ChatInput::Command(ChatCommand::Help),
         "/history" => ChatInput::Command(ChatCommand::History),
+        "/hooks" => ChatInput::Command(ChatCommand::Hooks),
         "/mcp" => ChatInput::Command(ChatCommand::Mcp),
         "/fork" | "/branch" => ChatInput::Command(ChatCommand::Fork(
             (!argument.is_empty()).then(|| argument.to_owned()),
@@ -1003,6 +1134,10 @@ mod tests {
         );
         assert_eq!(parse_input("/plan"), ChatInput::Command(ChatCommand::Plan));
         assert_eq!(parse_input("/mcp"), ChatInput::Command(ChatCommand::Mcp));
+        assert_eq!(
+            parse_input("/hooks"),
+            ChatInput::Command(ChatCommand::Hooks)
+        );
         assert_eq!(
             parse_input("/commands"),
             ChatInput::Command(ChatCommand::Commands)

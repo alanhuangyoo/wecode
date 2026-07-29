@@ -16,6 +16,7 @@ use crate::config::{
 };
 use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
+use crate::hooks::{HookEvent, HookInput, HookOutcome, HookRunner, append_context};
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
 use crate::interaction::{
@@ -306,7 +307,7 @@ async fn run_once(args: RunArgs) -> Result<()> {
         bail!("task cannot be empty");
     }
 
-    let (config, workspace) = resolve_config(&args.common)?;
+    let (config, workspace) = resolve_config_passive(&args.common)?;
     let cache = ResponseCache::new(config.cache.clone())?;
     let model = create_model(&config.model, config.api_key()?, cache)?;
     let sink: Box<dyn EventSink> = match args.output {
@@ -364,10 +365,15 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let instruction_set = instructions::discover(&workspace)?;
     let skills = SkillCatalog::discover(&workspace, &config.skills)?;
     let commands = CommandCatalog::discover(&workspace, &config.commands)?;
+    let hooks = HookRunner::new(
+        config.hooks.clone(),
+        workspace.clone(),
+        Some(config.model.api_key_env.clone()),
+    );
     let state_directory = config.agent.trajectory_directory.clone();
-    let shell = ChatShell::new()?;
+    let shell = ChatShell::new(&commands.commands(), &skills.skills())?;
     let view = shell.view();
-    let (mut session, mut conversation) = match start {
+    let (mut session, mut conversation, initial_source) = match start {
         ChatStart::New => (
             ChatSession::create(
                 &state_directory,
@@ -376,9 +382,12 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 &config.model.model,
             )?,
             Conversation::default(),
+            "startup",
         ),
         ChatStart::Resume(selector) => {
-            ChatSession::resume(&state_directory, &workspace, selector.as_deref())?
+            let (session, conversation) =
+                ChatSession::resume(&state_directory, &workspace, selector.as_deref())?;
+            (session, conversation, "resume")
         }
     };
     let mut agent: Option<Agent> = None;
@@ -395,6 +404,28 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         commands.len(),
     )?;
     view.sync_plan(&plan.current());
+    let initial_hooks = run_hook_event(
+        &hooks,
+        HookEvent::SessionStart,
+        session.summary(),
+        &config,
+        &workspace,
+        initial_source,
+        None,
+        None,
+        &view,
+    )
+    .await?;
+    if initial_hooks.blocked {
+        bail!(
+            "SessionStart hook blocked startup: {}",
+            initial_hooks
+                .reason
+                .as_deref()
+                .unwrap_or("no reason provided")
+        );
+    }
+    let mut pending_session_hook_context = initial_hooks.additional_context;
     if !config.mcp.servers.is_empty() {
         view.notice(format!(
             "Connecting {} configured MCP server{}…",
@@ -463,6 +494,13 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             if commands.len() == 1 { "" } else { "s" }
         ))?;
     }
+    if !hooks.is_empty() {
+        view.notice(format!(
+            "Enabled {} lifecycle hook{} · /hooks to inspect.",
+            hooks.len(),
+            if hooks.len() == 1 { "" } else { "s" }
+        ))?;
+    }
     let mut inputs = shell.into_input_stream();
 
     loop {
@@ -518,6 +556,18 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 view.warning("Message cannot be empty.")?;
             }
             ChatInput::Command(ChatCommand::New) => {
+                let _ = run_hook_event(
+                    &hooks,
+                    HookEvent::SessionEnd,
+                    session.summary(),
+                    &config,
+                    &workspace,
+                    "new",
+                    None,
+                    None,
+                    &view,
+                )
+                .await?;
                 session = ChatSession::create(
                     &state_directory,
                     &workspace,
@@ -527,6 +577,25 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 conversation = Conversation::default();
                 plan.clear();
                 input_queue.clear();
+                let started = run_hook_event(
+                    &hooks,
+                    HookEvent::SessionStart,
+                    session.summary(),
+                    &config,
+                    &workspace,
+                    "new",
+                    None,
+                    None,
+                    &view,
+                )
+                .await?;
+                if started.blocked {
+                    bail!(
+                        "SessionStart hook blocked new session: {}",
+                        started.reason.as_deref().unwrap_or("no reason provided")
+                    );
+                }
+                pending_session_hook_context = started.additional_context;
                 view.clear_screen(
                     &config,
                     &workspace,
@@ -565,17 +634,50 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
             ChatInput::Command(ChatCommand::Help) => view.show_help()?,
             ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
+            ChatInput::Command(ChatCommand::Hooks) => view.show_hooks(&hooks.summaries())?,
             ChatInput::Command(ChatCommand::Mcp) => view.show_mcp(&mcp.reports())?,
             ChatInput::Command(ChatCommand::Skills) => view.show_skills(&skills.skills())?,
             ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
             ChatInput::Command(ChatCommand::Fork(selector)) => {
                 let source_id = session.summary().id.clone();
+                let previous_session = session.summary().clone();
                 match session.fork(&state_directory, &conversation, selector.as_deref()) {
                     Ok((next_session, next_conversation)) => {
+                        let _ = run_hook_event(
+                            &hooks,
+                            HookEvent::SessionEnd,
+                            &previous_session,
+                            &config,
+                            &workspace,
+                            "fork",
+                            None,
+                            None,
+                            &view,
+                        )
+                        .await?;
                         session = next_session;
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        let started = run_hook_event(
+                            &hooks,
+                            HookEvent::SessionStart,
+                            session.summary(),
+                            &config,
+                            &workspace,
+                            "fork",
+                            None,
+                            None,
+                            &view,
+                        )
+                        .await?;
+                        if started.blocked {
+                            bail!(
+                                "SessionStart hook blocked fork: {}",
+                                started.reason.as_deref().unwrap_or("no reason provided")
+                            );
+                        }
+                        pending_session_hook_context = started.additional_context;
                         view.clear_screen(
                             &config,
                             &workspace,
@@ -608,12 +710,44 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
             ChatInput::Command(ChatCommand::Rewind(selector)) => {
                 let source_id = session.summary().id.clone();
+                let previous_session = session.summary().clone();
                 match session.rewind(&state_directory, &conversation, selector.as_deref()) {
                     Ok((next_session, next_conversation)) => {
+                        let _ = run_hook_event(
+                            &hooks,
+                            HookEvent::SessionEnd,
+                            &previous_session,
+                            &config,
+                            &workspace,
+                            "rewind",
+                            None,
+                            None,
+                            &view,
+                        )
+                        .await?;
                         session = next_session;
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        let started = run_hook_event(
+                            &hooks,
+                            HookEvent::SessionStart,
+                            session.summary(),
+                            &config,
+                            &workspace,
+                            "rewind",
+                            None,
+                            None,
+                            &view,
+                        )
+                        .await?;
+                        if started.blocked {
+                            bail!(
+                                "SessionStart hook blocked rewind: {}",
+                                started.reason.as_deref().unwrap_or("no reason provided")
+                            );
+                        }
+                        pending_session_hook_context = started.additional_context;
                         view.clear_screen(
                             &config,
                             &workspace,
@@ -634,14 +768,46 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 }
             }
             ChatInput::Command(ChatCommand::Resume(selector)) => {
+                let previous_session = session.summary().clone();
                 let resumed =
                     ChatSession::resume(&state_directory, &workspace, selector.as_deref());
                 match resumed {
                     Ok((next_session, next_conversation)) => {
+                        let _ = run_hook_event(
+                            &hooks,
+                            HookEvent::SessionEnd,
+                            &previous_session,
+                            &config,
+                            &workspace,
+                            "resume",
+                            None,
+                            None,
+                            &view,
+                        )
+                        .await?;
                         session = next_session;
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        let started = run_hook_event(
+                            &hooks,
+                            HookEvent::SessionStart,
+                            session.summary(),
+                            &config,
+                            &workspace,
+                            "resume",
+                            None,
+                            None,
+                            &view,
+                        )
+                        .await?;
+                        if started.blocked {
+                            bail!(
+                                "SessionStart hook blocked resume: {}",
+                                started.reason.as_deref().unwrap_or("no reason provided")
+                            );
+                        }
+                        pending_session_hook_context = started.additional_context;
                         view.clear_screen(
                             &config,
                             &workspace,
@@ -682,9 +848,25 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 unreachable!("skill commands are expanded before dispatch")
             }
             ChatInput::FollowUp(task) | ChatInput::Task(task) => {
-                session.set_initial_title(title_override.as_deref().unwrap_or(&task))?;
+                let task_title = task.clone();
+                let Some((task, prompt_contexts)) = apply_prompt_hooks(
+                    &hooks,
+                    session.summary(),
+                    &config,
+                    &workspace,
+                    &task,
+                    &view,
+                )
+                .await?
+                else {
+                    continue;
+                };
+                let mut contexts = std::mem::take(&mut pending_session_hook_context);
+                contexts.extend(prompt_contexts);
+                let task = append_context(&task, &contexts);
+                session.set_initial_title(title_override.as_deref().unwrap_or(&task_title))?;
                 session.checkpoint(
-                    Some(&automatic_checkpoint_label(&task)),
+                    Some(&automatic_checkpoint_label(&task_title)),
                     &conversation,
                     true,
                 )?;
@@ -716,6 +898,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 }
 
                 let mut current_task = task;
+                let mut stop_blocks = 0_usize;
                 let exit_requested = loop {
                     let result = run_active_chat_task(
                         agent.as_mut().expect("chat agent initialized"),
@@ -734,11 +917,49 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &mcp,
                         &skills,
                         &commands,
+                        &hooks,
                         &mut inputs,
                         &view,
                     )
                     .await?;
                     session.save(&conversation)?;
+                    if result.reason == "finished" {
+                        let stop_hooks = run_hook_event(
+                            &hooks,
+                            HookEvent::Stop,
+                            session.summary(),
+                            &config,
+                            &workspace,
+                            if stop_blocks == 0 {
+                                "agent"
+                            } else {
+                                "stop-hook-active"
+                            },
+                            None,
+                            Some(&result.reason),
+                            &view,
+                        )
+                        .await?;
+                        if stop_hooks.blocked && stop_blocks < 3 {
+                            stop_blocks += 1;
+                            current_task = append_context(
+                                stop_hooks
+                                    .reason
+                                    .as_deref()
+                                    .unwrap_or("Continue working before stopping."),
+                                &stop_hooks.additional_context,
+                            );
+                            view.notice(format!(
+                                "Stop hook requested another agent turn ({stop_blocks}/3)."
+                            ))?;
+                            continue;
+                        }
+                        if stop_hooks.blocked {
+                            view.warning(
+                                "Stop hook block limit reached; ending the task to prevent a loop.",
+                            )?;
+                        }
+                    }
                     if result.exit_requested || result.reason != "finished" {
                         break result.exit_requested;
                     }
@@ -760,8 +981,77 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
         }
     }
+    let _ = run_hook_event(
+        &hooks,
+        HookEvent::SessionEnd,
+        session.summary(),
+        &config,
+        &workspace,
+        "exit",
+        None,
+        None,
+        &view,
+    )
+    .await?;
     mcp.shutdown().await;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_hook_event(
+    hooks: &HookRunner,
+    event: HookEvent,
+    session: &crate::session::SessionSummary,
+    config: &Config,
+    workspace: &Path,
+    source: &str,
+    prompt: Option<&str>,
+    stop_reason: Option<&str>,
+    view: &ChatView,
+) -> Result<HookOutcome> {
+    let mut input = HookInput::new(
+        event,
+        session.id.clone(),
+        workspace.to_path_buf(),
+        config.model.provider.clone(),
+        config.model.model.clone(),
+        source,
+    );
+    input.prompt = prompt.map(ToOwned::to_owned);
+    input.stop_reason = stop_reason.map(ToOwned::to_owned);
+    let outcome = hooks.run(event, input).await?;
+    view.show_hook_reports(&outcome.reports)?;
+    Ok(outcome)
+}
+
+async fn apply_prompt_hooks(
+    hooks: &HookRunner,
+    session: &crate::session::SessionSummary,
+    config: &Config,
+    workspace: &Path,
+    prompt: &str,
+    view: &ChatView,
+) -> Result<Option<(String, Vec<String>)>> {
+    let outcome = run_hook_event(
+        hooks,
+        HookEvent::UserPromptSubmit,
+        session,
+        config,
+        workspace,
+        "interactive",
+        Some(prompt),
+        None,
+        view,
+    )
+    .await?;
+    if outcome.blocked {
+        view.warning(format!(
+            "Prompt blocked by hook: {}",
+            outcome.reason.as_deref().unwrap_or("no reason provided")
+        ))?;
+        return Ok(None);
+    }
+    Ok(Some((prompt.to_owned(), outcome.additional_context)))
 }
 
 struct ActiveChatResult {
@@ -787,6 +1077,7 @@ async fn run_active_chat_task(
     mcp: &McpManager,
     skills: &SkillCatalog,
     commands: &CommandCatalog,
+    hooks: &HookRunner,
     inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
     view: &ChatView,
 ) -> Result<ActiveChatResult> {
@@ -949,6 +1240,10 @@ async fn run_active_chat_task(
                             view.show_mcp(&mcp.reports())?;
                             continue;
                         }
+                        ChatInput::Command(ChatCommand::Hooks) => {
+                            view.show_hooks(&hooks.summaries())?;
+                            continue;
+                        }
                         ChatInput::Command(ChatCommand::Commands) => {
                             view.show_commands(&commands.commands())?;
                             continue;
@@ -970,15 +1265,41 @@ async fn run_active_chat_task(
                         view.warning("Steering message cannot be empty.")?;
                     }
                     ChatInput::Task(text) => {
-                        let queued = input_queue.steer(text);
-                        view.show_queued("steer", queued.id, input_queue.snapshot().len())?;
+                        if let Some((text, contexts)) = apply_prompt_hooks(
+                            hooks,
+                            session.summary(),
+                            config,
+                            workspace,
+                            &text,
+                            view,
+                        )
+                        .await?
+                        {
+                            let queued = input_queue.steer(append_context(&text, &contexts));
+                            view.show_queued("steer", queued.id, input_queue.snapshot().len())?;
+                        }
                     }
                     ChatInput::FollowUp(text) if text.trim().is_empty() => {
                         view.warning("Follow-up message cannot be empty.")?;
                     }
                     ChatInput::FollowUp(text) => {
-                        let queued = input_queue.follow_up(text);
-                        view.show_queued("follow-up", queued.id, input_queue.snapshot().len())?;
+                        if let Some((text, contexts)) = apply_prompt_hooks(
+                            hooks,
+                            session.summary(),
+                            config,
+                            workspace,
+                            &text,
+                            view,
+                        )
+                        .await?
+                        {
+                            let queued = input_queue.follow_up(append_context(&text, &contexts));
+                            view.show_queued(
+                                "follow-up",
+                                queued.id,
+                                input_queue.snapshot().len(),
+                            )?;
+                        }
                     }
                     ChatInput::Interrupted | ChatInput::Command(ChatCommand::Cancel) => {
                         if let Some(request) = pending_approval.take() {
@@ -1017,6 +1338,9 @@ async fn run_active_chat_task(
                     }
                     ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
                     ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
+                    ChatInput::Command(ChatCommand::Hooks) => {
+                        view.show_hooks(&hooks.summaries())?;
+                    }
                     ChatInput::Command(ChatCommand::Mcp) => {
                         view.show_mcp(&mcp.reports())?;
                     }
@@ -1029,12 +1353,24 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Skill { name, arguments }) => {
                         match skills.explicit_request(&name, &arguments) {
                             Ok(request) => {
-                                let queued = input_queue.steer(request);
-                                view.show_queued(
-                                    "skill steer",
-                                    queued.id,
-                                    input_queue.snapshot().len(),
-                                )?;
+                                if let Some((request, contexts)) = apply_prompt_hooks(
+                                    hooks,
+                                    session.summary(),
+                                    config,
+                                    workspace,
+                                    &request,
+                                    view,
+                                )
+                                .await?
+                                {
+                                    let queued =
+                                        input_queue.steer(append_context(&request, &contexts));
+                                    view.show_queued(
+                                        "skill steer",
+                                        queued.id,
+                                        input_queue.snapshot().len(),
+                                    )?;
+                                }
                             }
                             Err(error) => view.warning(error.to_string())?,
                         }
@@ -1042,12 +1378,24 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Unknown { name, arguments }) => {
                         match commands.expand(&name, &arguments) {
                             Ok(request) => {
-                                let queued = input_queue.steer(request);
-                                view.show_queued(
-                                    "command steer",
-                                    queued.id,
-                                    input_queue.snapshot().len(),
-                                )?;
+                                if let Some((request, contexts)) = apply_prompt_hooks(
+                                    hooks,
+                                    session.summary(),
+                                    config,
+                                    workspace,
+                                    &request,
+                                    view,
+                                )
+                                .await?
+                                {
+                                    let queued =
+                                        input_queue.steer(append_context(&request, &contexts));
+                                    view.show_queued(
+                                        "command steer",
+                                        queued.id,
+                                        input_queue.snapshot().len(),
+                                    )?;
+                                }
                             }
                             Err(_) => {
                                 view.warning(format!(
@@ -1137,7 +1485,7 @@ fn spawn_cancellation_signal(cancellation: CancellationToken) -> tokio::task::Jo
 }
 
 fn list_sessions(args: SessionsArgs) -> Result<()> {
-    let (config, workspace) = resolve_config(&args.common)?;
+    let (config, workspace) = resolve_config_passive(&args.common)?;
     let sessions = ChatSession::list(&config.agent.trajectory_directory, &workspace)?;
     if sessions.is_empty() {
         println!("no saved sessions for {}", workspace.display());
@@ -1157,7 +1505,7 @@ fn list_sessions(args: SessionsArgs) -> Result<()> {
 
 async fn bench(args: BenchArgs) -> Result<()> {
     let explicit_approval_policy = args.common.approval_policy.is_some();
-    let (mut config, workspace) = resolve_config(&args.common)?;
+    let (mut config, workspace) = resolve_config_passive(&args.common)?;
     if !explicit_approval_policy {
         config.agent.approval_policy = ApprovalPolicy::Never;
     }
@@ -1273,8 +1621,20 @@ fn setup(args: SetupArgs) -> Result<()> {
 }
 
 fn resolve_config(args: &CommonArgs) -> Result<(Config, PathBuf)> {
+    resolve_config_with(args, false)
+}
+
+fn resolve_config_passive(args: &CommonArgs) -> Result<(Config, PathBuf)> {
+    resolve_config_with(args, true)
+}
+
+fn resolve_config_with(args: &CommonArgs, passive: bool) -> Result<(Config, PathBuf)> {
     let workspace = canonical_workspace(&args.workspace)?;
-    let mut config = Config::load(&workspace, args.config.as_deref())?;
+    let mut config = if passive {
+        Config::load_passive(&workspace, args.config.as_deref())?
+    } else {
+        Config::load(&workspace, args.config.as_deref())?
+    };
     if let Some(provider) = &args.provider {
         config.apply_provider(provider)?;
     }

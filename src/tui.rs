@@ -24,6 +24,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::chat::{ChatInput, parse_input};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandCompletion {
+    pub command: String,
+    pub description: String,
+}
+
 #[derive(Clone)]
 pub struct TuiHandle {
     sender: Sender<TuiMessage>,
@@ -111,10 +117,11 @@ pub(crate) fn run(
     receiver: Receiver<TuiMessage>,
     inputs: tokio_mpsc::UnboundedSender<Result<ChatInput>>,
     history_path: PathBuf,
+    completions: Vec<CommandCompletion>,
 ) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let history = load_history(&history_path);
-    let mut state = TuiState::new(history);
+    let mut state = TuiState::new(history, completions);
     let mut redraw = true;
 
     loop {
@@ -275,6 +282,8 @@ struct TuiState {
     composer: Composer,
     composer_placeholder: Option<String>,
     composer_title: Option<String>,
+    completion_selected: usize,
+    completions: Vec<CommandCompletion>,
     header_primary: String,
     header_secondary: String,
     history: Vec<String>,
@@ -287,11 +296,13 @@ struct TuiState {
 }
 
 impl TuiState {
-    fn new(history: Vec<String>) -> Self {
+    fn new(history: Vec<String>, completions: Vec<CommandCompletion>) -> Self {
         Self {
             composer: Composer::default(),
             composer_placeholder: None,
             composer_title: None,
+            completion_selected: 0,
+            completions,
             header_primary: format!("WeCode {}", env!("CARGO_PKG_VERSION")),
             header_secondary: "Lightweight coding agent".into(),
             history,
@@ -372,6 +383,9 @@ impl TuiState {
                     self.composer.insert("\n");
                     return KeyOutcome::changed();
                 }
+                if self.apply_completion(false) {
+                    return KeyOutcome::changed();
+                }
                 let text = self.composer.take();
                 if text.trim().is_empty() {
                     return KeyOutcome::changed();
@@ -384,10 +398,12 @@ impl TuiState {
             }
             KeyCode::Char(character) => {
                 self.composer.insert_char(character);
+                self.completion_selected = 0;
                 KeyOutcome::changed()
             }
             KeyCode::Backspace => {
                 self.composer.backspace();
+                self.completion_selected = 0;
                 KeyOutcome::changed()
             }
             KeyCode::Delete => {
@@ -408,6 +424,34 @@ impl TuiState {
             }
             KeyCode::End => {
                 self.composer.end();
+                KeyOutcome::changed()
+            }
+            KeyCode::Tab => {
+                if self.apply_completion(true) {
+                    KeyOutcome::changed()
+                } else {
+                    KeyOutcome::unchanged()
+                }
+            }
+            KeyCode::BackTab => {
+                let count = self.active_completions().len();
+                if count > 0 {
+                    self.completion_selected =
+                        self.completion_selected.checked_sub(1).unwrap_or(count - 1);
+                    KeyOutcome::changed()
+                } else {
+                    KeyOutcome::unchanged()
+                }
+            }
+            KeyCode::Up if !self.active_completions().is_empty() => {
+                let count = self.active_completions().len();
+                self.completion_selected =
+                    self.completion_selected.checked_sub(1).unwrap_or(count - 1);
+                KeyOutcome::changed()
+            }
+            KeyCode::Down if !self.active_completions().is_empty() => {
+                let count = self.active_completions().len();
+                self.completion_selected = (self.completion_selected + 1) % count;
                 KeyOutcome::changed()
             }
             KeyCode::Up if !self.composer.text.contains('\n') => {
@@ -451,6 +495,34 @@ impl TuiState {
             next.and_then(|index| self.history.get(index).cloned())
                 .unwrap_or_default(),
         );
+    }
+
+    fn active_completions(&self) -> Vec<&CommandCompletion> {
+        let value = self.composer.text.trim_start();
+        if !value.starts_with('/') || value.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        self.completions
+            .iter()
+            .filter(|completion| completion.command.starts_with(value))
+            .take(8)
+            .collect()
+    }
+
+    fn apply_completion(&mut self, force: bool) -> bool {
+        let selected = self
+            .active_completions()
+            .get(self.completion_selected)
+            .map(|completion| completion.command.clone());
+        let Some(command) = selected else {
+            return false;
+        };
+        if !force && self.composer.text.trim() == command {
+            return false;
+        }
+        self.composer.set(format!("{command} "));
+        self.completion_selected = 0;
+        true
     }
 }
 
@@ -577,17 +649,40 @@ fn char_to_byte(value: &str, character_index: usize) -> usize {
 fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
     let composer_height = composer_height(&state.composer.text, area.width);
+    let completion_count = state.active_completions().len();
+    let base_height = 3_u16
+        .saturating_add(3)
+        .saturating_add(composer_height)
+        .saturating_add(1);
+    let mut optional_height = area.height.saturating_sub(base_height);
+    let desired_completion_height = u16::try_from(completion_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let completion_height = if completion_count > 0 && optional_height >= 3 {
+        desired_completion_height.min(optional_height)
+    } else {
+        0
+    };
+    optional_height = optional_height.saturating_sub(completion_height);
+    let desired_plan_height = state
+        .plan
+        .as_ref()
+        .map(|plan| u16::try_from(plan.len()).unwrap_or(u16::MAX).clamp(1, 5) + 2)
+        .unwrap_or(0);
+    let plan_height = if desired_plan_height > 0 && optional_height >= 3 {
+        desired_plan_height.min(optional_height)
+    } else {
+        0
+    };
     let mut constraints = vec![Constraint::Length(3)];
-    if let Some(plan) = &state.plan {
-        constraints.push(Constraint::Length(
-            u16::try_from(plan.len()).unwrap_or(u16::MAX).clamp(1, 5) + 2,
-        ));
+    if plan_height > 0 {
+        constraints.push(Constraint::Length(plan_height));
     }
-    constraints.extend([
-        Constraint::Min(3),
-        Constraint::Length(composer_height),
-        Constraint::Length(1),
-    ]);
+    constraints.push(Constraint::Min(3));
+    if completion_height > 0 {
+        constraints.push(Constraint::Length(completion_height));
+    }
+    constraints.extend([Constraint::Length(composer_height), Constraint::Length(1)]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -595,13 +690,65 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
 
     draw_header(frame, chunks[0], state);
     let mut index = 1;
-    if state.plan.is_some() {
+    if plan_height > 0 {
         draw_plan(frame, chunks[index], state);
         index += 1;
     }
     draw_transcript(frame, chunks[index], state);
-    draw_composer(frame, chunks[index + 1], state);
-    draw_footer(frame, chunks[index + 2], state);
+    index += 1;
+    if completion_height > 0 {
+        draw_completions(frame, chunks[index], state);
+        index += 1;
+    }
+    draw_composer(frame, chunks[index], state);
+    draw_footer(frame, chunks[index + 1], state);
+}
+
+fn draw_completions(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let completions = state.active_completions();
+    let selected = state
+        .completion_selected
+        .min(completions.len().saturating_sub(1));
+    let visible_rows = usize::from(area.height.saturating_sub(2));
+    let first_visible = selected.saturating_add(1).saturating_sub(visible_rows);
+    let lines = completions
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_rows)
+        .map(|(index, completion)| {
+            let marker = if index == selected { "›" } else { " " };
+            let style = if index == selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(vec![
+                Span::styled(format!(" {marker} {:24}", completion.command), style),
+                Span::styled(
+                    truncate(
+                        &completion.description,
+                        area.width.saturating_sub(31) as usize,
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(
+                    " Commands · ↑↓ select · Tab complete ",
+                    Style::default().fg(Color::Cyan),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        area,
+    );
 }
 
 fn draw_plan(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
@@ -1009,10 +1156,81 @@ mod tests {
     }
 
     #[test]
+    fn slash_palette_filters_navigates_and_completes() {
+        let completions = vec![
+            CommandCompletion {
+                command: "/help".into(),
+                description: "Show help".into(),
+            },
+            CommandCompletion {
+                command: "/hooks".into(),
+                description: "Show hooks".into(),
+            },
+        ];
+        let mut state = TuiState::new(Vec::new(), completions);
+        state.composer.insert("/h");
+        assert_eq!(state.active_completions().len(), 2);
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.composer.text, "/hooks ");
+        assert!(state.active_completions().is_empty());
+    }
+
+    #[test]
+    fn slash_palette_renders_above_the_composer() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(
+            Vec::new(),
+            vec![CommandCompletion {
+                command: "/review".into(),
+                description: "Review current changes".into(),
+            }],
+        );
+        state.composer.insert("/rev");
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Commands"));
+        assert!(rendered.contains("/review"));
+        assert!(rendered.contains("Review current changes"));
+        assert!(rendered.contains("Tab complete"));
+    }
+
+    #[test]
+    fn short_terminal_keeps_the_composer_visible() {
+        let backend = TestBackend::new(48, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let completions = (0..8)
+            .map(|index| CommandCompletion {
+                command: format!("/command-{index}"),
+                description: format!("Command {index}"),
+            })
+            .collect();
+        let mut state = TuiState::new(Vec::new(), completions);
+        state.composer.insert("/c");
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Message"));
+        assert!(rendered.contains("/c"));
+    }
+
+    #[test]
     fn full_screen_layout_keeps_header_timeline_and_composer_visible() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut state = TuiState::new(Vec::new());
+        let mut state = TuiState::new(Vec::new(), Vec::new());
         state.header_primary = "openai · gpt-mini  |  ~/project".into();
         state.header_secondary = "session abc123 · 2 rules · chat-completions".into();
         state.append_user("修复失败的测试");
@@ -1039,7 +1257,7 @@ mod tests {
     fn plan_panel_and_question_composer_remain_visible_together() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut state = TuiState::new(Vec::new());
+        let mut state = TuiState::new(Vec::new(), Vec::new());
         state.plan = Some(vec![
             "✓ Inspect repository".into(),
             "◉ Implement parser".into(),

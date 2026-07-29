@@ -126,6 +126,7 @@ Agent 工作时仍可继续编辑。
 /deny        拒绝操作并可提供原因
 /status      查看模型、工作区、缓存和上下文
 /mcp         查看 MCP 服务器和工具状态
+/hooks       查看生命周期 Hooks
 /commands    查看可复用 Prompt 命令
 /skills      查看发现的 Agent Skills
 /skill:<名称>
@@ -271,6 +272,19 @@ compatibility_directories = true
 paths = []
 max_commands = 128
 max_file_bytes = 65536
+
+[hooks]
+enabled = true
+max_output_bytes = 32768
+
+[[hooks.UserPromptSubmit]]
+command = "./scripts/prompt-policy.sh"
+command_windows = "powershell -File scripts/prompt-policy.ps1"
+matcher = "deploy|release"
+timeout_seconds = 10
+async = false
+fail_closed = true
+status_message = "prompt policy"
 ```
 
 支持 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY` 等服务商变量。
@@ -340,6 +354,27 @@ Prompt 目录。
 上限；自动加载的项目配置若指定外部 `commands.paths`，必须先显式信任。
 
 Prompt 命令只在交互 Chat 中展开；Benchmark 的提示词、工具和缓存命名空间保持不变。
+
+### 生命周期 Hooks
+
+WeCode 为 `SessionStart`、`UserPromptSubmit`、`Stop` 和 `SessionEnd` 提供有边界的命令
+Hooks。每个 Hook 会从 stdin 收到一个小型 JSON 对象，其中只有事件名、Session ID、
+Workspace、服务商、模型、来源以及该事件需要的 Prompt 或停止原因。子进程不会继承已知模型
+服务商的 API Key 环境变量。
+
+Hooks 支持正则匹配器、Windows 专用命令、独立超时、输出硬上限、可见状态消息、fail-open /
+fail-closed 和非阻塞异步通知。异步 Hook 不允许 fail-closed，因为其结果不会被等待。
+
+退出码 `2`、`{"continue":false}` 或 `{"decision":"block"}` 可以阻止 Prompt，或要求 Agent
+在停止前继续工作。成功的 JSON 输出可以通过 `additionalContext` 加入有大小限制的模型上下文；
+`suppressOutput` 可隐藏常规 stdout。Stop Hook 最多连续触发三次，避免死循环。`/hooks` 会显示
+当前事件目录。
+
+自动加载的项目配置不能直接执行 Hooks。请先审查项目 `.wecode.toml`，再通过 `--config`
+显式传入；或把可信 Hooks 放在 `~/.wecode/config.toml`。
+
+Hooks 只在交互模式启用。`wecode run` 和 `wecode bench` 可能会反序列化共用配置，但不会发现、
+构造或执行 Hooks；项目中的 Hook 声明也不会改变 benchmark 的工具注册表或 Prompt 路径。
 
 ## 权限审批
 
