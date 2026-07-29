@@ -1179,6 +1179,7 @@ fn display_uri(uri: &str, workspace: &Path) -> String {
                 .unwrap_or(&path)
                 .display()
                 .to_string()
+                .replace('\\', "/")
         })
         .unwrap_or_else(|| uri.to_owned())
 }
