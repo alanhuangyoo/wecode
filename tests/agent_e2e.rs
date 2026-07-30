@@ -577,7 +577,11 @@ async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
     assert_eq!(result.steps, 1);
     let requests = requests.lock().unwrap();
     assert!(requests[0].system.contains("Treat greetings"));
-    assert!(requests[0].system.contains("answer directly"));
+    assert!(
+        requests[0]
+            .system
+            .contains("without scanning the repository")
+    );
     assert!(
         requests[0]
             .system
