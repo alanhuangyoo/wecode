@@ -80,6 +80,35 @@ impl Conversation {
         self.messages.len()
     }
 
+    pub(crate) fn record_user_shell(&mut self, command: &str, result: &ExecutionResult) {
+        let mut context = format!(
+            "The user ran this local shell command outside the agent:\n\n```sh\n{command}\n```\n\n\
+             Result: exit_code={} timed_out={}",
+            result
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            result.timed_out
+        );
+        if !result.stdout.is_empty() {
+            context.push_str("\n\nstdout:\n```\n");
+            context.push_str(result.stdout.trim_end());
+            context.push_str("\n```");
+        }
+        if !result.stderr.is_empty() {
+            context.push_str("\n\nstderr:\n```\n");
+            context.push_str(result.stderr.trim_end());
+            context.push_str("\n```");
+        }
+        if result.truncated_bytes > 0 {
+            context.push_str(&format!(
+                "\n\n{} output bytes were omitted.",
+                result.truncated_bytes
+            ));
+        }
+        self.messages.push(Message::user(context));
+    }
+
     pub(crate) fn from_messages(messages: Vec<Message>) -> Self {
         Self { messages }
     }

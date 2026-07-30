@@ -22,6 +22,7 @@ use crate::commands::PromptCommand;
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, default_history_path,
 };
+use crate::executor::ExecutionResult;
 use crate::hooks::{HookReport, HookStatus, HookSummary};
 use crate::input_queue::QueueSnapshot;
 use crate::instructions::InstructionSet;
@@ -50,6 +51,7 @@ pub enum ChatCommand {
     Config,
     Deny(String),
     Detach(String),
+    Diff,
     Help,
     History,
     Hooks,
@@ -79,6 +81,10 @@ pub enum ChatCommand {
 pub enum ChatInput {
     Task(String),
     FollowUp(String),
+    Shell {
+        command: String,
+        include_in_context: bool,
+    },
     Command(ChatCommand),
     Interrupted,
     Exit,
@@ -225,7 +231,9 @@ impl ChatShell {
         if line.is_empty() {
             return Ok(ChatInput::Interrupted);
         }
-        if let Some(editor) = self.editor.as_mut() {
+        if let Some(editor) = self.editor.as_mut()
+            && !line.starts_with("!!")
+        {
             let _ = editor.add_history_entry(line);
             if editor.save_history(&self.history_path).is_ok() {
                 let _ = make_file_private(&self.history_path);
@@ -317,6 +325,7 @@ fn command_completions(
         ("/attach", "Attach a text file or image"),
         ("/attachments", "Show pending attachments"),
         ("/detach", "Remove pending attachments"),
+        ("/diff", "Show staged, unstaged, and untracked changes"),
         ("/resume", "Resume a saved session"),
         ("/sessions", "List saved sessions"),
         ("/checkpoint", "Save a conversation checkpoint"),
@@ -454,6 +463,9 @@ impl ChatView {
              \n  {:12} Show files attached to the next message\
              \n  {:12} Remove the last, selected, or all attachments\
              \n  {:12} Fuzzy-search and attach a repository file\
+             \n  {:12} Show staged, unstaged, and untracked changes\
+             \n  {:12} Run a shell command and include its result in context\
+             \n  {:12} Run a shell command without saving it to context\
              \n  {:12} Show the current task plan\
              \n  {:12} Show managed background processes\
              \n  {:12} Stop a managed background process\
@@ -496,6 +508,9 @@ impl ChatView {
             "/attachments",
             "/detach [number|all]",
             "@path",
+            "/diff",
+            "!command",
+            "!!command",
             "/plan",
             "/processes",
             "/stop-process <id>",
@@ -564,6 +579,81 @@ impl ChatView {
             config.model.provider,
             config.model.model,
             protocol_name(config.model.family, config.model.wire_api),
+        ))
+    }
+
+    pub fn shell_started(&self, command: &str) {
+        self.output
+            .set_tui_status(Some(format!("● Shell · {}", one_line(command))));
+    }
+
+    pub fn show_shell_result(
+        &self,
+        command: &str,
+        result: &ExecutionResult,
+        included: bool,
+    ) -> Result<()> {
+        self.output.set_tui_status(None);
+        let mut body = format!(
+            "$ {command}\nexit {} · {} ms{}",
+            result
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            result.duration_ms,
+            if result.timed_out {
+                " · timed out"
+            } else {
+                ""
+            }
+        );
+        if !result.stdout.is_empty() {
+            body.push_str("\n\n");
+            body.push_str(result.stdout.trim_end());
+        }
+        if !result.stderr.is_empty() {
+            body.push_str("\n\nstderr:\n");
+            body.push_str(result.stderr.trim_end());
+        }
+        if result.truncated_bytes > 0 {
+            body.push_str(&format!(
+                "\n\n… {} output bytes omitted",
+                result.truncated_bytes
+            ));
+        }
+        body.push_str(if included {
+            "\n\nIncluded in the next model context."
+        } else {
+            "\n\nExcluded from model context and session history."
+        });
+        let tone = if result.success() {
+            TuiTone::Success
+        } else {
+            TuiTone::Warning
+        };
+        if self.output.tui_entry("SHELL", &body, tone) {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "\n{}\n{body}\n",
+            Style::new().cyan().bold().apply_to("Shell")
+        ))
+    }
+
+    pub fn shell_failed(&self, error: impl AsRef<str>) -> Result<()> {
+        self.output.set_tui_status(None);
+        self.warning(format!("Shell command failed to start: {}", error.as_ref()))
+    }
+
+    pub fn show_diff(&self, diff: &str) -> Result<()> {
+        let body = bounded_middle(diff, 512 * 1_024);
+        if self.output.tui_entry("DIFF", &body, TuiTone::Normal) {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "\n{}\n{}\n",
+            Style::new().cyan().bold().apply_to("Working tree diff"),
+            body
         ))
     }
 
@@ -1397,6 +1487,18 @@ fn truncate_chars(value: &str, width: usize) -> String {
 }
 
 pub(crate) fn parse_input(line: &str) -> ChatInput {
+    if let Some(command) = line.strip_prefix("!!") {
+        return ChatInput::Shell {
+            command: command.trim_start().to_owned(),
+            include_in_context: false,
+        };
+    }
+    if let Some(command) = line.strip_prefix('!') {
+        return ChatInput::Shell {
+            command: command.trim_start().to_owned(),
+            include_in_context: true,
+        };
+    }
     let (command, argument) = line
         .split_once(char::is_whitespace)
         .map(|(command, argument)| (command, argument.trim()))
@@ -1423,6 +1525,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/detach" | "/remove-attachment" => {
             ChatInput::Command(ChatCommand::Detach(argument.to_owned()))
         }
+        "/diff" => ChatInput::Command(ChatCommand::Diff),
         "/followup" | "/follow-up" | "/later" => ChatInput::FollowUp(argument.to_owned()),
         "/help" | "/?" => ChatInput::Command(ChatCommand::Help),
         "/history" => ChatInput::Command(ChatCommand::History),
@@ -1472,6 +1575,28 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
 fn one_line(value: &str) -> String {
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&value, 72)
+}
+
+fn bounded_middle(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let head_budget = max_bytes / 2;
+    let tail_budget = max_bytes.saturating_sub(head_budget);
+    let mut head = head_budget.min(value.len());
+    while head > 0 && !value.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = value.len().saturating_sub(tail_budget);
+    while tail < value.len() && !value.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let omitted = tail.saturating_sub(head);
+    format!(
+        "{}\n\n… {omitted} diff bytes omitted from the middle …\n\n{}",
+        &value[..head],
+        &value[tail..]
+    )
 }
 
 fn image_count_label(count: usize) -> String {
@@ -1603,6 +1728,21 @@ mod tests {
             parse_input("/model gpt-fast"),
             ChatInput::Command(ChatCommand::Model(Some("gpt-fast".into())))
         );
+        assert_eq!(parse_input("/diff"), ChatInput::Command(ChatCommand::Diff));
+        assert_eq!(
+            parse_input("! cargo test"),
+            ChatInput::Shell {
+                command: "cargo test".into(),
+                include_in_context: true,
+            }
+        );
+        assert_eq!(
+            parse_input("!! printenv"),
+            ChatInput::Shell {
+                command: "printenv".into(),
+                include_in_context: false,
+            }
+        );
         assert_eq!(
             parse_input("/review src \"error paths\""),
             ChatInput::Command(ChatCommand::Unknown {
@@ -1657,6 +1797,16 @@ mod tests {
             parse_input("fix the parser"),
             ChatInput::Task("fix the parser".into())
         );
+    }
+
+    #[test]
+    fn bounded_middle_preserves_utf8_edges() {
+        let value = format!("{}{}", "你".repeat(100), "好".repeat(100));
+        let bounded = bounded_middle(&value, 64);
+        assert!(bounded.starts_with('你'));
+        assert!(bounded.ends_with('好'));
+        assert!(bounded.contains("diff bytes omitted"));
+        assert!(bounded.len() < value.len());
     }
 
     #[cfg(unix)]

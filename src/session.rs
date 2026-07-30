@@ -777,6 +777,7 @@ fn write_entries(file: File, entries: &[SessionEntry]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::context::ImageAttachment;
+    use crate::executor::ExecutionResult;
 
     #[test]
     fn persists_lists_renames_and_resumes_a_conversation() {
@@ -836,6 +837,34 @@ mod tests {
             .unwrap();
         assert_eq!(forked, conversation);
         assert_eq!(forked.messages()[0].images[0].data, "YWJj");
+    }
+
+    #[test]
+    fn included_user_shell_output_round_trips_through_session_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = ChatSession::create(&state, &workspace, "openai", "gpt-test").unwrap();
+        let mut conversation = Conversation::default();
+        conversation.record_user_shell(
+            "cargo test",
+            &ExecutionResult {
+                exit_code: Some(0),
+                stdout: "all tests passed\n".into(),
+                stderr: String::new(),
+                duration_ms: 42,
+                timed_out: false,
+                truncated_bytes: 0,
+            },
+        );
+        session.save(&conversation).unwrap();
+
+        let (_, resumed) =
+            ChatSession::resume(&state, &workspace, Some(&session.summary().id[..8])).unwrap();
+        assert_eq!(resumed.message_count(), 1);
+        assert!(resumed.messages()[0].content.contains("cargo test"));
+        assert!(resumed.messages()[0].content.contains("all tests passed"));
     }
 
     #[test]

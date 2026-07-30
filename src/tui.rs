@@ -159,11 +159,23 @@ pub(crate) fn run(
                 let outcome = state.handle_key(key);
                 redraw = outcome.changed;
                 if let Some(input) = outcome.input {
-                    if let ChatInput::Task(text) | ChatInput::FollowUp(text) = &input {
-                        save_history_entry(&history_path, text);
-                        state.history.push(text.clone());
-                        state.history_index = None;
-                        state.append_user(text);
+                    match &input {
+                        ChatInput::Task(text) | ChatInput::FollowUp(text) => {
+                            save_history_entry(&history_path, text);
+                            state.history.push(text.clone());
+                            state.history_index = None;
+                            state.append_user(text);
+                        }
+                        ChatInput::Shell {
+                            command,
+                            include_in_context: true,
+                        } => {
+                            let entry = format!("!{command}");
+                            save_history_entry(&history_path, &entry);
+                            state.history.push(entry);
+                            state.history_index = None;
+                        }
+                        _ => {}
                     }
                     let done = matches!(input, ChatInput::Exit);
                     if inputs.send(Ok(input)).is_err() || done {
@@ -377,6 +389,10 @@ impl TuiState {
         self.scroll = 0;
     }
 
+    fn is_shell_mode(&self) -> bool {
+        self.composer.text.trim_start().starts_with('!')
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> KeyOutcome {
         let modifiers = key.modifiers;
         if modifiers.contains(KeyModifiers::CONTROL) {
@@ -432,10 +448,13 @@ impl TuiState {
                         KeyOutcome::input(ChatInput::Task(prompt))
                     };
                 }
-                if modifiers.contains(KeyModifiers::ALT) {
+                let parsed = parse_input(text.trim());
+                if matches!(parsed, ChatInput::Shell { .. }) {
+                    KeyOutcome::input(parsed)
+                } else if modifiers.contains(KeyModifiers::ALT) {
                     KeyOutcome::input(ChatInput::FollowUp(text))
                 } else {
-                    KeyOutcome::input(parse_input(text.trim()))
+                    KeyOutcome::input(parsed)
                 }
             }
             KeyCode::Char(character) => {
@@ -540,7 +559,10 @@ impl TuiState {
     }
 
     fn active_command_completions(&self) -> Vec<&CommandCompletion> {
-        if self.active_file_query().is_some() || self.active_model_query().is_some() {
+        if self.is_shell_mode()
+            || self.active_file_query().is_some()
+            || self.active_model_query().is_some()
+        {
             return Vec::new();
         }
         let value = self.composer.text.trim_start();
@@ -555,6 +577,9 @@ impl TuiState {
     }
 
     fn active_model_query(&self) -> Option<String> {
+        if self.is_shell_mode() {
+            return None;
+        }
         let value = self.composer.text.trim_start();
         let query = value.strip_prefix("/model")?;
         if query.is_empty() || !query.starts_with(char::is_whitespace) || query.contains('\n') {
@@ -586,6 +611,9 @@ impl TuiState {
     }
 
     fn active_file_query(&self) -> Option<(usize, usize, String)> {
+        if self.is_shell_mode() {
+            return None;
+        }
         let cursor_byte = char_to_byte(&self.composer.text, self.composer.cursor);
         let before = &self.composer.text[..cursor_byte];
 
@@ -1144,8 +1172,14 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
                 format!("  {label}"),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
-            for line in wrap_plain(&entry.text, width) {
-                lines.push(Line::from(format!("  {line}")));
+            for raw in entry.text.lines() {
+                let style = match &entry.kind {
+                    TranscriptKind::Custom { label, .. } if label == "DIFF" => diff_line_style(raw),
+                    _ => Style::default(),
+                };
+                for line in wrap_plain(raw, width) {
+                    lines.push(Line::from(Span::styled(format!("  {line}"), style)));
+                }
             }
         }
     }
@@ -1162,17 +1196,52 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
     );
 }
 
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+    {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with("@@") {
+        Style::default().fg(Color::Magenta)
+    } else if line.starts_with("+++") || line.starts_with("---") {
+        Style::default().fg(Color::Cyan)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("Binary files ") {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    }
+}
+
 fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     let running = state.status.is_some();
     let overridden = state.composer_title.is_some();
+    let shell_mode = !overridden && state.is_shell_mode();
     let color = if overridden {
         Color::Magenta
+    } else if shell_mode {
+        Color::Green
     } else if running {
         Color::Yellow
     } else {
         Color::Cyan
     };
-    let title = state.composer_title.as_deref().unwrap_or(if running {
+    let title = state.composer_title.as_deref().unwrap_or(if shell_mode {
+        if state.composer.text.trim_start().starts_with("!!") {
+            " Shell · excluded from context "
+        } else {
+            " Shell · included in context "
+        }
+    } else if running {
         " Steer active task "
     } else {
         " Message "
@@ -1239,6 +1308,18 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
             hint("cancel task"),
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    } else if state.is_shell_mode() {
+        let spans = vec![
+            key(" Enter "),
+            hint("run"),
+            separator(),
+            key(" !! "),
+            hint("exclude from context"),
+            separator(),
+            key(" Esc "),
+            hint("clear"),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     } else if let Some(status) = &state.status {
         let spans = vec![
             Span::raw(" "),
@@ -1294,6 +1375,9 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
                 separator(),
                 key(" @ "),
                 hint("files"),
+                separator(),
+                key(" ! "),
+                hint("shell"),
             ]);
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1463,6 +1547,14 @@ mod tests {
     }
 
     #[test]
+    fn diff_lines_use_semantic_colors() {
+        assert_eq!(diff_line_style("+added").fg, Some(Color::Green));
+        assert_eq!(diff_line_style("-removed").fg, Some(Color::Red));
+        assert_eq!(diff_line_style("@@ -1 +1 @@").fg, Some(Color::Magenta));
+        assert_eq!(diff_line_style(" context").fg, None);
+    }
+
+    #[test]
     fn slash_palette_filters_navigates_and_completes() {
         let completions = vec![
             CommandCompletion {
@@ -1537,6 +1629,44 @@ mod tests {
             Some(ChatInput::Command(crate::chat::ChatCommand::Model(Some(
                 "gpt-5.4-mini".into()
             ))))
+        );
+    }
+
+    #[test]
+    fn shell_mode_is_visually_distinct_and_skips_prompt_completions() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(
+            Vec::new(),
+            vec![CommandCompletion {
+                command: "/help".into(),
+                description: "Show help".into(),
+            }],
+        );
+        state.files = vec!["src/main.rs".into()];
+        state.composer.insert("!! echo @src/main.rs");
+
+        assert!(state.is_shell_mode());
+        assert!(state.active_command_completions().is_empty());
+        assert!(state.active_file_completions().is_empty());
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Shell · excluded from context"));
+        assert!(rendered.contains("exclude from context"));
+
+        let submitted = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            submitted.input,
+            Some(ChatInput::Shell {
+                command: "echo @src/main.rs".into(),
+                include_in_context: false,
+            })
         );
     }
 
@@ -1679,6 +1809,7 @@ mod tests {
         assert!(rendered.contains("later"));
         assert!(rendered.contains("commands"));
         assert!(rendered.contains("files"));
+        assert!(rendered.contains("shell"));
     }
 
     #[test]

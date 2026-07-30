@@ -22,6 +22,7 @@ use crate::config::{
 use crate::context::ImageAttachment;
 use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
+use crate::executor::Executor;
 use crate::hooks::{HookEvent, HookInput, HookOutcome, HookRunner, append_context};
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
@@ -650,6 +651,9 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::Detach(selector)) => {
                 detach_pending(&mut pending_attachments, &selector, &view)?;
             }
+            ChatInput::Command(ChatCommand::Diff) => {
+                show_workspace_diff(&workspace, &view).await?;
+            }
             ChatInput::Command(ChatCommand::Checkpoint(label)) => {
                 let checkpoint = session.checkpoint(label.as_deref(), &conversation, false)?;
                 view.notice(format!(
@@ -965,6 +969,21 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
             ChatInput::Command(ChatCommand::Skill { .. }) => {
                 unreachable!("skill commands are expanded before dispatch")
+            }
+            ChatInput::Shell {
+                command,
+                include_in_context,
+            } => {
+                run_user_shell(
+                    &command,
+                    include_in_context,
+                    &config,
+                    &workspace,
+                    &mut conversation,
+                    &mut session,
+                    &view,
+                )
+                .await?;
             }
             ChatInput::FollowUp(task) | ChatInput::Task(task) => {
                 let task_title = task.clone();
@@ -1311,6 +1330,50 @@ fn prepare_chat_message(
     )?))
 }
 
+async fn show_workspace_diff(workspace: &Path, view: &ChatView) -> Result<()> {
+    match crate::git::collect_diff(workspace).await {
+        Ok(None) => view.warning("This workspace is not inside a Git repository."),
+        Ok(Some(diff)) if diff.is_empty() => view.notice("Working tree is clean."),
+        Ok(Some(diff)) => view.show_diff(&diff),
+        Err(error) => view.warning(format!("Could not compute working tree diff: {error}")),
+    }
+}
+
+async fn run_user_shell(
+    command: &str,
+    include_in_context: bool,
+    config: &Config,
+    workspace: &Path,
+    conversation: &mut Conversation,
+    session: &mut ChatSession,
+    view: &ChatView,
+) -> Result<()> {
+    if command.trim().is_empty() {
+        return view.warning("Usage: !<command> or !!<command>");
+    }
+    let executor = Executor::new(
+        workspace.to_path_buf(),
+        config.command_timeout(),
+        config.agent.command_output_bytes,
+        config.agent.deny_dangerous_commands,
+        Some(config.model.api_key_env.clone()),
+    );
+    view.shell_started(command);
+    let result = match executor.shell(command).await {
+        Ok(result) => result,
+        Err(error) => {
+            view.shell_failed(error.to_string())?;
+            return Ok(());
+        }
+    };
+    view.show_shell_result(command, &result, include_in_context)?;
+    if include_in_context {
+        conversation.record_user_shell(command, &result);
+        session.save(conversation)?;
+    }
+    Ok(())
+}
+
 async fn stop_background_process(
     processes: &BackgroundProcessManager,
     process_id: Option<u64>,
@@ -1492,6 +1555,14 @@ async fn run_active_chat_task(
                         detach_pending(pending_attachments, selector, view)?;
                         continue;
                     }
+                    ChatInput::Command(ChatCommand::Diff) => {
+                        let workspace = workspace.to_path_buf();
+                        let view = view.clone();
+                        tokio::spawn(async move {
+                            let _ = show_workspace_diff(&workspace, &view).await;
+                        });
+                        continue;
+                    }
                     ChatInput::Command(ChatCommand::Processes) => {
                         view.show_processes(&processes.summaries())?;
                         continue;
@@ -1658,6 +1729,11 @@ async fn run_active_chat_task(
                     }
                 }
                 match input {
+                    ChatInput::Shell { .. } => {
+                        view.warning(
+                            "Run direct shell commands after the active task finishes; use /cancel first if needed.",
+                        )?;
+                    }
                     ChatInput::Task(text) if text.trim().is_empty() => {
                         view.warning("Steering message cannot be empty.")?;
                     }
@@ -1751,7 +1827,8 @@ async fn run_active_chat_task(
                     }
                     ChatInput::Command(ChatCommand::Attach(_))
                     | ChatInput::Command(ChatCommand::Attachments)
-                    | ChatInput::Command(ChatCommand::Detach(_)) => {
+                    | ChatInput::Command(ChatCommand::Detach(_))
+                    | ChatInput::Command(ChatCommand::Diff) => {
                         unreachable!("attachment commands are handled before interaction dispatch")
                     }
                     ChatInput::Command(ChatCommand::Help) => view.show_help()?,

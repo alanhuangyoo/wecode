@@ -121,6 +121,9 @@ Agent 工作时仍可继续编辑。
 /attach      给下一条消息附加文本文件或图片
 /attachments 查看下一条消息的待发送附件
 /detach      删除最后一个、指定或全部附件
+/diff        查看 staged、unstaged 和 untracked 改动
+!命令        直接执行 Shell，并把结果加入模型上下文
+!!命令       直接执行 Shell，但不写入上下文或会话历史
 /plan        查看当前任务计划
 /processes   查看受管理的后台进程
 /stop-process <id>
@@ -163,6 +166,15 @@ Agent 工作时仍可继续编辑。
 使用 `/model` 可以查看当前 Provider、模型和 Wire Protocol；`/model <id>` 会保留对话
 上下文，并为当前交互会话切换模型。WeCode 会在下一个任务前重建模型客户端，响应缓存也会
 自动进入新模型的命名空间。任务运行中不允许切换，避免同一轮 Agent 请求混用模型。
+
+使用 `/diff` 可以立即检查工作区改动，不消耗模型调用。它按相对 `HEAD` 的最终状态展示
+staged、unstaged 和 untracked 文件。Diff 收集为每条 Git 命令设置 30 秒超时，并禁用
+仓库可控制的 Hooks、fsmonitor、textconv、外部 Diff 和 clean/process Filter。
+
+输入以 `!` 开头时，会直接在工作区执行 Shell；输入框会变为绿色，带大小上限的结果会进入
+下一轮模型上下文。使用 `!!` 可执行临时命令：结果只在本地显示，不进入模型上下文、会话
+文件或输入历史。两种模式都会移除 Provider 凭据、执行命令超时与输出上限，并继续应用
+危险命令拦截策略。
 
 使用 `/attach 路径` 可以附加 UTF-8 源码/文本文件；在全屏界面里直接粘贴 PNG、JPEG、GIF
 或 WebP 图片路径也会自动加入附件。附件面板会一直显示到下一条消息发送为止；

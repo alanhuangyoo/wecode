@@ -131,6 +131,9 @@ composer remains editable while the agent works.
 /attach      Attach a text file or image to the next message
 /attachments Show files attached to the next message
 /detach      Remove the last, selected, or all attachments
+/diff        Show staged, unstaged, and untracked changes
+!command     Run a shell command and include its result in model context
+!!command    Run a shell command without saving it to context or session history
 /plan        Show the current task plan
 /processes   Show managed background processes
 /stop-process <id>
@@ -176,6 +179,17 @@ model for the current interactive session while preserving conversation context.
 the model client before the next task, and the response cache automatically uses the new model
 namespace. Model switching is unavailable while a task is active so one agent turn never mixes
 models.
+
+Use `/diff` for an immediate working-tree review without spending a model call. It shows the final
+state against `HEAD`, including staged, unstaged, and untracked files. Diff collection has a
+30-second per-command timeout and disables repository-controlled hooks, fsmonitor, textconv,
+external diff commands, and clean/process filters.
+
+Prefix input with `!` to run a shell command directly in the workspace. The composer turns green
+and the result is stored as bounded context for the next model turn. Use `!!` when the command or
+output should remain ephemeral: it is displayed locally but excluded from model context, session
+storage, and input history. Both forms scrub configured provider credentials, enforce the command
+timeout and output cap, and retain the dangerous-command safety policy.
 
 Attach a UTF-8 source or text file with `/attach path`, or paste a PNG, JPEG, GIF, or WebP path
 directly into the full-screen composer. A compact attachment panel stays visible until the next
