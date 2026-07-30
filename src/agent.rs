@@ -19,24 +19,20 @@ use crate::events::{Event, EventSink, JsonlSink};
 use crate::executor::{ExecutionResult, Executor};
 use crate::file_tools::FileTools;
 use crate::git::{collect_patch, head_id};
+use crate::harness::AgentHarness;
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
 use crate::interaction::{PlanState, UserAnswer, UserInputClient, UserInputResponse};
 use crate::lsp::LspManager;
 use crate::mcp::McpManager;
 use crate::model::{
-    CompletionRequest, Model, ModelStream, ModelStreamEvent, ToolProfile, Usage, action_batch_text,
-    tool_definitions,
+    Model, ModelStream, ModelStreamEvent, ToolProfile, Usage, action_batch_text, tool_definitions,
 };
+use crate::prompt_context::{PromptContext, PromptContextOptions};
 use crate::protocol::{Action, PlanStatus, parse_action};
 use crate::skills::SkillCatalog;
 use crate::subagent::SubagentManager;
 use crate::tool_registry::{INTERACTIVE_CORE_TOOLS, ToolRegistry};
-
-const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
-const INTERACTIVE_PROMPT: &str = include_str!("../prompts/interactive.md");
-const READ_ONLY_SUBAGENT_PROMPT: &str = include_str!("../prompts/subagent_readonly.md");
-const REVIEW_PROMPT: &str = include_str!("../prompts/review.md");
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
@@ -74,6 +70,10 @@ pub struct RunResult {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Conversation {
     messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    active_tools: Vec<String>,
+    #[serde(skip)]
+    prompt_context: Option<PromptContext>,
 }
 
 impl Conversation {
@@ -135,12 +135,33 @@ impl Conversation {
         self.messages.push(Message::user(context));
     }
 
+    #[cfg(test)]
     pub(crate) fn from_messages(messages: Vec<Message>) -> Self {
-        Self { messages }
+        Self {
+            messages,
+            active_tools: Vec::new(),
+            prompt_context: None,
+        }
+    }
+
+    pub(crate) fn from_state(messages: Vec<Message>, active_tools: Vec<String>) -> Self {
+        Self {
+            messages,
+            active_tools,
+            prompt_context: None,
+        }
     }
 
     pub(crate) fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub fn active_tools(&self) -> &[String] {
+        &self.active_tools
+    }
+
+    pub fn prompt_context(&self) -> Option<&PromptContext> {
+        self.prompt_context.as_ref()
     }
 }
 
@@ -278,6 +299,18 @@ impl Agent {
             self.config.agent.context_max_tokens,
             self.config.agent.context_keep_messages,
         );
+        let instruction_set = instructions::discover(&self.workspace)?;
+        let skills_prompt = self.skills.as_ref().map(SkillCatalog::system_prompt);
+        let prompt_context = PromptContext::build(PromptContextOptions {
+            profile: self.tool_profile,
+            model: &self.config.model,
+            workspace: &self.workspace,
+            instructions: (self.tool_profile == ToolProfile::Interactive)
+                .then_some(&instruction_set),
+            skills_prompt: skills_prompt.as_deref(),
+            additional_prompt: options.additional_system_prompt.as_deref(),
+        })?;
+        let harness = AgentHarness::new(&session_id, prompt_context);
         let mut messages = match conversation.as_deref() {
             Some(conversation) if !conversation.messages.is_empty() => {
                 let mut messages = conversation.messages.clone();
@@ -288,7 +321,13 @@ impl Agent {
                 messages
             }
             _ => vec![Message::user_with_images(
-                initial_prompt(task, &self.workspace, options.verify.as_deref())?,
+                initial_prompt(
+                    task,
+                    &self.workspace,
+                    options.verify.as_deref(),
+                    self.tool_profile,
+                    &instruction_set,
+                ),
                 options.images.clone(),
             )],
         };
@@ -301,13 +340,21 @@ impl Agent {
         let mut success = false;
         let mut steps = 0;
         let mut pending_tool_results = None;
+        let restored_active_tools = conversation
+            .as_deref()
+            .map(|conversation| conversation.active_tools.clone())
+            .unwrap_or_default();
         let mut enabled_tools = (self.tool_profile == ToolProfile::Interactive
             && self.config.model.native_tools)
             .then(|| {
-                INTERACTIVE_CORE_TOOLS
-                    .iter()
-                    .map(|name| (*name).to_owned())
-                    .collect::<Vec<_>>()
+                if restored_active_tools.is_empty() {
+                    INTERACTIVE_CORE_TOOLS
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect::<Vec<_>>()
+                } else {
+                    restored_active_tools
+                }
             });
         let cancellation = options.cancellation.clone();
         let input_queue = options.input_queue.clone();
@@ -315,16 +362,6 @@ impl Agent {
         let processes = options.processes.clone();
         let lsp = options.lsp.clone();
         let subagents = options.subagents.clone();
-        let mut system_prompt = system_prompt(self.tool_profile, &self.config.model);
-        if let Some(additional) = options
-            .additional_system_prompt
-            .as_deref()
-            .filter(|prompt| !prompt.trim().is_empty())
-        {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(additional);
-        }
-
         for step in 1..=self.config.agent.max_steps {
             bind_pending_tool_results(&mut messages, &mut pending_tool_results);
             if cancellation
@@ -359,12 +396,9 @@ impl Agent {
                 sink: self.sink.as_ref(),
                 step,
             });
-            let request = CompletionRequest {
-                system: system_prompt.clone(),
-                messages: messages.clone(),
-                session_id: session_id.clone(),
-                enabled_tools: enabled_tools.clone(),
-            };
+            let request = harness
+                .create_turn_state(&messages, enabled_tools.as_deref())
+                .completion_request();
             let completion = self.model.complete(
                 request,
                 stream.as_ref().map(|stream| stream as &dyn ModelStream),
@@ -1319,6 +1353,8 @@ impl Agent {
         };
         if let Some(conversation) = conversation {
             conversation.messages = messages;
+            conversation.active_tools = enabled_tools.unwrap_or_default();
+            conversation.prompt_context = Some(harness.prompt_context().clone());
         }
         if let Some(path) = &options.result_out {
             if let Some(parent) = path.parent()
@@ -1828,7 +1864,22 @@ impl ModelStream for EventModelStream<'_> {
     }
 }
 
-fn initial_prompt(task: &str, workspace: &std::path::Path, verify: Option<&str>) -> Result<String> {
+fn initial_prompt(
+    task: &str,
+    workspace: &std::path::Path,
+    verify: Option<&str>,
+    profile: ToolProfile,
+    instruction_set: &instructions::InstructionSet,
+) -> String {
+    if profile == ToolProfile::Interactive {
+        let mut prompt = format!("<user_request>\n{task}\n</user_request>\n");
+        if let Some(verify) = verify {
+            prompt.push_str("\nThe controller requires this final verification command to pass:\n");
+            prompt.push_str(verify);
+            prompt.push('\n');
+        }
+        return prompt;
+    }
     let mut prompt = format!(
         "Task:\n{task}\n\nWorkspace: {}\nPlatform: {} / {}\n",
         workspace.display(),
@@ -1840,26 +1891,7 @@ fn initial_prompt(task: &str, workspace: &std::path::Path, verify: Option<&str>)
         prompt.push_str(verify);
         prompt.push('\n');
     }
-    prompt.push_str(&instructions::discover(workspace)?.render());
-    Ok(prompt)
-}
-
-fn system_prompt(profile: ToolProfile, model: &crate::config::ModelConfig) -> String {
-    match profile {
-        ToolProfile::Coding => return SYSTEM_PROMPT.to_owned(),
-        ToolProfile::ReadOnlySubagent => return READ_ONLY_SUBAGENT_PROMPT.to_owned(),
-        ToolProfile::Review => return REVIEW_PROMPT.to_owned(),
-        ToolProfile::Interactive => {}
-    }
-    let mut prompt = format!(
-        "{INTERACTIVE_PROMPT}\n\nRuntime:\n- Provider: {}\n- Model: {}\n- Native tools: {}\n",
-        model.provider, model.model, model.native_tools
-    );
-    if !model.native_tools {
-        prompt.push_str(
-            "\nThis provider does not support native function calls. For a tool step, return exactly one JSON action using read_file, list_files, grep, shell, patch, request_user_input, or search_tools. Return ordinary text when the task is complete.\n",
-        );
-    }
+    prompt.push_str(&instruction_set.render());
     prompt
 }
 

@@ -40,6 +40,7 @@ pub struct SessionCheckpoint {
 pub struct ChatSession {
     summary: SessionSummary,
     persisted_messages: Vec<Message>,
+    persisted_active_tools: Vec<String>,
     checkpoints: Vec<SessionCheckpoint>,
     workspace: PathBuf,
 }
@@ -63,6 +64,11 @@ enum SessionEntry {
         timestamp_ms: u64,
         messages: Vec<Message>,
     },
+    Compaction {
+        timestamp_ms: u64,
+        source_message_count: usize,
+        messages: Vec<Message>,
+    },
     Rename {
         timestamp_ms: u64,
         title: String,
@@ -71,6 +77,10 @@ enum SessionEntry {
         timestamp_ms: u64,
         provider: String,
         model: String,
+    },
+    ActiveTools {
+        timestamp_ms: u64,
+        tools: Vec<String>,
     },
     Checkpoint {
         timestamp_ms: u64,
@@ -91,6 +101,7 @@ struct LoadedSession {
     summary: SessionSummary,
     workspace: PathBuf,
     messages: Vec<Message>,
+    active_tools: Vec<String>,
     checkpoints: Vec<SessionCheckpoint>,
 }
 
@@ -130,6 +141,7 @@ impl ChatSession {
                 checkpoint_count: 0,
             },
             persisted_messages: Vec::new(),
+            persisted_active_tools: Vec::new(),
             checkpoints: Vec::new(),
             workspace: workspace.to_path_buf(),
         })
@@ -143,11 +155,13 @@ impl ChatSession {
         let sessions = load_sessions(state_directory, workspace)?;
         let loaded = select_session(sessions, selector)?;
         let persisted_messages = loaded.messages.clone();
-        let conversation = Conversation::from_messages(loaded.messages);
+        let persisted_active_tools = loaded.active_tools.clone();
+        let conversation = Conversation::from_state(loaded.messages, loaded.active_tools);
         Ok((
             Self {
                 summary: loaded.summary,
                 persisted_messages,
+                persisted_active_tools,
                 checkpoints: loaded.checkpoints,
                 workspace: loaded.workspace,
             },
@@ -164,7 +178,7 @@ impl ChatSession {
 
     pub fn save(&mut self, conversation: &Conversation) -> Result<()> {
         let messages = conversation.messages();
-        let entries = if messages.starts_with(&self.persisted_messages) {
+        let mut entries = if messages.starts_with(&self.persisted_messages) {
             messages[self.persisted_messages.len()..]
                 .iter()
                 .cloned()
@@ -174,11 +188,18 @@ impl ChatSession {
                 })
                 .collect::<Vec<_>>()
         } else {
-            vec![SessionEntry::Snapshot {
+            vec![SessionEntry::Compaction {
                 timestamp_ms: timestamp_ms(),
+                source_message_count: self.persisted_messages.len(),
                 messages: messages.to_vec(),
             }]
         };
+        if conversation.active_tools() != self.persisted_active_tools {
+            entries.push(SessionEntry::ActiveTools {
+                timestamp_ms: timestamp_ms(),
+                tools: conversation.active_tools().to_vec(),
+            });
+        }
         if entries.is_empty() {
             return Ok(());
         }
@@ -188,6 +209,7 @@ impl ChatSession {
             .with_context(|| format!("failed to append session {}", self.summary.path.display()))?;
         write_entries(file, &entries)?;
         self.persisted_messages = messages.to_vec();
+        self.persisted_active_tools = conversation.active_tools().to_vec();
         self.summary.message_count = self.persisted_messages.len();
         self.summary.updated_at_ms = timestamp_ms();
         Ok(())
@@ -299,10 +321,16 @@ impl ChatSession {
             .transpose()?;
         match checkpoint {
             Some(checkpoint) => {
-                let messages = load_checkpoint_messages(&self.summary.path, &checkpoint.id)?;
-                self.fork_at(state_directory, &messages, Some(&checkpoint))
+                let (messages, active_tools) =
+                    load_checkpoint_state(&self.summary.path, &checkpoint.id)?;
+                self.fork_at(state_directory, &messages, &active_tools, Some(&checkpoint))
             }
-            None => self.fork_at(state_directory, conversation.messages(), None),
+            None => self.fork_at(
+                state_directory,
+                conversation.messages(),
+                conversation.active_tools(),
+                None,
+            ),
         }
     }
 
@@ -322,8 +350,8 @@ impl ChatSession {
                 .cloned()
                 .context("no earlier checkpoint exists in this session")?,
         };
-        let messages = load_checkpoint_messages(&self.summary.path, &checkpoint.id)?;
-        self.fork_at(state_directory, &messages, Some(&checkpoint))
+        let (messages, active_tools) = load_checkpoint_state(&self.summary.path, &checkpoint.id)?;
+        self.fork_at(state_directory, &messages, &active_tools, Some(&checkpoint))
     }
 
     pub fn set_initial_title(&mut self, task: &str) -> Result<()> {
@@ -341,9 +369,11 @@ impl ChatSession {
         &self,
         state_directory: &Path,
         messages: &[Message],
+        active_tools: &[String],
         checkpoint: Option<&SessionCheckpoint>,
     ) -> Result<(Self, Conversation)> {
-        let forked_conversation = Conversation::from_messages(messages.to_vec());
+        let forked_conversation =
+            Conversation::from_state(messages.to_vec(), active_tools.to_vec());
         let mut forked = Self::create(
             state_directory,
             &self.workspace,
@@ -378,7 +408,10 @@ impl ChatSession {
         {
             forked.checkpoint(
                 Some(&source.label),
-                &Conversation::from_messages(messages[..source.message_count].to_vec()),
+                &Conversation::from_state(
+                    messages[..source.message_count].to_vec(),
+                    active_tools.to_vec(),
+                ),
                 source.automatic,
             )?;
         }
@@ -440,6 +473,7 @@ fn load_session(path: &Path) -> Result<LoadedSession> {
     }
     let mut title = None;
     let mut messages = Vec::new();
+    let mut active_tools = Vec::new();
     let mut checkpoints: Vec<SessionCheckpoint> = Vec::new();
     let mut parent_session_id = None;
     let mut fork_source_message_count = None;
@@ -468,6 +502,22 @@ fn load_session(path: &Path) -> Result<LoadedSession> {
                 fork_source_restored |=
                     fork_source_message_count.is_some_and(|count| count <= messages.len());
             }
+            SessionEntry::Compaction {
+                timestamp_ms,
+                source_message_count,
+                messages: next_messages,
+            } => {
+                if source_message_count != messages.len() {
+                    bail!(
+                        "compaction expected {source_message_count} source messages, but {} were projected",
+                        messages.len()
+                    );
+                }
+                updated_at_ms = updated_at_ms.max(timestamp_ms);
+                messages = next_messages;
+                fork_source_restored |=
+                    fork_source_message_count.is_some_and(|count| count <= messages.len());
+            }
             SessionEntry::Rename {
                 timestamp_ms,
                 title: next_title,
@@ -483,6 +533,13 @@ fn load_session(path: &Path) -> Result<LoadedSession> {
                 updated_at_ms = updated_at_ms.max(timestamp_ms);
                 provider = next_provider;
                 model = next_model;
+            }
+            SessionEntry::ActiveTools {
+                timestamp_ms,
+                tools,
+            } => {
+                updated_at_ms = updated_at_ms.max(timestamp_ms);
+                active_tools = tools;
             }
             SessionEntry::Checkpoint {
                 timestamp_ms,
@@ -544,11 +601,12 @@ fn load_session(path: &Path) -> Result<LoadedSession> {
         },
         workspace,
         messages,
+        active_tools,
         checkpoints,
     })
 }
 
-fn load_checkpoint_messages(path: &Path, checkpoint_id: &str) -> Result<Vec<Message>> {
+fn load_checkpoint_state(path: &Path, checkpoint_id: &str) -> Result<(Vec<Message>, Vec<String>)> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("failed to inspect session {}", path.display()))?;
     if metadata.len() > MAX_SESSION_BYTES {
@@ -572,6 +630,7 @@ fn load_checkpoint_messages(path: &Path, checkpoint_id: &str) -> Result<Vec<Mess
     }
 
     let mut messages = Vec::new();
+    let mut active_tools = Vec::new();
     for (index, line) in lines.enumerate() {
         let line = line.with_context(|| format!("failed to read session line {}", index + 2))?;
         match serde_json::from_str::<SessionEntry>(&line)
@@ -582,13 +641,27 @@ fn load_checkpoint_messages(path: &Path, checkpoint_id: &str) -> Result<Vec<Mess
                 messages: next_messages,
                 ..
             } => messages = next_messages,
+            SessionEntry::Compaction {
+                source_message_count,
+                messages: next_messages,
+                ..
+            } => {
+                if source_message_count != messages.len() {
+                    bail!(
+                        "compaction expected {source_message_count} source messages, but {} were projected",
+                        messages.len()
+                    );
+                }
+                messages = next_messages;
+            }
+            SessionEntry::ActiveTools { tools, .. } => active_tools = tools,
             SessionEntry::Checkpoint {
                 id, message_count, ..
             } if id == checkpoint_id => {
                 if message_count > messages.len() {
                     bail!("checkpoint {id:?} points past the restored conversation");
                 }
-                return Ok(messages[..message_count].to_vec());
+                return Ok((messages[..message_count].to_vec(), active_tools));
             }
             _ => {}
         }
@@ -809,6 +882,34 @@ mod tests {
     }
 
     #[test]
+    fn active_tool_changes_round_trip_and_follow_checkpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = ChatSession::create(&state, &workspace, "openai", "gpt-test").unwrap();
+        let conversation = Conversation::from_state(
+            vec![Message::user("inspect diagnostics")],
+            vec!["read_file".into(), "search_tools".into(), "lsp".into()],
+        );
+        session.save(&conversation).unwrap();
+        let checkpoint = session
+            .checkpoint(Some("lsp loaded"), &conversation, false)
+            .unwrap();
+
+        let (_, resumed) =
+            ChatSession::resume(&state, &workspace, Some(&session.summary().id[..8])).unwrap();
+        assert_eq!(resumed.active_tools(), conversation.active_tools());
+
+        let (_, forked) = session
+            .fork(&state, &conversation, Some(&checkpoint.id))
+            .unwrap();
+        assert_eq!(forked.active_tools(), conversation.active_tools());
+        let raw = std::fs::read_to_string(&session.summary().path).unwrap();
+        assert!(raw.contains(r#""type":"active_tools""#));
+    }
+
+    #[test]
     fn image_messages_round_trip_through_resume_checkpoint_and_fork() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
@@ -950,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_preserve_checkpoints_when_compaction_replaces_messages() {
+    fn compaction_entries_preserve_raw_history_and_checkpoint_projection() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         let workspace = temp.path().join("repo");
@@ -978,7 +1079,9 @@ mod tests {
             .unwrap();
 
         let raw = std::fs::read_to_string(&session.summary().path).unwrap();
-        assert!(raw.contains(r#""type":"snapshot""#));
+        assert!(raw.contains(r#""type":"compaction""#));
+        assert!(raw.contains(r#""source_message_count":4"#));
+        assert!(raw.contains("old parser contents"));
         let (resumed, resumed_conversation) =
             ChatSession::resume(&state, &workspace, Some(&session.summary().id[..8])).unwrap();
         assert_eq!(resumed_conversation, compacted);

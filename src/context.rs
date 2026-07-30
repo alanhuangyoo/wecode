@@ -235,7 +235,7 @@ pub fn estimate_text_tokens(value: &str) -> u64 {
     xai_token_estimation::estimate_tokens(value)
 }
 
-fn context_usage(messages: &[Message]) -> ContextUsage {
+pub fn context_usage(messages: &[Message]) -> ContextUsage {
     let mut usage = ContextUsage {
         messages: messages.len(),
         ..Default::default()

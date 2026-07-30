@@ -19,7 +19,7 @@ use crate::config::{
     ApprovalPolicy, CacheMode, Config, ProviderFamily, WireApi, default_config_path,
     default_credentials_path, provider_preset,
 };
-use crate::context::{ImageAttachment, estimate_text_tokens};
+use crate::context::ImageAttachment;
 use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
 use crate::executor::Executor;
@@ -32,6 +32,7 @@ use crate::interaction::{
 use crate::lsp::LspManager;
 use crate::mcp::McpManager;
 use crate::model::{ToolProfile, Usage, create_model, create_model_with_tools, tool_definitions};
+use crate::prompt_context::{PromptContext, PromptContextOptions};
 use crate::review::{ReviewRequest, ReviewTarget, parse_review, review_prompt};
 use crate::session::ChatSession;
 use crate::setup::{SetupOptions, run as run_setup};
@@ -667,6 +668,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 show_context_usage(
                     &conversation,
                     &config,
+                    &workspace,
                     &instruction_set,
                     &mcp,
                     &skills,
@@ -1304,32 +1306,53 @@ fn create_subagent_manager(
     Ok(manager)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_context_usage(
     conversation: &Conversation,
     config: &Config,
+    workspace: &Path,
     instructions: &instructions::InstructionSet,
     mcp: &McpManager,
     skills: &SkillCatalog,
     last_usage: Option<(Usage, usize)>,
     view: &ChatView,
 ) -> Result<()> {
-    let usage = conversation.context_usage(
+    let skills_prompt = skills.system_prompt();
+    let prompt = match conversation.prompt_context() {
+        Some(prompt) => prompt.clone(),
+        None => PromptContext::build(PromptContextOptions {
+            profile: ToolProfile::Interactive,
+            model: &config.model,
+            workspace,
+            instructions: Some(instructions),
+            skills_prompt: Some(&skills_prompt),
+            additional_prompt: None,
+        })?,
+    };
+    let mut definitions = tool_definitions(ToolProfile::Interactive, &mcp.definitions());
+    let active_tools = if conversation.active_tools().is_empty() {
+        crate::tool_registry::INTERACTIVE_CORE_TOOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        conversation.active_tools().to_vec()
+    };
+    definitions.retain(|definition| {
+        definition
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| active_tools.iter().any(|active| active == name))
+    });
+    if !config.model.native_tools {
+        definitions.clear();
+    }
+    let usage = prompt.usage(
+        conversation.messages(),
+        &definitions,
         config.agent.context_max_tokens,
-        config.agent.context_keep_messages,
     );
-    let rules_tokens = estimate_text_tokens(&instructions.render());
-    let definitions = tool_definitions(ToolProfile::Interactive, &mcp.definitions());
-    let tool_tokens = serde_json::to_string(&definitions)
-        .map(|definitions| estimate_text_tokens(&definitions))
-        .unwrap_or_default()
-        .saturating_add(estimate_text_tokens(&skills.system_prompt()));
-    view.show_context(
-        usage,
-        config.agent.context_max_tokens,
-        rules_tokens,
-        tool_tokens,
-        last_usage,
-    )
+    view.show_context(usage, last_usage)
 }
 
 fn sync_context_metrics(

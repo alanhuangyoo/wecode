@@ -31,6 +31,7 @@ use crate::interaction::{PlanSnapshot, UserInputRequest};
 use crate::lsp::{LspEvent, LspServerStatus, LspServerSummary};
 use crate::mcp::{McpServerReport, McpServerState};
 use crate::model::{ToolProfile, Usage};
+use crate::prompt_context::{PromptStability, RequestContextUsage};
 use crate::protocol::PlanStatus;
 use crate::review::ParsedReview;
 use crate::session::{SessionCheckpoint, SessionSummary};
@@ -690,14 +691,11 @@ impl ChatView {
 
     pub fn show_context(
         &self,
-        usage: ContextUsage,
-        max_tokens: u64,
-        rules_tokens: u64,
-        tool_tokens: u64,
+        usage: RequestContextUsage,
         last_usage: Option<(Usage, usize)>,
     ) -> Result<()> {
-        self.sync_context_metrics(usage, max_tokens, last_usage);
-        let percent = usage.percent_of(max_tokens);
+        self.sync_request_context_metrics(&usage, last_usage);
+        let percent = usage.percent();
         let bar = context_bar(percent, 24);
         let provider = match last_usage {
             Some((usage, exact_cache_hits)) => format!(
@@ -711,25 +709,47 @@ impl ChatView {
             ),
             None => "no model request in this session yet".into(),
         };
-        let body = format!(
+        let mut body = format!(
             "{bar}  {percent}%\n\n\
-             Conversation  {} / {} estimated tokens\n\
-             Text          {} tokens in {} messages ({} user · {} assistant)\n\
-             Images        {} tokens across {} images\n\
+             Request total ~{} / {} tokens\n\
+             System prompt ~{} tokens\n\
+             System tools  ~{} tokens\n\
              Rules         ~{} tokens\n\
-             Tools         ~{} tokens\n\
-             Last request  {provider}\n\n\
-             Limits are estimates; providers tokenize images and tool schemas differently.",
+             Memory        ~{} tokens\n\
+             Skills        ~{} tokens\n\
+             Messages      ~{} tokens in {} messages ({} user · {} assistant)\n\
+             Images        ~{} tokens across {} images\n\
+             Free space    ~{} tokens\n\
+             Last request  {provider}",
             compact_number(usage.total_tokens),
-            compact_number(max_tokens),
-            compact_number(usage.text_tokens),
-            usage.messages,
-            usage.user_messages,
-            usage.assistant_messages,
-            compact_number(usage.image_tokens),
-            usage.images,
-            compact_number(rules_tokens),
-            compact_number(tool_tokens),
+            compact_number(usage.max_tokens),
+            compact_number(usage.system_prompt_tokens),
+            compact_number(usage.tool_tokens),
+            compact_number(usage.rules_tokens),
+            compact_number(usage.memory_tokens),
+            compact_number(usage.skills_tokens),
+            compact_number(usage.messages.total_tokens),
+            usage.messages.messages,
+            usage.messages.user_messages,
+            usage.messages.assistant_messages,
+            compact_number(usage.messages.image_tokens),
+            usage.messages.images,
+            compact_number(usage.free_tokens),
+        );
+        body.push_str("\n\nPrompt sections");
+        for section in &usage.sections {
+            body.push_str(&format!(
+                "\n  {:22} ~{:>6} tokens · {}",
+                section.label,
+                compact_number(section.tokens),
+                match section.stability {
+                    PromptStability::Stable => "stable",
+                    PromptStability::Volatile => "volatile",
+                }
+            ));
+        }
+        body.push_str(
+            "\n\nEstimates come from the same prompt sections, active tool schemas, and messages used to build the provider request.",
         );
         if self.output.tui_entry("CONTEXT", &body, TuiTone::Normal) {
             return Ok(());
@@ -738,6 +758,27 @@ impl ChatView {
             "\n{}\n{body}\n",
             Style::new().cyan().bold().apply_to("Context")
         ))
+    }
+
+    fn sync_request_context_metrics(
+        &self,
+        usage: &RequestContextUsage,
+        last_usage: Option<(Usage, usize)>,
+    ) {
+        let mut metrics = format!(
+            "context {}/{} · {}%",
+            compact_number(usage.total_tokens),
+            compact_number(usage.max_tokens),
+            usage.percent(),
+        );
+        if let Some((provider, exact_hits)) = last_usage {
+            metrics.push_str(&format!(
+                " · {} cached · {} exact",
+                compact_number(provider.cache_read_tokens),
+                exact_hits
+            ));
+        }
+        self.output.set_tui_metrics(Some(metrics));
     }
 
     pub fn sync_context_metrics(

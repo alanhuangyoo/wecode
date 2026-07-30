@@ -542,6 +542,17 @@ async fn interactive_plan_updates_state_and_model_context() {
 async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
     let temp = tempfile::tempdir().unwrap();
     init_fixture(temp.path());
+    std::fs::write(
+        temp.path().join("AGENTS.md"),
+        "Use repository conventions.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(temp.path().join(".wecode")).unwrap();
+    std::fs::write(
+        temp.path().join(".wecode/MEMORY.md"),
+        "The user prefers focused validation.\n",
+    )
+    .unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let model = CapturingModel {
         requests: requests.clone(),
@@ -550,6 +561,7 @@ async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
         }])),
     };
     let mut config = Config::default();
+    config.model.model = "gpt-5.4-mini".into();
     config.agent.trajectory_directory = temp.path().join("trajectories");
     config.cache.directory = temp.path().join("cache");
     let mut agent = Agent::new_with_profile(
@@ -566,6 +578,28 @@ async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
     let requests = requests.lock().unwrap();
     assert!(requests[0].system.contains("Treat greetings"));
     assert!(requests[0].system.contains("answer directly"));
+    assert!(
+        requests[0]
+            .system
+            .contains("id=\"base_instructions\" stability=\"stable\"")
+    );
+    assert!(
+        requests[0]
+            .system
+            .contains("id=\"world_state\" stability=\"volatile\"")
+    );
+    assert!(requests[0].system.contains("Provider: openai"));
+    assert!(requests[0].system.contains("Model: gpt-5.4-mini"));
+    assert!(requests[0].system.contains("Use repository conventions."));
+    assert!(
+        requests[0]
+            .system
+            .contains("The user prefers focused validation.")
+    );
+    assert_eq!(
+        requests[0].messages[0].content,
+        "<user_request>\n你好\n</user_request>\n"
+    );
     assert_eq!(
         requests[0]
             .enabled_tools
@@ -1533,7 +1567,10 @@ async fn interactive_agent_progressively_loads_a_matching_skill() {
     {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(!requests[0].system.contains("<name>reviewer</name>"));
+        assert!(requests[0].system.contains("<name>reviewer</name>"));
+        assert!(requests[0]
+            .system
+            .contains("Review Rust changes for correctness."));
         assert!(!requests[0].system.contains("# Review instructions"));
         assert!(
             requests[1]

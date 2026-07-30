@@ -26,10 +26,11 @@ runtime.
 - **Purpose-built terminal UX** — a fast full-screen conversation timeline, persistent multiline
   composer, structured tool/output cards, live provider streaming, mid-run steering, queued
   follow-ups, cancellable runs, and slash commands.
-- **Durable sessions** — conversations auto-save as inspectable JSONL, can be listed or resumed,
-  and retain one stable provider cache identity across follow-up turns.
+- **Durable sessions** — append-only JSONL records messages, active-tool changes, checkpoints, and
+  compaction projections; sessions can be listed, resumed, forked, or rewound.
 - **Repository-aware** — bounded global and hierarchical `AGENTS.md`, `CLAUDE.md`, and rules
-  directories are loaded from repository root to the active workspace.
+  directories are loaded from repository root to the active workspace, with optional global and
+  workspace Markdown memory.
 - **Semantic code intelligence** — installed language servers are detected automatically and
   started only when definitions, references, symbols, hover, call hierarchy, or diagnostics are
   needed.
@@ -185,11 +186,18 @@ the model client before the next task, and the response cache automatically uses
 namespace. Model switching is unavailable while a task is active so one agent turn never mixes
 models.
 
-The footer continuously shows estimated conversation usage and prompt-cache metrics. `/context`
-opens a breakdown of text, images, rules, tools, provider cache reads/writes, and exact local cache
-hits. `/compact [focus]` replaces eligible older turns with a bounded local summary while preserving
-the initial task and recent messages. Compaction is transactional, costs no model call, drops old
-image payloads after recording durable facts, and persists as a session snapshot.
+The footer continuously shows estimated context usage and prompt-cache metrics. `/context` derives
+its breakdown from the same request projection sent to the provider: named system-prompt sections,
+active tool schemas, rules, memory, Skills, messages, images, and free space, plus provider cache
+reads/writes and exact local cache hits. Stable and volatile prompt sections are labeled explicitly.
+`/compact [focus]` replaces eligible older turns in the model projection with a bounded local summary
+while preserving the initial task and recent messages. Compaction is transactional, costs no model
+call, drops old image payloads after recording durable facts, and appends an explicit compaction
+entry while the original JSONL message history remains inspectable.
+
+Optional persistent memory can be stored in `~/.wecode/MEMORY.md` for global preferences and
+`.wecode/MEMORY.md` at the repository root for workspace facts. Both files are bounded and injected
+as a named context section; the current user request and project rules take precedence.
 
 Use `/diff` for an immediate working-tree review without spending a model call. It shows the final
 state against `HEAD`, including staged, unstaged, and untracked files. Diff collection has a
