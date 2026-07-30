@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use console::strip_ansi_codes;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -56,8 +56,22 @@ pub(crate) enum TuiMessage {
         primary: String,
         secondary: String,
     },
+    Welcome {
+        model: String,
+        workspace: String,
+        session: String,
+        capabilities: String,
+    },
     Metrics(Option<String>),
     Status(Option<String>),
+    StreamStart,
+    StreamDelta {
+        text: String,
+        reasoning: bool,
+    },
+    StreamFinish {
+        commit: bool,
+    },
     Plan(Option<Vec<String>>),
     Composer {
         title: Option<String>,
@@ -89,8 +103,37 @@ impl TuiHandle {
         let _ = self.sender.send(TuiMessage::Header { primary, secondary });
     }
 
+    pub fn set_welcome(
+        &self,
+        model: String,
+        workspace: String,
+        session: String,
+        capabilities: String,
+    ) {
+        let _ = self.sender.send(TuiMessage::Welcome {
+            model,
+            workspace,
+            session,
+            capabilities,
+        });
+    }
+
     pub fn set_status(&self, status: Option<String>) {
         let _ = self.sender.send(TuiMessage::Status(status));
+    }
+
+    pub fn start_stream(&self) {
+        let _ = self.sender.send(TuiMessage::StreamStart);
+    }
+
+    pub fn stream_delta(&self, text: String, reasoning: bool) {
+        let _ = self
+            .sender
+            .send(TuiMessage::StreamDelta { text, reasoning });
+    }
+
+    pub fn finish_stream(&self, commit: bool) {
+        let _ = self.sender.send(TuiMessage::StreamFinish { commit });
     }
 
     pub fn set_metrics(&self, metrics: Option<String>) {
@@ -151,7 +194,11 @@ pub(crate) fn run(
             redraw = false;
         }
 
-        if !event::poll(Duration::from_millis(40))? {
+        if !event::poll(Duration::from_millis(70))? {
+            if state.status.is_some() {
+                state.tick = state.tick.wrapping_add(1);
+                redraw = true;
+            }
             continue;
         }
         match event::read()? {
@@ -194,6 +241,17 @@ pub(crate) fn run(
                     redraw = true;
                 }
             }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    state.scroll = state.scroll.saturating_add(3);
+                    redraw = true;
+                }
+                MouseEventKind::ScrollDown => {
+                    state.scroll = state.scroll.saturating_sub(3);
+                    redraw = true;
+                }
+                _ => {}
+            },
             Event::Resize(_, _) => redraw = true,
             _ => {}
         }
@@ -221,6 +279,7 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
             }
             Ok(TuiMessage::Clear) => {
                 state.transcript.clear();
+                state.live_response = None;
                 state.metrics = None;
                 state.scroll = 0;
                 state.status = None;
@@ -235,12 +294,54 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
                 state.header_secondary = secondary;
                 changed = true;
             }
+            Ok(TuiMessage::Welcome {
+                model,
+                workspace,
+                session,
+                capabilities,
+            }) => {
+                state.welcome = Some(WelcomeCard {
+                    model,
+                    workspace,
+                    session,
+                    capabilities,
+                });
+                changed = true;
+            }
             Ok(TuiMessage::Metrics(metrics)) => {
                 state.metrics = metrics;
                 changed = true;
             }
             Ok(TuiMessage::Status(status)) => {
                 state.status = status;
+                changed = true;
+            }
+            Ok(TuiMessage::StreamStart) => {
+                state.live_response = Some(LiveResponse::default());
+                changed = true;
+            }
+            Ok(TuiMessage::StreamDelta { text, reasoning }) => {
+                let response = state
+                    .live_response
+                    .get_or_insert_with(LiveResponse::default);
+                if reasoning {
+                    response.reasoning.push_str(&text);
+                } else {
+                    response.text.push_str(&text);
+                }
+                changed = true;
+            }
+            Ok(TuiMessage::StreamFinish { commit }) => {
+                if let Some(response) = state.live_response.take()
+                    && commit
+                    && !response.text.trim().is_empty()
+                {
+                    state.transcript.push(TranscriptEntry {
+                        kind: TranscriptKind::Agent,
+                        text: response.text.trim().to_owned(),
+                    });
+                    state.scroll = 0;
+                }
                 changed = true;
             }
             Ok(TuiMessage::Plan(plan)) => {
@@ -282,7 +383,12 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        ) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -299,6 +405,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
@@ -318,6 +425,20 @@ struct TranscriptEntry {
     text: String,
 }
 
+#[derive(Clone)]
+struct WelcomeCard {
+    model: String,
+    workspace: String,
+    session: String,
+    capabilities: String,
+}
+
+#[derive(Default)]
+struct LiveResponse {
+    reasoning: String,
+    text: String,
+}
+
 struct TuiState {
     attachments: Vec<String>,
     composer: Composer,
@@ -330,12 +451,15 @@ struct TuiState {
     header_secondary: String,
     history: Vec<String>,
     history_index: Option<usize>,
+    live_response: Option<LiveResponse>,
     metrics: Option<String>,
     models: Vec<String>,
     plan: Option<Vec<String>>,
     scroll: u16,
     status: Option<String>,
+    tick: usize,
     transcript: Vec<TranscriptEntry>,
+    welcome: Option<WelcomeCard>,
 }
 
 impl TuiState {
@@ -352,12 +476,15 @@ impl TuiState {
             header_secondary: "Lightweight coding agent".into(),
             history,
             history_index: None,
+            live_response: None,
             metrics: None,
             models: Vec::new(),
             plan: None,
             scroll: 0,
             status: None,
+            tick: 0,
             transcript: Vec::new(),
+            welcome: None,
         }
     }
 
@@ -423,6 +550,11 @@ impl TuiState {
                     self.composer.clear();
                     return KeyOutcome::changed();
                 }
+                KeyCode::Char('l') => {
+                    self.transcript.clear();
+                    self.scroll = 0;
+                    return KeyOutcome::changed();
+                }
                 _ => {}
             }
         }
@@ -472,11 +604,19 @@ impl TuiState {
                 KeyOutcome::changed()
             }
             KeyCode::Left => {
-                self.composer.left();
+                if modifiers.contains(KeyModifiers::ALT) {
+                    self.composer.previous_word();
+                } else {
+                    self.composer.left();
+                }
                 KeyOutcome::changed()
             }
             KeyCode::Right => {
-                self.composer.right();
+                if modifiers.contains(KeyModifiers::ALT) {
+                    self.composer.next_word();
+                } else {
+                    self.composer.right();
+                }
                 KeyOutcome::changed()
             }
             KeyCode::Home => {
@@ -864,6 +1004,26 @@ impl Composer {
         self.cursor = (self.cursor + 1).min(self.text.chars().count());
     }
 
+    fn previous_word(&mut self) {
+        let characters = self.text.chars().collect::<Vec<_>>();
+        while self.cursor > 0 && characters[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+        while self.cursor > 0 && !characters[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+    }
+
+    fn next_word(&mut self) {
+        let characters = self.text.chars().collect::<Vec<_>>();
+        while self.cursor < characters.len() && !characters[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+        while self.cursor < characters.len() && characters[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+    }
+
     fn home(&mut self) {
         let before = self.text.chars().take(self.cursor).collect::<String>();
         self.cursor -= before
@@ -1103,6 +1263,8 @@ fn draw_plan(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let primary_width = area.width.saturating_sub(13) as usize;
+    let secondary_width = area.width.saturating_sub(2) as usize;
     let header = Text::from(vec![
         Line::from(vec![
             Span::styled(
@@ -1114,14 +1276,14 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
             ),
             Span::raw("  "),
             Span::styled(
-                &state.header_primary,
+                truncate(&state.header_primary, primary_width),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                &state.header_secondary,
+                truncate(&state.header_secondary, secondary_width),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -1135,27 +1297,13 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
 fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
     let width = area.width.saturating_sub(4).max(1) as usize;
     let mut lines = Vec::new();
-    if state.transcript.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "Ask WeCode to inspect, change, test, or explain this repository.",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "Examples: “fix the failing tests” · “explain @src/main.rs”",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+    if state.transcript.is_empty() && state.live_response.is_none() {
+        render_empty_state(&mut lines, state, width, area.height);
     } else {
         for entry in &state.transcript {
-            let (label, color) = match &entry.kind {
-                TranscriptKind::User => ("YOU", Color::Blue),
-                TranscriptKind::Agent => ("WECODE", Color::Cyan),
+            let (label, color, marker) = match &entry.kind {
+                TranscriptKind::User => ("YOU", Color::Blue, "›"),
+                TranscriptKind::Agent => ("WECODE", Color::Cyan, "◆"),
                 TranscriptKind::Custom { label, tone } => (
                     label.as_str(),
                     match tone {
@@ -1165,22 +1313,45 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
                         TuiTone::Error => Color::Red,
                         TuiTone::Dim => Color::DarkGray,
                     },
+                    tool_marker(label),
                 ),
             };
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!("  {label}"),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )));
-            for raw in entry.text.lines() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {marker} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    label,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let raw_lines = entry.text.lines().collect::<Vec<_>>();
+            let limit = transcript_line_limit(&entry.kind);
+            for raw in raw_lines.iter().take(limit).copied() {
                 let style = match &entry.kind {
                     TranscriptKind::Custom { label, .. } if label == "DIFF" => diff_line_style(raw),
+                    TranscriptKind::Agent => markdown_line_style(raw),
+                    TranscriptKind::User => Style::default().fg(Color::White),
+                    TranscriptKind::Custom {
+                        tone: TuiTone::Dim, ..
+                    } => Style::default().fg(Color::Gray),
                     _ => Style::default(),
                 };
                 for line in wrap_plain(raw, width) {
-                    lines.push(Line::from(Span::styled(format!("  {line}"), style)));
+                    lines.push(Line::from(Span::styled(format!("    {line}"), style)));
                 }
             }
+            if raw_lines.len() > limit {
+                lines.push(Line::from(Span::styled(
+                    format!("    … {} more lines hidden", raw_lines.len() - limit),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        if let Some(response) = &state.live_response {
+            render_live_response(&mut lines, response, state.tick, width);
         }
     }
 
@@ -1194,6 +1365,183 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_empty_state<'a>(
+    lines: &mut Vec<Line<'a>>,
+    state: &'a TuiState,
+    width: usize,
+    height: u16,
+) {
+    let top_padding = height.saturating_sub(14) / 3;
+    lines.extend((0..top_padding).map(|_| Line::from("")));
+    lines.push(centered_line(
+        "◆  W E C O D E",
+        width,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(centered_line(
+        "Your repository, understood and changed from the terminal",
+        width,
+        Style::default().fg(Color::Gray),
+    ));
+    lines.push(Line::from(""));
+    lines.push(centered_line(
+        "Describe a task in the message box below",
+        width,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(centered_line(
+        "fix a bug   ·   build a feature   ·   explain code   ·   review changes",
+        width,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(""));
+    if let Some(welcome) = &state.welcome {
+        lines.push(centered_line(
+            &format!("● ready  ·  {}", welcome.model),
+            width,
+            Style::default().fg(Color::Green),
+        ));
+        lines.push(centered_line(
+            &welcome.workspace,
+            width,
+            Style::default().fg(Color::DarkGray),
+        ));
+        lines.push(centered_line(
+            &format!("session {}  ·  {}", welcome.session, welcome.capabilities),
+            width,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(centered_line(
+        "/ for commands   @ for files   ! for shell",
+        width,
+        Style::default().fg(Color::DarkGray),
+    ));
+}
+
+fn centered_line(value: &str, width: usize, style: Style) -> Line<'static> {
+    let value = truncate(value, width);
+    let value_width = UnicodeWidthStr::width(value.as_str());
+    let padding = " ".repeat(width.saturating_sub(value_width) / 2);
+    Line::from(vec![Span::raw(padding), Span::styled(value, style)])
+}
+
+fn render_live_response<'a>(
+    lines: &mut Vec<Line<'a>>,
+    response: &'a LiveResponse,
+    tick: usize,
+    width: usize,
+) {
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {} ", frames[tick % frames.len()]),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if response.text.is_empty() {
+                "WECODE · THINKING"
+            } else {
+                "WECODE · RESPONDING"
+            },
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let visible = if response.text.trim().is_empty() {
+        response
+            .reasoning
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        response.text.clone()
+    };
+    if visible.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    Inspecting the repository and planning the next step…",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return;
+    }
+    for raw in visible
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        for line in wrap_plain(raw, width) {
+            lines.push(Line::from(Span::styled(
+                format!("    {line}"),
+                if response.text.is_empty() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    markdown_line_style(raw)
+                },
+            )));
+        }
+    }
+}
+
+fn transcript_line_limit(kind: &TranscriptKind) -> usize {
+    match kind {
+        TranscriptKind::Custom { label, .. }
+            if matches!(
+                label.as_str(),
+                "READ" | "LIST" | "GLOB" | "GREP" | "OUTPUT" | "RESULT"
+            ) =>
+        {
+            10
+        }
+        TranscriptKind::Custom { label, .. } if label.starts_with("RUN ·") => 12,
+        _ => usize::MAX,
+    }
+}
+
+fn tool_marker(label: &str) -> &'static str {
+    if label.starts_with("EDIT") {
+        "±"
+    } else if label.starts_with("RUN") || label == "SHELL" {
+        "$"
+    } else if label == "ERROR" || label == "STOPPED" {
+        "×"
+    } else if label == "DONE" || label == "VERIFY" {
+        "✓"
+    } else if label == "WARNING" || label == "APPROVAL" {
+        "!"
+    } else {
+        "•"
+    }
+}
+
+fn markdown_line_style(line: &str) -> Style {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("```") {
+        Style::default().fg(Color::Magenta)
+    } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        Style::default().fg(Color::White)
+    } else if trimmed.starts_with('>') {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    }
 }
 
 fn diff_line_style(line: &str) -> Style {
@@ -1244,7 +1592,7 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     } else if running {
         " Steer active task "
     } else {
-        " Message "
+        " Ask WeCode "
     });
     let block = Block::default()
         .title(Span::styled(
@@ -1256,6 +1604,22 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let prompt_color = if shell_mode { Color::Green } else { color };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "›",
+            Style::default()
+                .fg(prompt_color)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(inner.x, inner.y, 1, inner.height),
+    );
+    let text_area = Rect::new(
+        inner.x.saturating_add(2),
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
 
     if state.composer.text.is_empty() {
         let placeholder =
@@ -1267,31 +1631,31 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
                 } else if running {
                     "Type to steer, or Alt-Enter to queue the next task"
                 } else {
-                    "Ask WeCode to do anything in this repository"
+                    "Describe what you want to build, fix, inspect, or understand…"
                 });
         frame.render_widget(
             Paragraph::new(Span::styled(
                 placeholder,
                 Style::default().fg(Color::DarkGray),
             )),
-            inner,
+            text_area,
         );
-        frame.set_cursor_position(Position::new(inner.x, inner.y));
+        frame.set_cursor_position(Position::new(text_area.x, text_area.y));
         return;
     }
 
     frame.render_widget(
         Paragraph::new(state.composer.text.as_str()).wrap(Wrap { trim: false }),
-        inner,
+        text_area,
     );
     let (cursor_x, cursor_y) =
-        cursor_position(&state.composer.text, state.composer.cursor, inner.width);
+        cursor_position(&state.composer.text, state.composer.cursor, text_area.width);
     frame.set_cursor_position(Position::new(
-        inner.x.saturating_add(cursor_x),
-        inner
+        text_area.x.saturating_add(cursor_x),
+        text_area
             .y
             .saturating_add(cursor_y)
-            .min(inner.bottom().saturating_sub(1)),
+            .min(text_area.bottom().saturating_sub(1)),
     ));
 }
 
@@ -1321,10 +1685,21 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     } else if let Some(status) = &state.status {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let animated = status.starts_with("Thinking")
+            || status.starts_with("Streaming")
+            || status.starts_with("Reviewing");
         let spans = vec![
             Span::raw(" "),
             Span::styled(
-                truncate(status, area.width.saturating_sub(57) as usize),
+                truncate(
+                    &if animated {
+                        format!("{} {status}", frames[state.tick % frames.len()])
+                    } else {
+                        status.clone()
+                    },
+                    area.width.saturating_sub(57) as usize,
+                ),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1341,43 +1716,56 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     } else {
-        let mut spans = if area.width < 90 {
+        let mut spans = if state.metrics.is_some() && area.width >= 70 {
             vec![
                 key(" Enter "),
                 hint("send"),
                 separator(),
-                key(" Alt-Enter "),
-                hint("later"),
-            ]
-        } else {
-            vec![
-                key(" Enter "),
-                hint("send"),
-                separator(),
-                key(" Ctrl-J "),
+                key(" Shift-Enter "),
                 hint("newline"),
-                separator(),
-                key(" Alt-Enter "),
-                hint("follow-up"),
             ]
-        };
-        if let Some(metrics) = &state.metrics {
-            spans.push(Span::raw("    "));
-            spans.push(Span::styled(
-                truncate(metrics, area.width.saturating_sub(62) as usize),
-                Style::default().fg(Color::DarkGray),
-            ));
+        } else if area.width < 90 {
+            vec![
+                key(" Enter "),
+                hint("send"),
+                separator(),
+                key(" / "),
+                hint("commands"),
+            ]
         } else {
-            spans.extend([
+            vec![
+                key(" Enter "),
+                hint("send"),
+                separator(),
+                key(" Shift-Enter "),
+                hint("newline"),
                 separator(),
                 key(" / "),
                 hint("commands"),
                 separator(),
                 key(" @ "),
                 hint("files"),
+            ]
+        };
+        if let Some(metrics) = &state.metrics {
+            spans.push(Span::raw("    "));
+            spans.push(Span::styled(
+                truncate(
+                    metrics,
+                    area.width
+                        .saturating_sub(if area.width >= 70 { 38 } else { 30 })
+                        as usize,
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            spans.extend([
                 separator(),
                 key(" ! "),
                 hint("shell"),
+                separator(),
+                key(" Ctrl-L "),
+                hint("clear"),
             ]);
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1761,7 +2149,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Message"));
+        assert!(rendered.contains("Ask WeCode"));
         assert!(rendered.contains("/c"));
     }
 
@@ -1787,8 +2175,8 @@ mod tests {
         assert!(rendered.contains("gpt-mini"));
         assert!(rendered.contains('修'));
         assert!(rendered.contains('测'));
-        assert!(rendered.contains("Message"));
-        assert!(rendered.contains("Alt-Enter"));
+        assert!(rendered.contains("Ask WeCode"));
+        assert!(rendered.contains("Shift-Enter"));
         assert!(rendered.contains("cached"));
     }
 
@@ -1806,7 +2194,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("later"));
+        assert!(rendered.contains("send"));
         assert!(rendered.contains("commands"));
         assert!(rendered.contains("files"));
         assert!(rendered.contains("shell"));
@@ -1857,7 +2245,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Attachments"));
         assert!(rendered.contains("screen.png"));
-        assert!(rendered.contains("Message"));
+        assert!(rendered.contains("Ask WeCode"));
         assert!(rendered.contains("send"));
     }
 
@@ -1877,7 +2265,68 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Message"));
+        assert!(rendered.contains("Ask WeCode"));
         assert!(rendered.contains("describe this"));
+    }
+
+    #[test]
+    fn welcome_state_looks_like_a_ready_coding_agent() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.welcome = Some(WelcomeCard {
+            model: "openai / gpt-mini".into(),
+            workspace: "~/project".into(),
+            session: "abc123".into(),
+            capabilities: "repo · shell · edit · plan".into(),
+        });
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("W E C O D E"));
+        assert!(rendered.contains("Your repository"));
+        assert!(rendered.contains("openai / gpt-mini"));
+        assert!(rendered.contains("Describe a task"));
+        assert!(rendered.contains("Ask WeCode"));
+    }
+
+    #[test]
+    fn streamed_response_is_visible_in_the_timeline() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.live_response = Some(LiveResponse {
+            reasoning: String::new(),
+            text: "I found the failing parser test.".into(),
+        });
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("WECODE · RESPONDING"));
+        assert!(rendered.contains("failing parser test"));
+    }
+
+    #[test]
+    fn alt_arrows_move_by_word() {
+        let mut composer = Composer::default();
+        composer.insert("fix the parser");
+        composer.previous_word();
+        assert_eq!(composer.cursor, 8);
+        composer.previous_word();
+        assert_eq!(composer.cursor, 4);
+        composer.next_word();
+        assert_eq!(composer.cursor, 8);
     }
 }

@@ -103,6 +103,15 @@ fn resolve_workspace_path(workspace: &Path, relative: &Path) -> Result<PathBuf> 
     }
 
     let target = workspace.join(normalized);
+    if crate::config::wecode_home_dir()
+        .canonicalize()
+        .is_ok_and(|private| target.starts_with(private))
+    {
+        bail!(
+            "patch path targets private WeCode state: {}",
+            relative.display()
+        );
+    }
     let mut existing = target.as_path();
     while !existing.exists() {
         existing = existing

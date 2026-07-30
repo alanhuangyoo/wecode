@@ -495,6 +495,12 @@ impl FileTools {
         if !resolved.starts_with(&workspace) {
             bail!("path escapes the workspace: {input}");
         }
+        if crate::config::wecode_home_dir()
+            .canonicalize()
+            .is_ok_and(|private| resolved.starts_with(private))
+        {
+            bail!("path is private WeCode state and cannot be accessed by agent tools: {input}");
+        }
         Ok(resolved)
     }
 }
@@ -609,7 +615,7 @@ fn walk_entries(root: &Path, max_depth: Option<usize>, include_dirs: bool) -> Re
         .parents(true)
         .require_git(false)
         .follow_links(false)
-        .filter_entry(not_git_metadata)
+        .filter_entry(not_private_metadata)
         .sort_by_file_path(|left, right| left.cmp(right));
     if let Some(max_depth) = max_depth {
         builder.max_depth(Some(max_depth));
@@ -638,8 +644,8 @@ fn walk_entries(root: &Path, max_depth: Option<usize>, include_dirs: bool) -> Re
     Ok(WalkResult { entries, truncated })
 }
 
-fn not_git_metadata(entry: &DirEntry) -> bool {
-    entry.depth() == 0 || entry.file_name() != ".git"
+fn not_private_metadata(entry: &DirEntry) -> bool {
+    entry.depth() == 0 || (entry.file_name() != ".git" && entry.file_name() != ".wecode")
 }
 
 fn glob_matcher(pattern: &str) -> Result<GlobMatcher> {

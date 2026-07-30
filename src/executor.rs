@@ -199,6 +199,7 @@ fn reject_dangerous_command(command: &str) -> Result<()> {
         "git reset --hard",
         "git clean -fd",
         "git clean -df",
+        ".wecode/credentials",
     ];
     if let Some(pattern) = denied.iter().find(|pattern| normalized.contains(**pattern)) {
         bail!(

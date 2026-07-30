@@ -94,6 +94,20 @@ impl TerminalOutput {
         true
     }
 
+    pub fn set_tui_welcome(
+        &self,
+        model: String,
+        workspace: String,
+        session: String,
+        capabilities: String,
+    ) -> bool {
+        let TerminalOutputInner::Tui(handle) = self.inner.as_ref() else {
+            return false;
+        };
+        handle.set_welcome(model, workspace, session, capabilities);
+        true
+    }
+
     pub fn clear_tui(&self) -> bool {
         let TerminalOutputInner::Tui(handle) = self.inner.as_ref() else {
             return false;
@@ -105,6 +119,24 @@ impl TerminalOutput {
     pub fn set_tui_status(&self, status: Option<String>) {
         if let TerminalOutputInner::Tui(handle) = self.inner.as_ref() {
             handle.set_status(status);
+        }
+    }
+
+    pub fn start_tui_stream(&self) {
+        if let TerminalOutputInner::Tui(handle) = self.inner.as_ref() {
+            handle.start_stream();
+        }
+    }
+
+    pub fn push_tui_stream(&self, text: String, reasoning: bool) {
+        if let TerminalOutputInner::Tui(handle) = self.inner.as_ref() {
+            handle.stream_delta(text, reasoning);
+        }
+    }
+
+    pub fn finish_tui_stream(&self, commit: bool) {
+        if let TerminalOutputInner::Tui(handle) = self.inner.as_ref() {
+            handle.finish_stream(commit);
         }
     }
 
@@ -179,10 +211,11 @@ impl TerminalUi {
     }
 
     fn with_mode(mode: UiMode, output: TerminalOutput, allow_deltas: bool) -> Self {
+        let interactive = io::stderr().is_terminal() || output.is_tui();
         Self {
             spinner: Mutex::new(None),
             stream_preview: Mutex::new(String::new()),
-            interactive: io::stderr().is_terminal(),
+            interactive,
             allow_deltas,
             mode,
             output,
@@ -210,7 +243,8 @@ impl TerminalUi {
         };
         if self.output.is_tui() {
             self.output
-                .set_tui_status(Some(format!("⠋ {activity} · step {step}")));
+                .set_tui_status(Some(format!("{activity} · step {step}")));
+            self.output.start_tui_stream();
         } else if self.output.is_external() {
             self.output
                 .print(format!("  ⠋ {activity} · step {step}\n"))?;
@@ -252,8 +286,9 @@ impl TerminalUi {
         }
         let label = if reasoning { "Thinking" } else { "Streaming" };
         if self.output.is_tui() {
+            self.output.push_tui_stream(text.to_owned(), reasoning);
             self.output
-                .set_tui_status(Some(format!("● {label} · {preview}")));
+                .set_tui_status(Some(format!("{label} · {preview}")));
         } else if let Some(spinner) = self.spinner.lock().expect("spinner lock poisoned").as_ref() {
             spinner.set_message(format!("{label} · {preview}"));
         }
@@ -326,6 +361,7 @@ impl EventSink for TerminalUi {
                 ..
             } => {
                 self.stop_spinner();
+                self.output.finish_tui_stream(kind != "finish");
                 if self.mode == UiMode::Review && kind == "finish" {
                     return Ok(());
                 }
@@ -552,6 +588,7 @@ impl EventSink for TerminalUi {
             }
             Event::RunCancelled { .. } => {
                 self.stop_spinner();
+                self.output.finish_tui_stream(false);
                 let message = if self.mode == UiMode::Review {
                     "review cancelled; the workspace was not modified"
                 } else {
@@ -637,6 +674,7 @@ impl EventSink for TerminalUi {
             }
             Event::Error { message } => {
                 self.stop_spinner();
+                self.output.finish_tui_stream(false);
                 if self.output.tui_entry("ERROR", message, TuiTone::Error) {
                     return Ok(());
                 }

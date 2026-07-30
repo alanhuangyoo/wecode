@@ -270,7 +270,7 @@ fn completion_files(workspace: &Path) -> Vec<String> {
             entry.depth() == 0
                 || !matches!(
                     entry.file_name().to_str(),
-                    Some(".git" | "node_modules" | "target")
+                    Some(".git" | ".wecode" | "node_modules" | "target")
                 )
         });
     let mut files = builder
@@ -401,21 +401,24 @@ impl ChatView {
         command_count: usize,
     ) -> Result<()> {
         if self.output.set_tui_header(
+            format!("{}  ·  {}", config.model.model, compact_path(workspace)),
             format!(
-                "{} · {}  |  {}",
+                "{} provider  ·  {} protocol  ·  session {}  ·  {} rules  ·  {} skills",
                 config.model.provider,
-                config.model.model,
-                compact_path(workspace)
-            ),
-            format!(
-                "session {} · {} rules · {} skills · {} commands · {} · /help",
+                protocol_name(config.model.family, config.model.wire_api),
                 short_id(&session.id),
                 instructions.files.len(),
                 skill_count,
-                command_count,
-                protocol_name(config.model.family, config.model.wire_api)
             ),
         ) {
+            self.output.set_tui_welcome(
+                format!("{} / {}", config.model.provider, config.model.model),
+                compact_path(workspace),
+                short_id(&session.id).to_owned(),
+                format!(
+                    "repo · shell · edit · plan  ·  {skill_count} skills  ·  {command_count} commands"
+                ),
+            );
             return Ok(());
         }
         self.output.print(render_welcome(

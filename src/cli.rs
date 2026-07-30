@@ -17,7 +17,7 @@ use crate::chat::{ChatCommand, ChatInput, ChatShell, ChatView};
 use crate::commands::CommandCatalog;
 use crate::config::{
     ApprovalPolicy, CacheMode, Config, ProviderFamily, WireApi, default_config_path,
-    provider_preset,
+    default_credentials_path, provider_preset,
 };
 use crate::context::{ImageAttachment, estimate_text_tokens};
 use crate::control::CancellationToken;
@@ -2534,7 +2534,19 @@ fn ensure_secret_file_outside_workspace(path: &Path, workspace: &Path) -> Result
     let workspace = workspace
         .canonicalize()
         .with_context(|| format!("workspace {} does not exist", workspace.display()))?;
-    if path.starts_with(&workspace) {
+    let managed_credentials = default_credentials_path().canonicalize().ok();
+    ensure_canonical_secret_location(&path, &workspace, managed_credentials.as_deref())
+}
+
+fn ensure_canonical_secret_location(
+    path: &Path,
+    workspace: &Path,
+    managed_credentials: Option<&Path>,
+) -> Result<()> {
+    if managed_credentials == Some(path) {
+        return Ok(());
+    }
+    if path.starts_with(workspace) {
         bail!(
             "API key file {} must be outside the agent workspace {}",
             path.display(),
@@ -2699,5 +2711,16 @@ mod tests {
         std::fs::write(&path, "test-key").unwrap();
 
         ensure_secret_file_outside_workspace(&path, workspace.path()).unwrap();
+    }
+
+    #[test]
+    fn accepts_managed_credentials_when_home_is_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let private = workspace.path().join(".wecode");
+        std::fs::create_dir(&private).unwrap();
+        let path = private.join("credentials");
+        std::fs::write(&path, "test-key").unwrap();
+
+        ensure_canonical_secret_location(&path, workspace.path(), Some(&path)).unwrap();
     }
 }
