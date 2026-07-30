@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::{
     CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, ToolProfile, Usage,
-    action_batch_text, action_from_tool_call, merge_adjacent_messages, tool_definitions,
+    action_batch_text, merge_adjacent_messages, model_tool_call, request_tool_definitions,
 };
 use crate::config::ModelConfig;
 use crate::context::Role;
@@ -40,24 +40,7 @@ impl GeminiModel {
     fn body(&self, request: &CompletionRequest) -> Value {
         let contents: Vec<Value> = merge_adjacent_messages(&request.messages)
             .iter()
-            .map(|message| {
-                let mut parts = vec![json!({"text": message.content})];
-                parts.extend(message.images.iter().map(|image| {
-                    json!({
-                        "inlineData": {
-                            "mimeType": image.media_type,
-                            "data": image.data,
-                        }
-                    })
-                }));
-                json!({
-                    "role": match message.role {
-                        Role::User => "user",
-                        Role::Assistant => "model",
-                    },
-                    "parts": parts,
-                })
-            })
+            .map(gemini_content)
             .collect();
         let mut generation = json!({
             "maxOutputTokens": self.config.max_output_tokens,
@@ -72,7 +55,7 @@ impl GeminiModel {
         });
         if self.config.native_tools {
             body["tools"] = json!([{
-                "functionDeclarations": tool_definitions(self.tool_profile, &self.extra_tools)
+                "functionDeclarations": request_tool_definitions(request, self.tool_profile, &self.extra_tools)
             }]);
             body["toolConfig"] = json!({
                 "functionCallingConfig": {"mode": "AUTO"}
@@ -80,6 +63,50 @@ impl GeminiModel {
         }
         body
     }
+}
+
+fn gemini_content(message: &crate::context::Message) -> Value {
+    if let Some(result) = &message.tool_result {
+        return json!({
+            "role": "user",
+            "parts": [{
+                "functionResponse": {
+                    "name": result.name,
+                    "response": {
+                        "output": message.content,
+                        "is_error": result.is_error,
+                    }
+                }
+            }]
+        });
+    }
+    let mut parts = Vec::new();
+    if !message.content.is_empty() || message.tool_calls.is_empty() {
+        parts.push(json!({"text": message.content}));
+    }
+    parts.extend(message.tool_calls.iter().map(|call| {
+        json!({
+            "functionCall": {
+                "name": call.name,
+                "args": call.arguments,
+            }
+        })
+    }));
+    parts.extend(message.images.iter().map(|image| {
+        json!({
+            "inlineData": {
+                "mimeType": image.media_type,
+                "data": image.data,
+            }
+        })
+    }));
+    json!({
+        "role": match message.role {
+            Role::User => "user",
+            Role::Assistant => "model",
+        },
+        "parts": parts,
+    })
 }
 
 #[async_trait]
@@ -163,11 +190,18 @@ struct GeminiStreamState {
 
 impl GeminiStreamState {
     fn finish(self) -> Result<ModelResponse> {
-        let mut actions = self
+        let tool_calls = self
             .tool_calls
             .into_iter()
-            .map(|(name, arguments)| action_from_tool_call(&name, arguments))
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                model_tool_call(format!("wecode-call-{index}"), name, arguments)
+            })
             .collect::<Result<Vec<_>>>()?;
+        let mut actions = tool_calls
+            .iter()
+            .map(|call| call.action.clone())
+            .collect::<Vec<_>>();
         let text = if self.text.is_empty() {
             (!actions.is_empty())
                 .then(|| action_batch_text(&actions))
@@ -178,6 +212,7 @@ impl GeminiStreamState {
         let action = (!actions.is_empty()).then(|| actions.remove(0));
         Ok(ModelResponse {
             text,
+            tool_calls,
             action,
             additional_actions: actions,
             usage: self.usage,
@@ -255,20 +290,29 @@ fn emit_delta(stream: &dyn ModelStream, event: ModelStreamEvent) -> Result<()> {
 }
 
 fn parse_response(value: Value) -> Result<ModelResponse> {
-    let mut actions = value
+    let tool_calls = value
         .pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|part| part.get("functionCall"))
-        .map(|call| {
+        .enumerate()
+        .map(|(index, call)| {
             let name = call
                 .get("name")
                 .and_then(Value::as_str)
                 .context("Gemini functionCall did not contain a name")?;
-            action_from_tool_call(name, call.get("args").cloned().unwrap_or_else(|| json!({})))
+            model_tool_call(
+                format!("wecode-call-{index}"),
+                name,
+                call.get("args").cloned().unwrap_or_else(|| json!({})),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut actions = tool_calls
+        .iter()
+        .map(|call| call.action.clone())
+        .collect::<Vec<_>>();
     let mut text = value
         .pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
@@ -285,6 +329,7 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
     let action = (!actions.is_empty()).then(|| actions.remove(0));
     Ok(ModelResponse {
         text,
+        tool_calls,
         action,
         additional_actions: actions,
         usage: Usage {
@@ -306,7 +351,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::context::{ImageAttachment, Message};
+    use crate::context::{ImageAttachment, Message, ToolCallMessage};
 
     #[derive(Default)]
     struct RecordingStream(Mutex<Vec<ModelStreamEvent>>);
@@ -335,6 +380,7 @@ mod tests {
             system: "system".into(),
             messages: vec![Message::user("inspect")],
             session_id: "session".into(),
+            enabled_tools: None,
         };
         assert_eq!(
             model.body(&plain)["contents"][0]["parts"],
@@ -356,6 +402,28 @@ mod tests {
                 {"text": "inspect"},
                 {"inlineData": {"mimeType": "image/webp", "data": "YWJj"}}
             ])
+        );
+    }
+
+    #[test]
+    fn serializes_gemini_function_response_with_the_original_name() {
+        let assistant = Message::assistant_tool_calls(
+            "",
+            vec![ToolCallMessage {
+                id: "wecode-call-0".into(),
+                name: "grep".into(),
+                arguments: json!({"pattern": "TODO", "path": "."}),
+            }],
+        );
+        let result = Message::tool_result("wecode-call-0", "grep", "no matches", false);
+
+        assert_eq!(
+            gemini_content(&assistant)["parts"][0]["functionCall"]["name"],
+            "grep"
+        );
+        assert_eq!(
+            gemini_content(&result)["parts"][0]["functionResponse"]["name"],
+            "grep"
         );
     }
 

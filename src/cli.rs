@@ -752,6 +752,9 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 view.show_subagents(&subagents.summaries().await)?;
             }
             ChatInput::Command(ChatCommand::Skills) => view.show_skills(&skills.skills())?,
+            ChatInput::Command(ChatCommand::Tools) => {
+                view.show_tools(&mcp.definitions(), &skills.skills())?
+            }
             ChatInput::Command(ChatCommand::Plan) => view.show_plan(&plan.current())?,
             ChatInput::Command(ChatCommand::Processes) => {
                 view.show_processes(&processes.summaries())?
@@ -1995,6 +1998,10 @@ async fn run_active_chat_task(
                             view.show_skills(&skills.skills())?;
                             continue;
                         }
+                        ChatInput::Command(ChatCommand::Tools) => {
+                            view.show_tools(&mcp.definitions(), &skills.skills())?;
+                            continue;
+                        }
                         _ => {
                             view.warning(
                                 "Answer the pending question, or use /cancel to stop the task.",
@@ -2155,6 +2162,9 @@ async fn run_active_chat_task(
                     }
                     ChatInput::Command(ChatCommand::Skills) => {
                         view.show_skills(&skills.skills())?;
+                    }
+                    ChatInput::Command(ChatCommand::Tools) => {
+                        view.show_tools(&mcp.definitions(), &skills.skills())?;
                     }
                     ChatInput::Command(ChatCommand::Skill { name, arguments }) => {
                         match skills.explicit_request(&name, &arguments) {

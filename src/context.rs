@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::Action;
+use crate::tool_registry::ToolRegistry;
 
 const SUMMARY_MARKER: &str = "[wecode-context-summary-v1]";
 const MAX_SUMMARY_BYTES: usize = 10_000;
@@ -32,6 +33,24 @@ pub struct Message {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<ToolResultMessage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ToolCallMessage {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ToolResultMessage {
+    pub call_id: String,
+    pub name: String,
+    pub is_error: bool,
 }
 
 impl Message {
@@ -40,6 +59,8 @@ impl Message {
             role: Role::User,
             content: content.into(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_result: None,
         }
     }
 
@@ -48,6 +69,8 @@ impl Message {
             role: Role::User,
             content: content.into(),
             images,
+            tool_calls: Vec::new(),
+            tool_result: None,
         }
     }
 
@@ -56,7 +79,45 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_result: None,
         }
+    }
+
+    pub fn assistant_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCallMessage>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            images: Vec::new(),
+            tool_calls,
+            tool_result: None,
+        }
+    }
+
+    pub fn tool_result(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_result: Some(ToolResultMessage {
+                call_id: call_id.into(),
+                name: name.into(),
+                is_error,
+            }),
+        }
+    }
+
+    pub fn is_plain(&self) -> bool {
+        self.tool_calls.is_empty() && self.tool_result.is_none()
     }
 }
 
@@ -146,7 +207,8 @@ impl ContextWindow {
         if messages.len() <= self.keep_messages + 1 {
             return 0;
         }
-        let keep_from = messages.len().saturating_sub(self.keep_messages);
+        let mut keep_from = messages.len().saturating_sub(self.keep_messages);
+        keep_from = tool_exchange_start(messages, keep_from);
         if keep_from <= 1 {
             return 0;
         }
@@ -188,6 +250,12 @@ fn context_usage(messages: &[Message]) -> ContextUsage {
         usage.text_tokens = usage
             .text_tokens
             .saturating_add(estimate_text_tokens(&message.content));
+        for call in &message.tool_calls {
+            usage.text_tokens = usage
+                .text_tokens
+                .saturating_add(estimate_text_tokens(&call.name))
+                .saturating_add(estimate_text_tokens(&call.arguments.to_string()));
+        }
         usage.images = usage.images.saturating_add(message.images.len());
         usage.image_tokens = usage.image_tokens.saturating_add(
             message
@@ -230,11 +298,32 @@ fn summarize(messages: &[Message], focus: Option<&str>) -> String {
         }
         match message.role {
             Role::Assistant => {
-                let result = messages
-                    .get(index + 1)
-                    .filter(|message| message.role == Role::User)
-                    .map(|message| message.content.as_str());
-                ingest_actions(&message.content, result, &mut facts);
+                if message.tool_calls.is_empty() {
+                    let result = messages
+                        .get(index + 1)
+                        .filter(|message| message.role == Role::User)
+                        .map(|message| message.content.as_str());
+                    ingest_actions(&message.content, result, &mut facts);
+                } else {
+                    for call in &message.tool_calls {
+                        let result = messages[index + 1..]
+                            .iter()
+                            .take_while(|candidate| candidate.role == Role::User)
+                            .find(|candidate| {
+                                candidate
+                                    .tool_result
+                                    .as_ref()
+                                    .is_some_and(|result| result.call_id == call.id)
+                            })
+                            .map(|result| result.content.as_str());
+                        if let Ok(action) =
+                            ToolRegistry::parse_call(&call.name, call.arguments.clone())
+                            && let Ok(serialized) = serde_json::to_string(&action)
+                        {
+                            ingest_actions(&serialized, result, &mut facts);
+                        }
+                    }
+                }
             }
             Role::User => ingest_user_message(&message.content, &mut facts),
         }
@@ -275,6 +364,24 @@ fn summarize(messages: &[Message], focus: Option<&str>) -> String {
         output.push_str("\nOther durable facts:\n- No durable facts were extracted.\n");
     }
     output
+}
+
+fn tool_exchange_start(messages: &[Message], mut keep_from: usize) -> usize {
+    while let Some(result) = messages
+        .get(keep_from)
+        .and_then(|message| message.tool_result.as_ref())
+    {
+        let Some(call_index) = messages[..keep_from].iter().rposition(|message| {
+            message
+                .tool_calls
+                .iter()
+                .any(|call| call.id == result.call_id)
+        }) else {
+            break;
+        };
+        keep_from = call_index;
+    }
+    keep_from
 }
 
 fn ingest_actions(content: &str, result: Option<&str>, facts: &mut SummaryFacts) {
@@ -400,6 +507,16 @@ fn ingest_actions(content: &str, result: Option<&str>, facts: &mut SummaryFacts)
                         6,
                     );
                 }
+            }
+            Action::SearchTools { query, .. } => {
+                push_fact(
+                    &mut facts.other,
+                    format!(
+                        "Searched deferred tools for `{}`.",
+                        single_line_excerpt(&query, MAX_FACT_BYTES)
+                    ),
+                    10,
+                );
             }
             Action::McpCall { server, tool, .. } => {
                 let fact = format!("Called MCP tool `{server}::{tool}`.");
@@ -711,6 +828,75 @@ mod tests {
         assert_eq!(messages[0].content, "task");
         assert!(messages[1].content.starts_with(SUMMARY_MARKER));
         assert!(messages.last().unwrap().content.contains("result 19"));
+    }
+
+    #[test]
+    fn compaction_never_splits_native_tool_exchange() {
+        let calls = vec![ToolCallMessage {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        }];
+        let mut messages = vec![Message::user("task")];
+        for index in 0..8 {
+            messages.push(Message::assistant(format!(
+                "old {index} {}",
+                "x".repeat(300)
+            )));
+        }
+        messages.push(Message::assistant_tool_calls("", calls));
+        messages.push(Message::tool_result(
+            "call-1",
+            "read_file",
+            "file contents",
+            false,
+        ));
+        messages.push(Message::assistant("done"));
+
+        assert!(ContextWindow::new(100, 2).compact(&mut messages) > 0);
+        let call_index = messages
+            .iter()
+            .position(|message| !message.tool_calls.is_empty())
+            .expect("tool call retained");
+        assert_eq!(
+            messages[call_index + 1]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .call_id,
+            "call-1"
+        );
+    }
+
+    #[test]
+    fn native_tool_calls_contribute_to_usage_and_summary() {
+        let call = ToolCallMessage {
+            id: "call-1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({
+                "command": "cargo test --all-targets",
+                "description": "validate"
+            }),
+        };
+        let messages = vec![
+            Message::user("task"),
+            Message::assistant_tool_calls("", vec![call]),
+            Message::tool_result(
+                "call-1",
+                "shell",
+                "exit_code: 0\nduration_ms: 10\ntimed_out: false",
+                false,
+            ),
+            Message::assistant("done"),
+            Message::user("tail"),
+            Message::assistant("tail"),
+        ];
+        let usage = context_usage(&messages);
+        assert!(usage.text_tokens > estimate_text_tokens("taskdonetailtail"));
+
+        let summary = summarize(&messages[1..3], None);
+        assert!(summary.contains("Ran `cargo test --all-targets`"));
+        assert!(summary.contains("Validation"));
     }
 
     #[test]

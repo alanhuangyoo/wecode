@@ -146,6 +146,11 @@ pub enum Action {
     RequestUserInput {
         questions: Vec<UserQuestion>,
     },
+    SearchTools {
+        query: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     McpCall {
         server: String,
         tool: String,
@@ -233,6 +238,7 @@ impl Action {
             Self::Patch { .. } => "patch",
             Self::UpdatePlan { .. } => "update_plan",
             Self::RequestUserInput { .. } => "request_user_input",
+            Self::SearchTools { .. } => "search_tools",
             Self::McpCall { .. } => "mcp_call",
             Self::LoadSkill { .. } => "load_skill",
             Self::StartProcess { .. } => "start_process",
@@ -284,6 +290,7 @@ impl Action {
                     "questions for user"
                 }
             }
+            Self::SearchTools { query, .. } => query,
             Self::McpCall { tool, .. } => tool,
             Self::LoadSkill { name, path, .. } => path.as_deref().unwrap_or(name),
             Self::StartProcess {
@@ -346,6 +353,15 @@ pub(crate) fn validate_action(action: &Action) -> Result<()> {
         Action::Patch { patch, .. } if patch.trim().is_empty() => bail!("patch cannot be empty"),
         Action::UpdatePlan { plan, .. } => validate_plan(plan),
         Action::RequestUserInput { questions } => validate_questions(questions),
+        Action::SearchTools { query, limit } => {
+            if query.trim().is_empty() || query.len() > 1_024 {
+                bail!("tool search query must contain between 1 and 1024 bytes");
+            }
+            if limit.is_some_and(|limit| !(1..=20).contains(&limit)) {
+                bail!("tool search limit must be between 1 and 20");
+            }
+            Ok(())
+        }
         Action::McpCall {
             server,
             tool,

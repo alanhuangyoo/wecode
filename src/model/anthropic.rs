@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::{
     CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, ToolProfile, Usage,
-    action_batch_text, action_from_tool_call, merge_adjacent_messages, tool_definitions,
+    action_batch_text, merge_adjacent_messages, model_tool_call, request_tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode};
 use crate::context::Role;
@@ -71,23 +71,44 @@ impl AnthropicModel {
             .iter()
             .enumerate()
             .map(|(index, message)| {
-                let mut block = json!({"type": "text", "text": message.content});
+                let mut content = if let Some(result) = &message.tool_result {
+                    vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": result.call_id,
+                        "content": message.content,
+                        "is_error": result.is_error,
+                    })]
+                } else {
+                    let mut content = Vec::new();
+                    if !message.content.is_empty() || message.tool_calls.is_empty() {
+                        content.push(json!({"type": "text", "text": message.content}));
+                    }
+                    content.extend(message.tool_calls.iter().map(|call| {
+                        json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": call.arguments,
+                        })
+                    }));
+                    content.extend(message.images.iter().map(|image| {
+                        json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.media_type,
+                                "data": image.data,
+                            }
+                        })
+                    }));
+                    content
+                };
                 if index == last_index
                     && let Some(cache_control) = &cache_control
+                    && let Some(block) = content.last_mut()
                 {
                     block["cache_control"] = cache_control.clone();
                 }
-                let mut content = vec![block];
-                content.extend(message.images.iter().map(|image| {
-                    json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": image.media_type,
-                            "data": image.data,
-                        }
-                    })
-                }));
                 json!({
                     "role": match message.role {
                         Role::User => "user",
@@ -108,7 +129,7 @@ impl AnthropicModel {
         }
         if self.config.native_tools {
             body["tools"] = Value::Array(
-                tool_definitions(self.tool_profile, &self.extra_tools)
+                request_tool_definitions(request, self.tool_profile, &self.extra_tools)
                     .into_iter()
                     .map(|definition| {
                         json!({
@@ -184,26 +205,39 @@ struct AnthropicStreamState {
 
 #[derive(Default)]
 struct PartialToolUse {
+    id: String,
     name: String,
     input: String,
 }
 
 impl AnthropicStreamState {
     fn finish(self) -> Result<ModelResponse> {
-        let mut actions = self
+        let tool_calls = self
             .tool_calls
-            .into_values()
-            .filter(|call| !call.name.is_empty())
-            .map(|call| {
+            .into_iter()
+            .filter(|(_, call)| !call.name.is_empty())
+            .map(|(index, call)| {
                 let input = if call.input.is_empty() {
                     json!({})
                 } else {
                     serde_json::from_str(&call.input)
                         .context("Anthropic stream returned invalid tool input")?
                 };
-                action_from_tool_call(&call.name, input)
+                model_tool_call(
+                    if call.id.is_empty() {
+                        format!("wecode-call-{index}")
+                    } else {
+                        call.id
+                    },
+                    call.name,
+                    input,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut actions = tool_calls
+            .iter()
+            .map(|call| call.action.clone())
+            .collect::<Vec<_>>();
         let text = if self.text.is_empty() {
             (!actions.is_empty())
                 .then(|| action_batch_text(&actions))
@@ -214,6 +248,7 @@ impl AnthropicStreamState {
         let action = (!actions.is_empty()).then(|| actions.remove(0));
         Ok(ModelResponse {
             text,
+            tool_calls,
             action,
             additional_actions: actions,
             usage: self.usage,
@@ -261,6 +296,11 @@ fn ingest_stream_event(
                         let index =
                             value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                         let call = state.tool_calls.entry(index).or_default();
+                        call.id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
                         call.name = block
                             .get("name")
                             .and_then(Value::as_str)
@@ -327,23 +367,33 @@ fn emit_delta(stream: &dyn ModelStream, event: ModelStreamEvent) -> Result<()> {
 }
 
 fn parse_response(value: Value) -> Result<ModelResponse> {
-    let mut actions = value
+    let tool_calls = value
         .get("content")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-        .map(|block| {
+        .enumerate()
+        .map(|(index, block)| {
             let name = block
                 .get("name")
                 .and_then(Value::as_str)
                 .context("Anthropic tool_use block did not contain a name")?;
-            action_from_tool_call(
+            model_tool_call(
+                block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("wecode-call-{index}")),
                 name,
                 block.get("input").cloned().unwrap_or_else(|| json!({})),
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut actions = tool_calls
+        .iter()
+        .map(|call| call.action.clone())
+        .collect::<Vec<_>>();
     let mut text = value
         .get("content")
         .and_then(Value::as_array)
@@ -360,6 +410,7 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
     let action = (!actions.is_empty()).then(|| actions.remove(0));
     Ok(ModelResponse {
         text,
+        tool_calls,
         action,
         additional_actions: actions,
         usage: Usage {
@@ -381,7 +432,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::context::{ImageAttachment, Message};
+    use crate::context::{ImageAttachment, Message, ToolCallMessage};
 
     #[derive(Default)]
     struct RecordingStream(Mutex<Vec<ModelStreamEvent>>);
@@ -411,6 +462,7 @@ mod tests {
             system: "system".into(),
             messages: vec![Message::user("inspect")],
             session_id: "session".into(),
+            enabled_tools: None,
         };
         assert_eq!(
             model.body(&plain)["messages"][0]["content"],
@@ -439,6 +491,44 @@ mod tests {
                     }
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn serializes_anthropic_tool_result_with_the_original_tool_use_id() {
+        let config = ModelConfig {
+            prompt_cache: PromptCacheMode::Off,
+            native_tools: true,
+            ..Default::default()
+        };
+        let model = AnthropicModel::new(
+            config,
+            None,
+            reqwest::Client::new(),
+            ToolProfile::Interactive,
+            Vec::new(),
+        );
+        let request = CompletionRequest {
+            system: "system".into(),
+            messages: vec![
+                Message::assistant_tool_calls(
+                    "",
+                    vec![ToolCallMessage {
+                        id: "toolu_abc".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "src/lib.rs"}),
+                    }],
+                ),
+                Message::tool_result("toolu_abc", "read_file", "file contents", false),
+            ],
+            session_id: "session".into(),
+            enabled_tools: Some(vec!["read_file".into()]),
+        };
+        let body = model.body(&request);
+        assert_eq!(body["messages"][0]["content"][0]["id"], "toolu_abc");
+        assert_eq!(
+            body["messages"][1]["content"][0]["tool_use_id"],
+            "toolu_abc"
         );
     }
 

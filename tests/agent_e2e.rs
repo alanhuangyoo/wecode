@@ -22,7 +22,9 @@ use wecode::input_queue::InputQueue;
 use wecode::interaction::{PlanState, UserInputClient, UserInputResponse, resolve_answers};
 use wecode::lsp::LspManager;
 use wecode::mcp::McpManager;
-use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, ToolProfile, Usage};
+use wecode::model::{
+    CompletionRequest, Model, ModelResponse, ModelStream, ModelToolCall, ToolProfile, Usage,
+};
 use wecode::protocol::{Action, LspOperation, PlanItem, PlanStatus, QuestionOption, UserQuestion};
 use wecode::review::{ReviewRequest, parse_review, review_prompt};
 use wecode::skills::SkillCatalog;
@@ -47,6 +49,7 @@ impl Model for FakeModel {
             .expect("fake model response");
         Ok(ModelResponse {
             text,
+            tool_calls: Vec::new(),
             action: None,
             additional_actions: Vec::new(),
             usage: Usage {
@@ -73,6 +76,51 @@ struct CapturingModel {
     responses: Mutex<VecDeque<Action>>,
 }
 
+struct NativeCallCapturingModel {
+    calls: AtomicUsize,
+    requests: Arc<Mutex<Vec<CompletionRequest>>>,
+}
+
+#[async_trait]
+impl Model for NativeCallCapturingModel {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
+        self.requests.lock().expect("request capture").push(request);
+        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        Ok(if first {
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ModelToolCall {
+                    id: "call_read_1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "tracked.txt"}),
+                    action: Action::ReadFile {
+                        path: "tracked.txt".into(),
+                        offset: None,
+                        limit: None,
+                    },
+                }],
+                action: None,
+                additional_actions: Vec::new(),
+                usage: Usage::default(),
+                cache_hit: false,
+            }
+        } else {
+            ModelResponse {
+                text: "Inspected tracked.txt successfully.".into(),
+                tool_calls: Vec::new(),
+                action: None,
+                additional_actions: Vec::new(),
+                usage: Usage::default(),
+                cache_hit: false,
+            }
+        })
+    }
+}
+
 #[async_trait]
 impl Model for CapturingModel {
     async fn complete(
@@ -89,6 +137,7 @@ impl Model for CapturingModel {
             .expect("fake model response");
         Ok(ModelResponse {
             text: String::new(),
+            tool_calls: Vec::new(),
             action: Some(action),
             additional_actions: Vec::new(),
             usage: Usage::default(),
@@ -112,6 +161,7 @@ impl Model for NativeFakeModel {
             .expect("fake model response");
         Ok(ModelResponse {
             text: String::new(),
+            tool_calls: Vec::new(),
             action: Some(action),
             additional_actions: Vec::new(),
             usage: Usage {
@@ -141,6 +191,7 @@ impl Model for BatchFakeModel {
         let action = (!actions.is_empty()).then(|| actions.remove(0));
         Ok(ModelResponse {
             text: String::new(),
+            tool_calls: Vec::new(),
             action,
             additional_actions: actions,
             usage: Usage::default(),
@@ -188,6 +239,7 @@ impl Model for GatedChildModel {
         self.release.notified().await;
         Ok(ModelResponse {
             text: String::new(),
+            tool_calls: Vec::new(),
             action: Some(Action::Finish {
                 summary: "background delegated result".into(),
             }),
@@ -227,6 +279,7 @@ impl Model for BackgroundParentModel {
         };
         Ok(ModelResponse {
             text: String::new(),
+            tool_calls: Vec::new(),
             action: Some(action),
             additional_actions: Vec::new(),
             usage: Usage::default(),
@@ -250,6 +303,7 @@ impl Model for SteeringGateModel {
         }
         Ok(ModelResponse {
             text: String::new(),
+            tool_calls: Vec::new(),
             action: Some(Action::Finish {
                 summary: if call == 0 {
                     "premature finish".into()
@@ -385,6 +439,10 @@ async fn interactive_plan_updates_state_and_model_context() {
     let model = CapturingModel {
         requests: requests.clone(),
         responses: Mutex::new(VecDeque::from([
+            Action::SearchTools {
+                query: "plan multi-step work".into(),
+                limit: None,
+            },
             Action::UpdatePlan {
                 explanation: Some("Track the work visibly.".into()),
                 plan: vec![
@@ -449,20 +507,35 @@ async fn interactive_plan_updates_state_and_model_context() {
             .all(|item| item.status == PlanStatus::Completed)
     );
     let requests = requests.lock().unwrap();
-    assert!(requests[0].system.contains("request_user_input"));
+    assert!(
+        !requests[0]
+            .enabled_tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "update_plan")
+    );
     assert!(
         requests[1]
-            .messages
+            .enabled_tools
+            .as_ref()
+            .unwrap()
             .iter()
-            .any(|message| message.content.contains("PLAN UPDATED:"))
+            .any(|tool| tool == "update_plan")
     );
     assert!(
         requests[2]
             .messages
             .iter()
+            .any(|message| message.content.contains("PLAN UPDATED:"))
+    );
+    assert!(
+        requests[3]
+            .messages
+            .iter()
             .any(|message| message.content.contains("PLAN INCOMPLETE:"))
     );
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
 }
 
 #[tokio::test]
@@ -492,11 +565,68 @@ async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
     assert_eq!(result.steps, 1);
     let requests = requests.lock().unwrap();
     assert!(requests[0].system.contains("Treat greetings"));
-    assert!(
+    assert!(requests[0].system.contains("answer directly"));
+    assert_eq!(
         requests[0]
-            .system
-            .contains("do not inspect or search the workspace")
+            .enabled_tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        wecode::tool_registry::INTERACTIVE_CORE_TOOLS
     );
+    assert!(
+        !requests[0]
+            .enabled_tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "finish")
+    );
+}
+
+#[tokio::test]
+async fn interactive_native_tool_result_keeps_the_provider_call_id() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = NativeCallCapturingModel {
+        calls: AtomicUsize::new(0),
+        requests: requests.clone(),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent
+        .run("inspect tracked.txt", RunOptions::default())
+        .await
+        .unwrap();
+    assert!(result.success);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let assistant_call = requests[1]
+        .messages
+        .iter()
+        .find_map(|message| message.tool_calls.first())
+        .expect("assistant tool call");
+    let tool_result = requests[1]
+        .messages
+        .iter()
+        .find_map(|message| message.tool_result.as_ref())
+        .expect("native tool result");
+    assert_eq!(assistant_call.id, "call_read_1");
+    assert_eq!(tool_result.call_id, assistant_call.id);
+    assert_eq!(tool_result.name, "read_file");
 }
 
 #[tokio::test]
@@ -730,6 +860,10 @@ async fn foreground_subagent_result_reaches_the_parent_model() {
     let parent_model = CapturingModel {
         requests: requests.clone(),
         responses: Mutex::new(VecDeque::from([
+            Action::SearchTools {
+                query: "delegate subagent inspection".into(),
+                limit: None,
+            },
             Action::SpawnAgent {
                 description: "inspect fixture".into(),
                 prompt: "Report what the fixture contains.".into(),
@@ -780,10 +914,25 @@ async fn foreground_subagent_result_reaches_the_parent_model() {
     assert!(result.success);
     {
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].system.contains("spawn_agent"));
+        assert_eq!(requests.len(), 3);
+        assert!(
+            !requests[0]
+                .enabled_tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "spawn_agent")
+        );
         assert!(
             requests[1]
+                .enabled_tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "spawn_agent")
+        );
+        assert!(
+            requests[2]
                 .messages
                 .iter()
                 .any(|message| message.content.contains("delegated fixture result"))
@@ -1263,6 +1412,10 @@ done
     let model = CapturingModel {
         requests: requests.clone(),
         responses: Mutex::new(VecDeque::from([
+            Action::SearchTools {
+                query: "fixture integration inspect".into(),
+                limit: None,
+            },
             Action::McpCall {
                 server: "fixture".into(),
                 tool: "inspect".into(),
@@ -1301,9 +1454,17 @@ done
     assert!(result.success);
     {
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(
             requests[1]
+                .enabled_tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "mcp__fixture__inspect")
+        );
+        assert!(
+            requests[2]
                 .messages
                 .iter()
                 .any(|message| message.content.contains("mcp-observation"))
@@ -1327,6 +1488,10 @@ async fn interactive_agent_progressively_loads_a_matching_skill() {
     let model = CapturingModel {
         requests: requests.clone(),
         responses: Mutex::new(VecDeque::from([
+            Action::SearchTools {
+                query: "review Rust correctness".into(),
+                limit: None,
+            },
             Action::LoadSkill {
                 name: "reviewer".into(),
                 path: None,
@@ -1367,10 +1532,24 @@ async fn interactive_agent_progressively_loads_a_matching_skill() {
     assert!(result.success);
     {
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].system.contains("<name>reviewer</name>"));
+        assert_eq!(requests.len(), 3);
+        assert!(!requests[0].system.contains("<name>reviewer</name>"));
         assert!(!requests[0].system.contains("# Review instructions"));
-        assert!(requests[1].messages.iter().any(|message| {
+        assert!(
+            requests[1]
+                .enabled_tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "load_skill")
+        );
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("skill `reviewer`"))
+        );
+        assert!(requests[2].messages.iter().any(|message| {
             message.content.contains("# Review instructions")
                 && message.content.contains("Check error paths and tests.")
         }));

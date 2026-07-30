@@ -30,12 +30,13 @@ use crate::instructions::InstructionSet;
 use crate::interaction::{PlanSnapshot, UserInputRequest};
 use crate::lsp::{LspEvent, LspServerStatus, LspServerSummary};
 use crate::mcp::{McpServerReport, McpServerState};
-use crate::model::Usage;
+use crate::model::{ToolProfile, Usage};
 use crate::protocol::PlanStatus;
 use crate::review::ParsedReview;
 use crate::session::{SessionCheckpoint, SessionSummary};
 use crate::skills::Skill;
 use crate::subagent::{SubagentEvent, SubagentStatus, SubagentSummary};
+use crate::tool_registry::{INTERACTIVE_CORE_TOOLS, ToolRegistry};
 use crate::tui::{self, TuiHandle, TuiMessage, TuiTone};
 use crate::ui::TerminalOutput;
 
@@ -79,6 +80,7 @@ pub enum ChatCommand {
     Status,
     StopAgent(Option<u64>),
     StopProcess(Option<u64>),
+    Tools,
     Queue,
     Unknown { name: String, arguments: String },
 }
@@ -360,6 +362,7 @@ fn command_completions(
         ("/hooks", "Show lifecycle hooks"),
         ("/commands", "Show reusable prompts"),
         ("/skills", "Show Agent Skills"),
+        ("/tools", "Show core and deferred tools"),
         ("/rules", "Show project rules"),
         ("/config", "Show the active config"),
         ("/history", "Show input history"),
@@ -400,13 +403,16 @@ impl ChatView {
         skill_count: usize,
         command_count: usize,
     ) -> Result<()> {
+        let (core_tools, deferred_tools) = interactive_tool_counts();
         if self.output.set_tui_header(
             format!("{}  ·  {}", config.model.model, compact_path(workspace)),
             format!(
-                "{} provider  ·  {} protocol  ·  session {}  ·  {} rules  ·  {} skills",
+                "{} provider  ·  {} protocol  ·  session {}  ·  {} core + {} deferred  ·  {} rules  ·  {} skills",
                 config.model.provider,
                 protocol_name(config.model.family, config.model.wire_api),
                 short_id(&session.id),
+                core_tools,
+                deferred_tools,
                 instructions.files.len(),
                 skill_count,
             ),
@@ -416,7 +422,7 @@ impl ChatView {
                 compact_path(workspace),
                 short_id(&session.id).to_owned(),
                 format!(
-                    "repo · shell · edit · plan  ·  {skill_count} skills  ·  {command_count} commands"
+                    "{core_tools} core · {deferred_tools} deferred  ·  {skill_count} skills  ·  {command_count} commands"
                 ),
             );
             return Ok(());
@@ -505,6 +511,7 @@ impl ChatView {
              \n  {:12} Show lifecycle hooks\
              \n  {:12} Show reusable prompt commands\
              \n  {:12} Show discovered skills\
+             \n  {:12} Show core and deferred tools\
              \n  {:12} Invoke a skill with optional arguments\
              \n  {:12} Show loaded project instruction files\
              \n  {:12} Show the active config path\
@@ -553,6 +560,7 @@ impl ChatView {
             "/hooks",
             "/commands",
             "/skills",
+            "/tools",
             "/skill:<name>",
             "/rules",
             "/config",
@@ -600,6 +608,83 @@ impl ChatView {
             config.model.provider,
             config.model.model,
             protocol_name(config.model.family, config.model.wire_api),
+        ))
+    }
+
+    pub fn show_tools(
+        &self,
+        mcp_definitions: &[serde_json::Value],
+        skills: &[Skill],
+    ) -> Result<()> {
+        let definitions = ToolRegistry::for_profile(ToolProfile::Interactive).definitions();
+        let mut core = Vec::new();
+        let mut deferred = Vec::new();
+        for definition in &definitions {
+            let Some(name) = definition.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if name == "finish" {
+                continue;
+            }
+            let description = definition
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let line = format!("{name} — {description}");
+            if INTERACTIVE_CORE_TOOLS.contains(&name) {
+                core.push(line);
+            } else {
+                deferred.push(line);
+            }
+        }
+        let mut body = format!(
+            "{} core · {} deferred · {} MCP · {} skill{}\n\nCore (sent every turn)\n",
+            core.len(),
+            deferred.len(),
+            mcp_definitions.len(),
+            skills.len(),
+            if skills.len() == 1 { "" } else { "s" },
+        );
+        for line in core {
+            body.push_str("  • ");
+            body.push_str(&line);
+            body.push('\n');
+        }
+        body.push_str("\nDeferred (found through search_tools)\n");
+        for line in deferred {
+            body.push_str("  • ");
+            body.push_str(&line);
+            body.push('\n');
+        }
+        if !mcp_definitions.is_empty() {
+            body.push_str("\nMCP (deferred)\n");
+            for definition in mcp_definitions {
+                if let Some(name) = definition.get("name").and_then(serde_json::Value::as_str) {
+                    body.push_str("  • ");
+                    body.push_str(name);
+                    body.push('\n');
+                }
+            }
+        }
+        if !skills.is_empty() {
+            body.push_str("\nSkills (deferred)\n");
+            for skill in skills {
+                body.push_str("  • ");
+                body.push_str(&skill.name);
+                body.push_str(" — ");
+                body.push_str(&skill.description);
+                body.push('\n');
+            }
+        }
+        body.push_str(
+            "\nOnly core schemas stay in the normal model request. Deferred capabilities are loaded for the active agent run when needed.",
+        );
+        if self.output.tui_entry("TOOLS", &body, TuiTone::Normal) {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "\n{}\n{body}\n",
+            Style::new().cyan().bold().apply_to("Tools")
         ))
     }
 
@@ -836,6 +921,7 @@ impl ChatView {
         skill_count: usize,
         command_count: usize,
     ) -> Result<()> {
+        let (core_tools, deferred_tools) = interactive_tool_counts();
         self.output.set_tui_header(
             format!(
                 "{} · {}  |  {}",
@@ -844,8 +930,10 @@ impl ChatView {
                 compact_path(workspace)
             ),
             format!(
-                "session {} · {} rules · {} skills · {} commands · {} · /help",
+                "session {} · {} core + {} deferred · {} rules · {} skills · {} commands · {} · /help",
                 short_id(&session.id),
+                core_tools,
+                deferred_tools,
                 instructions.files.len(),
                 skill_count,
                 command_count,
@@ -1557,6 +1645,7 @@ fn render_welcome(
     skill_count: usize,
     command_count: usize,
 ) -> String {
+    let (core_tools, deferred_tools) = interactive_tool_counts();
     let cyan = Style::new().cyan().bold();
     let dim = Style::new().dim();
     let width = (Term::stdout().size().1 as usize).clamp(48, 92);
@@ -1615,7 +1704,7 @@ fn render_welcome(
     welcome_row(
         &mut output,
         width,
-        "tools      repo · LSP · agents · shell · patch · plan · ask · processes · finish",
+        &format!("tools      {core_tools} core · {deferred_tools} deferred · /tools to inspect"),
     );
     welcome_row(
         &mut output,
@@ -1628,6 +1717,16 @@ fn render_welcome(
         dim.apply_to("  Type a task to begin · /help for commands · Ctrl-D to exit\n")
     ));
     output
+}
+
+fn interactive_tool_counts() -> (usize, usize) {
+    let definitions = ToolRegistry::for_profile(ToolProfile::Interactive).definitions();
+    let deferred = definitions
+        .iter()
+        .filter_map(|definition| definition.get("name").and_then(serde_json::Value::as_str))
+        .filter(|name| *name != "finish" && !INTERACTIVE_CORE_TOOLS.contains(name))
+        .count();
+    (INTERACTIVE_CORE_TOOLS.len(), deferred)
 }
 
 fn welcome_row(output: &mut String, width: usize, content: &str) {
@@ -1724,6 +1823,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/review" => ChatInput::Command(ChatCommand::Review(argument.to_owned())),
         "/sessions" => ChatInput::Command(ChatCommand::Sessions),
         "/skills" => ChatInput::Command(ChatCommand::Skills),
+        "/tools" => ChatInput::Command(ChatCommand::Tools),
         "/stop-process" | "/process-stop" => {
             ChatInput::Command(ChatCommand::StopProcess(argument.parse::<u64>().ok()))
         }
@@ -1906,6 +2006,10 @@ mod tests {
             ChatInput::Command(ChatCommand::StopAgent(None))
         );
         assert_eq!(parse_input("/mcp"), ChatInput::Command(ChatCommand::Mcp));
+        assert_eq!(
+            parse_input("/tools"),
+            ChatInput::Command(ChatCommand::Tools)
+        );
         assert_eq!(parse_input("/lsp"), ChatInput::Command(ChatCommand::Lsp));
         assert_eq!(
             parse_input("/lsp-restart"),

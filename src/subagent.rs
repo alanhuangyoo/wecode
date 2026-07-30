@@ -1095,6 +1095,7 @@ mod tests {
         ) -> Result<ModelResponse> {
             Ok(ModelResponse {
                 text: String::new(),
+                tool_calls: Vec::new(),
                 action: self.actions.lock().unwrap().pop_front(),
                 additional_actions: Vec::new(),
                 usage: Usage::default(),

@@ -22,6 +22,8 @@ pub struct CompletionRequest {
     pub system: String,
     pub messages: Vec<Message>,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -49,6 +51,8 @@ impl Usage {
 pub struct ModelResponse {
     pub text: String,
     #[serde(default)]
+    pub tool_calls: Vec<ModelToolCall>,
+    #[serde(default)]
     pub action: Option<Action>,
     #[serde(default)]
     pub additional_actions: Vec<Action>,
@@ -57,7 +61,19 @@ pub struct ModelResponse {
     pub cache_hit: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ModelToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub action: Action,
+}
+
 impl ModelResponse {
+    pub fn take_tool_calls(&mut self) -> Vec<ModelToolCall> {
+        std::mem::take(&mut self.tool_calls)
+    }
+
     pub fn take_actions(&mut self) -> Vec<Action> {
         let mut actions =
             Vec::with_capacity(self.additional_actions.len() + usize::from(self.action.is_some()));
@@ -225,6 +241,8 @@ fn merge_adjacent_messages(messages: &[Message]) -> Vec<Message> {
     for message in messages {
         if let Some(last) = result.last_mut()
             && last.role == message.role
+            && last.is_plain()
+            && message.is_plain()
         {
             last.content.push_str("\n\n");
             last.content.push_str(&message.content);
@@ -245,8 +263,43 @@ pub(crate) fn tool_definitions(
     definitions
 }
 
+pub(crate) fn request_tool_definitions(
+    request: &CompletionRequest,
+    profile: ToolProfile,
+    extra_tools: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let definitions = tool_definitions(profile, extra_tools);
+    let Some(enabled) = &request.enabled_tools else {
+        return definitions;
+    };
+    definitions
+        .into_iter()
+        .filter(|definition| {
+            definition
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| enabled.iter().any(|enabled| enabled == name))
+        })
+        .collect()
+}
+
 pub(crate) fn action_from_tool_call(name: &str, arguments: serde_json::Value) -> Result<Action> {
     ToolRegistry::parse_call(name, arguments)
+}
+
+pub(crate) fn model_tool_call(
+    id: impl Into<String>,
+    name: impl Into<String>,
+    arguments: serde_json::Value,
+) -> Result<ModelToolCall> {
+    let name = name.into();
+    let action = action_from_tool_call(&name, arguments.clone())?;
+    Ok(ModelToolCall {
+        id: id.into(),
+        name,
+        arguments,
+        action,
+    })
 }
 
 pub(crate) fn action_text(action: &Action) -> String {
@@ -284,6 +337,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ModelResponse {
                 text: r#"{"action":"finish","summary":"done"}"#.into(),
+                tool_calls: Vec::new(),
                 action: None,
                 additional_actions: Vec::new(),
                 usage: Usage {
@@ -315,6 +369,7 @@ mod tests {
             system: "system".into(),
             messages: vec![Message::user("task")],
             session_id: "session".into(),
+            enabled_tools: None,
         };
 
         let first = model.complete(request.clone(), None).await.unwrap();
@@ -447,6 +502,7 @@ mod tests {
                 }],
             )],
             session_id: "session".into(),
+            enabled_tools: None,
         };
         let first = cache.key("safe-namespace", &request("image-one")).unwrap();
         let second = cache.key("safe-namespace", &request("image-two")).unwrap();
@@ -467,6 +523,7 @@ mod tests {
             system: "system".into(),
             messages: vec![Message::user("task")],
             session_id: "session".into(),
+            enabled_tools: None,
         };
         assert_eq!(
             serde_json::to_value(request).unwrap(),

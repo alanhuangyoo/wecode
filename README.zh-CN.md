@@ -17,8 +17,10 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
 - **轻量且易分发**：单个 Rust CLI，依赖精简，不需要 Node.js 或 Python 运行时。
 - **广泛兼容模型**：支持 OpenAI Responses、OpenAI 兼容的 Chat Completions、
   Anthropic Messages 和 Gemini `generateContent`。
-- **工具调用可靠**：原生提供限制在工作区内的 `read_file`、`list_files`、`glob`、`grep`，
-  以及 `shell`、`apply_patch`、`finish`；不支持原生工具调用的网关可用 JSON 文本动作协议兜底。
+- **工具调用可靠**：仓库工具限制在工作区内，原生保留 Provider 的 call ID 与 tool result
+  消息；不支持原生工具调用的网关可用 JSON 文本动作协议兜底。
+- **工具按需加载**：交互模式只常驻七个核心 Schema；LSP、后台进程、子代理、Skills 与 MCP
+  在需要时通过 `search_tools` 发现并加载。
 - **专门设计的终端交互**：快速的全屏对话时间线、常驻多行输入框、工具与输出卡片、模型实时
   流式状态、运行中修正方向、后续任务队列、可取消任务和斜杠命令。
 - **持久化会话**：对话自动保存为可读的 JSONL，可列出和恢复；多轮对话使用稳定的服务端
@@ -151,6 +153,7 @@ Agent 工作时仍可继续编辑。
 /hooks       查看生命周期 Hooks
 /commands    查看可复用 Prompt 命令
 /skills      查看发现的 Agent Skills
+/tools       查看核心、延迟加载、MCP 与 Skill 能力
 /skill:<名称>
              调用 Skill 并可附带参数
 /rules       查看已加载的项目规则
@@ -249,6 +252,10 @@ Worktree 隔离。并发数、记录数、步骤、运行时间、输出、通�
 最初的任务消息保持不变，可作为稳定的 Provider 缓存前缀。
 
 ## 仓库工具
+
+交互会话常驻 `read_file`、`list_files`、`grep`、`shell`、`apply_patch`、
+`request_user_input` 和 `search_tools`。其他能力延迟加载，以减少 Prompt Token，并提升小模型
+选择工具的准确率；可用 `/tools` 查看完整目录。
 
 模型无需浪费轮次拼接 Shell 命令，就能直接检查代码：
 

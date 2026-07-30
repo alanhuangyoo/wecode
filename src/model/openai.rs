@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::{
     CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, ToolProfile, Usage,
-    action_batch_text, action_from_tool_call, tool_definitions,
+    action_batch_text, model_tool_call, request_tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode, WireApi};
 use crate::context::Role;
@@ -55,15 +55,7 @@ impl OpenAiModel {
             "role": "system",
             "content": request.system,
         })];
-        messages.extend(request.messages.iter().map(|message| {
-            json!({
-                "role": match message.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
-                "content": chat_message_content(message),
-            })
-        }));
+        messages.extend(request.messages.iter().map(chat_message));
         let mut body = json!({
             "model": self.config.model,
             "messages": messages,
@@ -80,7 +72,7 @@ impl OpenAiModel {
         }
         if self.config.native_tools {
             body["tools"] = Value::Array(
-                tool_definitions(self.tool_profile, &self.extra_tools)
+                request_tool_definitions(request, self.tool_profile, &self.extra_tools)
                     .into_iter()
                     .map(|definition| json!({"type": "function", "function": definition}))
                     .collect(),
@@ -92,19 +84,7 @@ impl OpenAiModel {
     }
 
     fn responses_body(&self, request: &CompletionRequest) -> Value {
-        let input: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|message| {
-                json!({
-                    "role": match message.role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                    },
-                    "content": responses_message_content(message),
-                })
-            })
-            .collect();
+        let input: Vec<Value> = request.messages.iter().flat_map(responses_items).collect();
         let mut body = json!({
             "model": self.config.model,
             "instructions": request.system,
@@ -123,7 +103,7 @@ impl OpenAiModel {
         }
         if self.config.native_tools {
             body["tools"] = Value::Array(
-                tool_definitions(self.tool_profile, &self.extra_tools)
+                request_tool_definitions(request, self.tool_profile, &self.extra_tools)
                     .into_iter()
                     .map(|mut definition| {
                         definition["type"] = json!("function");
@@ -136,6 +116,74 @@ impl OpenAiModel {
         }
         body
     }
+}
+
+fn chat_message(message: &crate::context::Message) -> Value {
+    if let Some(result) = &message.tool_result {
+        return json!({
+            "role": "tool",
+            "tool_call_id": result.call_id,
+            "content": message.content,
+        });
+    }
+    if !message.tool_calls.is_empty() {
+        return json!({
+            "role": "assistant",
+            "content": if message.content.is_empty() { Value::Null } else { json!(message.content) },
+            "tool_calls": message.tool_calls.iter().map(|call| json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": serde_json::to_string(&call.arguments)
+                        .expect("tool call arguments are serializable"),
+                }
+            })).collect::<Vec<_>>(),
+        });
+    }
+    json!({
+        "role": match message.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        },
+        "content": chat_message_content(message),
+    })
+}
+
+fn responses_items(message: &crate::context::Message) -> Vec<Value> {
+    if let Some(result) = &message.tool_result {
+        return vec![json!({
+            "type": "function_call_output",
+            "call_id": result.call_id,
+            "output": message.content,
+        })];
+    }
+    if !message.tool_calls.is_empty() {
+        let mut items = Vec::with_capacity(message.tool_calls.len() + 1);
+        if !message.content.is_empty() {
+            items.push(json!({
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": message.content}],
+            }));
+        }
+        items.extend(message.tool_calls.iter().map(|call| {
+            json!({
+                "type": "function_call",
+                "call_id": call.id,
+                "name": call.name,
+                "arguments": serde_json::to_string(&call.arguments)
+                    .expect("tool call arguments are serializable"),
+            })
+        }));
+        return items;
+    }
+    vec![json!({
+        "role": match message.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        },
+        "content": responses_message_content(message),
+    })]
 }
 
 fn chat_message_content(message: &crate::context::Message) -> Value {
@@ -277,22 +325,35 @@ struct OpenAiStreamState {
 
 #[derive(Default)]
 struct PartialToolCall {
+    id: String,
     name: String,
     arguments: String,
 }
 
 impl OpenAiStreamState {
     fn finish(self, source: &str) -> Result<ModelResponse> {
-        let mut actions = self
+        let tool_calls = self
             .tool_calls
-            .into_values()
-            .filter(|call| !call.name.is_empty())
-            .map(|call| {
+            .into_iter()
+            .filter(|(_, call)| !call.name.is_empty())
+            .map(|(index, call)| {
                 let arguments = serde_json::from_str(&call.arguments)
                     .with_context(|| format!("{source} returned invalid tool arguments"))?;
-                action_from_tool_call(&call.name, arguments)
+                model_tool_call(
+                    if call.id.is_empty() {
+                        format!("wecode-call-{index}")
+                    } else {
+                        call.id
+                    },
+                    call.name,
+                    arguments,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut actions = tool_calls
+            .iter()
+            .map(|call| call.action.clone())
+            .collect::<Vec<_>>();
         let text = if self.text.is_empty() {
             (!actions.is_empty())
                 .then(|| action_batch_text(&actions))
@@ -303,6 +364,7 @@ impl OpenAiStreamState {
         let action = (!actions.is_empty()).then(|| actions.remove(0));
         Ok(ModelResponse {
             text,
+            tool_calls,
             action,
             additional_actions: actions,
             usage: self.usage,
@@ -357,6 +419,9 @@ fn ingest_chat_event(
                 continue;
             };
             let call = state.tool_calls.entry(index).or_default();
+            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                call.id = id.to_owned();
+            }
             if let Some(name) = function.get("name").and_then(Value::as_str) {
                 call.name.push_str(name);
             }
@@ -421,6 +486,13 @@ fn ingest_responses_event(
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
                 let call = state.tool_calls.entry(index).or_default();
+                if let Some(id) = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    call.id = id.to_owned();
+                }
                 if let Some(name) = item.get("name").and_then(Value::as_str) {
                     call.name = name.to_owned();
                 }
@@ -452,14 +524,18 @@ fn emit_nonempty(stream: &dyn ModelStream, event: ModelStreamEvent) -> Result<()
 }
 
 fn parse_chat_response(value: Value) -> Result<ModelResponse> {
-    let mut actions = value
+    let tool_calls = value
         .pointer("/choices/0/message/tool_calls")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|call| call.get("function"))
-        .filter_map(parse_openai_tool_call)
+        .enumerate()
+        .filter_map(|(index, call)| parse_openai_tool_call(call, index))
         .collect::<Result<Vec<_>>>()?;
+    let mut actions = tool_calls
+        .iter()
+        .map(|call| call.action.clone())
+        .collect::<Vec<_>>();
     let mut text = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -480,6 +556,7 @@ fn parse_chat_response(value: Value) -> Result<ModelResponse> {
     let action = (!actions.is_empty()).then(|| actions.remove(0));
     Ok(ModelResponse {
         text,
+        tool_calls,
         action,
         additional_actions: actions,
         usage,
@@ -488,7 +565,7 @@ fn parse_chat_response(value: Value) -> Result<ModelResponse> {
 }
 
 fn parse_responses_response(value: Value) -> Result<ModelResponse> {
-    let mut actions = Vec::new();
+    let mut tool_calls = Vec::new();
     let mut text = value
         .get("output_text")
         .and_then(Value::as_str)
@@ -497,11 +574,11 @@ fn parse_responses_response(value: Value) -> Result<ModelResponse> {
     if text.is_empty()
         && let Some(output) = value.get("output").and_then(Value::as_array)
     {
-        for item in output {
+        for (index, item) in output.iter().enumerate() {
             if item.get("type").and_then(Value::as_str) == Some("function_call")
-                && let Some(action) = parse_openai_tool_call(item)
+                && let Some(call) = parse_openai_tool_call(item, index)
             {
-                actions.push(action?);
+                tool_calls.push(call?);
             }
             if let Some(content) = item.get("content").and_then(Value::as_array) {
                 for part in content {
@@ -512,6 +589,10 @@ fn parse_responses_response(value: Value) -> Result<ModelResponse> {
             }
         }
     }
+    let mut actions = tool_calls
+        .iter()
+        .map(|call| call.action.clone())
+        .collect::<Vec<_>>();
     if text.is_empty() && !actions.is_empty() {
         text = action_batch_text(&actions);
     }
@@ -527,6 +608,7 @@ fn parse_responses_response(value: Value) -> Result<ModelResponse> {
     let action = (!actions.is_empty()).then(|| actions.remove(0));
     Ok(ModelResponse {
         text,
+        tool_calls,
         action,
         additional_actions: actions,
         usage,
@@ -534,7 +616,8 @@ fn parse_responses_response(value: Value) -> Result<ModelResponse> {
     })
 }
 
-fn parse_openai_tool_call(function: &Value) -> Option<Result<crate::protocol::Action>> {
+fn parse_openai_tool_call(call: &Value, index: usize) -> Option<Result<super::ModelToolCall>> {
+    let function = call.get("function").unwrap_or(call);
     let name = function.get("name")?.as_str()?;
     let arguments = function.get("arguments")?;
     let arguments = match arguments {
@@ -544,7 +627,13 @@ fn parse_openai_tool_call(function: &Value) -> Option<Result<crate::protocol::Ac
         },
         value => value.clone(),
     };
-    Some(action_from_tool_call(name, arguments))
+    let id = call
+        .get("call_id")
+        .or_else(|| call.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("wecode-call-{index}"));
+    Some(model_tool_call(id, name, arguments))
 }
 
 fn u64_at(value: &Value, pointer: &str) -> u64 {
@@ -560,7 +649,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::context::{ImageAttachment, Message};
+    use crate::context::{ImageAttachment, Message, ToolCallMessage};
 
     #[derive(Default)]
     struct RecordingStream(Mutex<Vec<ModelStreamEvent>>);
@@ -608,6 +697,23 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn serializes_native_tool_results_with_the_original_openai_call_id() {
+        let call = ToolCallMessage {
+            id: "call_abc".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "src/lib.rs"}),
+        };
+        let assistant = Message::assistant_tool_calls("", vec![call]);
+        let result = Message::tool_result("call_abc", "read_file", "file contents", false);
+
+        assert_eq!(chat_message(&assistant)["tool_calls"][0]["id"], "call_abc");
+        assert_eq!(chat_message(&result)["tool_call_id"], "call_abc");
+        assert_eq!(responses_items(&assistant)[0]["call_id"], "call_abc");
+        assert_eq!(responses_items(&result)[0]["call_id"], "call_abc");
+        assert_eq!(responses_items(&result)[0]["type"], "function_call_output");
     }
 
     #[test]

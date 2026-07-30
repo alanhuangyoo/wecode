@@ -4,6 +4,15 @@ use serde_json::{Value, json};
 use crate::protocol::{Action, PlanItem, UserQuestion, validate_action};
 
 pub const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+pub const INTERACTIVE_CORE_TOOLS: &[&str] = &[
+    "read_file",
+    "list_files",
+    "grep",
+    "shell",
+    "apply_patch",
+    "request_user_input",
+    "search_tools",
+];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolProfile {
@@ -82,6 +91,7 @@ impl ToolRegistry {
             | Action::Patch { .. }
             | Action::UpdatePlan { .. }
             | Action::RequestUserInput { .. }
+            | Action::SearchTools { .. }
             | Action::McpCall { .. }
             | Action::LoadSkill { .. }
             | Action::StartProcess { .. }
@@ -203,6 +213,10 @@ impl ToolRegistry {
                 )
                 .context("request_user_input returned invalid questions")?,
             },
+            "search_tools" => Action::SearchTools {
+                query: get_string("query"),
+                limit: get_usize("limit"),
+            },
             "load_skill" | "skill" => Action::LoadSkill {
                 name: get_string("name"),
                 path: arguments
@@ -323,6 +337,19 @@ impl ToolRegistry {
 
 fn interactive_definitions() -> Vec<Value> {
     vec![
+        json!({
+            "name": "search_tools",
+            "description": "Search deferred WeCode and MCP capabilities. Use this when a task needs a tool that is not currently loaded, such as LSP, skills, background processes, subagents, web, images, or an external integration. Matching tools become callable on the next turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Capability needed, described in a few words."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Maximum matching tools. Defaults to 5."}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
         json!({
             "name": "update_plan",
             "description": "Create or update the visible task plan. Use it for multi-step work and keep statuses current. At most one step may be in progress.",
@@ -725,7 +752,7 @@ mod tests {
         let read_only = ToolRegistry::for_profile(ToolProfile::ReadOnlySubagent).definitions();
         let review = ToolRegistry::for_profile(ToolProfile::Review).definitions();
         assert_eq!(coding.len(), 7);
-        assert_eq!(interactive.len(), 20);
+        assert_eq!(interactive.len(), 21);
         assert_eq!(
             interactive
                 .iter()
@@ -733,6 +760,7 @@ mod tests {
                 .filter_map(|tool| tool["name"].as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "search_tools",
                 "update_plan",
                 "request_user_input",
                 "load_skill",

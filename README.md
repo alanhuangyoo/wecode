@@ -19,9 +19,10 @@ runtime.
   runtime.
 - **Broad model support** — OpenAI Responses, OpenAI-compatible Chat Completions, Anthropic
   Messages, and Gemini `generateContent`.
-- **Reliable tools** — workspace-confined `read_file`, `list_files`, `glob`, and `grep`, plus
-  `shell`, `apply_patch`, and `finish`; every action also has a JSON text fallback for gateways
-  without native tool calls.
+- **Reliable tools** — workspace-confined repository tools, native provider call IDs and tool-result
+  messages, plus a JSON text fallback for gateways without native tool calls.
+- **Progressive tool loading** — only seven core interactive schemas stay hot; LSP, processes,
+  subagents, Skills, and MCP integrations are discovered through `search_tools` when needed.
 - **Purpose-built terminal UX** — a fast full-screen conversation timeline, persistent multiline
   composer, structured tool/output cards, live provider streaming, mid-run steering, queued
   follow-ups, cancellable runs, and slash commands.
@@ -161,6 +162,7 @@ composer remains editable while the agent works.
 /hooks       Show configured lifecycle hooks
 /commands    Show reusable prompt commands
 /skills      Show discovered Agent Skills
+/tools       Show core, deferred, MCP, and Skill capabilities
 /skill:<name>
              Invoke a skill with optional arguments
 /rules       Show loaded project instruction files
@@ -279,6 +281,10 @@ compaction replaces the previous summary instead of nesting summaries, while the
 message remains a stable provider-cache prefix.
 
 ## Repository tools
+
+Interactive sessions keep `read_file`, `list_files`, `grep`, `shell`, `apply_patch`,
+`request_user_input`, and `search_tools` loaded. Other capabilities are deferred to reduce prompt
+tokens and improve small-model tool selection; use `/tools` to inspect the complete catalog.
 
 Models can inspect code without spending turns constructing shell commands:
 
