@@ -10,29 +10,32 @@ use sha2::{Digest, Sha256};
 
 use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalKind, RiskLevel, classify_shell};
 use crate::background_process::BackgroundProcessManager;
+use crate::compaction;
 use crate::config::Config;
 use crate::context::{
     CompactionReport, ContextUsage, ContextWindow, ImageAttachment, Message, ToolCallMessage,
+    repair_dangling_tool_calls,
 };
 use crate::control::CancellationToken;
 use crate::events::{Event, EventSink, JsonlSink};
 use crate::executor::{ExecutionResult, Executor};
 use crate::file_tools::FileTools;
 use crate::git::{collect_patch, head_id};
-use crate::harness::AgentHarness;
+use crate::harness::{
+    AgentHarness, HarnessMetrics, ToolTurnLedger, TurnDecoder, TurnDisposition,
+    tool_observation_is_error,
+};
 use crate::input_queue::{InputQueue, QueuedInput};
 use crate::instructions;
 use crate::interaction::{PlanState, UserAnswer, UserInputClient, UserInputResponse};
 use crate::lsp::LspManager;
 use crate::mcp::McpManager;
-use crate::model::{
-    Model, ModelStream, ModelStreamEvent, ToolProfile, Usage, action_batch_text, tool_definitions,
-};
+use crate::model::{Model, ModelStream, ModelStreamEvent, ToolProfile, Usage, tool_definitions};
 use crate::prompt_context::{PromptContext, PromptContextOptions};
-use crate::protocol::{Action, PlanStatus, parse_action};
+use crate::protocol::{Action, PlanStatus};
 use crate::skills::SkillCatalog;
 use crate::subagent::SubagentManager;
-use crate::tool_registry::{INTERACTIVE_CORE_TOOLS, ToolRegistry};
+use crate::tool_registry::{AUTONOMOUS_CORE_TOOLS, INTERACTIVE_CORE_TOOLS, ToolRegistry};
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
@@ -65,6 +68,7 @@ pub struct RunResult {
     pub patch: String,
     pub cache_hits: usize,
     pub usage: Usage,
+    pub harness: HarnessMetrics,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -87,15 +91,6 @@ impl Conversation {
 
     pub fn context_usage(&self, max_tokens: u64, keep_messages: usize) -> ContextUsage {
         ContextWindow::new(max_tokens, keep_messages).usage(&self.messages)
-    }
-
-    pub fn compact(
-        &mut self,
-        max_tokens: u64,
-        keep_messages: usize,
-        focus: Option<&str>,
-    ) -> Option<CompactionReport> {
-        ContextWindow::new(max_tokens, keep_messages).compact_manual(&mut self.messages, focus)
     }
 
     pub(crate) fn record_review(&mut self, label: &str, review: &str) {
@@ -175,11 +170,6 @@ pub struct Agent {
     skills: Option<SkillCatalog>,
 }
 
-struct PendingToolResults {
-    first_result: usize,
-    calls: Vec<ToolCallMessage>,
-}
-
 impl Agent {
     pub fn new(
         config: Config,
@@ -249,6 +239,25 @@ impl Agent {
 
     pub async fn run(&mut self, task: &str, options: RunOptions) -> Result<RunResult> {
         self.run_inner(task, options, None).await
+    }
+
+    pub async fn compact_conversation(
+        &self,
+        conversation: &mut Conversation,
+        session_id: &str,
+        focus: Option<&str>,
+    ) -> Result<Option<CompactionReport>> {
+        Ok(compaction::compact(
+            self.model.as_ref(),
+            &mut conversation.messages,
+            self.config.agent.context_max_tokens,
+            self.config.agent.context_keep_messages,
+            session_id,
+            focus,
+            true,
+        )
+        .await?
+        .map(|outcome| outcome.report))
     }
 
     pub async fn run_in_conversation(
@@ -331,7 +340,11 @@ impl Agent {
                 options.images.clone(),
             )],
         };
-        let mut format_errors = 0;
+        let mut turn_decoder = TurnDecoder::new(
+            self.tool_profile,
+            self.config.model.native_tools,
+            self.config.agent.max_format_errors,
+        );
         let mut verify_failures = 0;
         let mut total_usage = Usage::default();
         let mut cache_hits = 0;
@@ -339,17 +352,28 @@ impl Agent {
         let mut reason = "step_limit".to_string();
         let mut success = false;
         let mut steps = 0;
-        let mut pending_tool_results = None;
+        let mut pending_tool_turn: Option<ToolTurnLedger> = None;
         let restored_active_tools = conversation
             .as_deref()
             .map(|conversation| conversation.active_tools.clone())
             .unwrap_or_default();
+        let has_interactive_capabilities = options.plan.is_some()
+            || options.user_input.is_some()
+            || options.processes.is_some()
+            || options.lsp.is_some()
+            || options.subagents.is_some()
+            || self.mcp.is_some()
+            || self.skills.is_some();
         let mut enabled_tools = (self.tool_profile == ToolProfile::Interactive
             && self.config.model.native_tools)
             .then(|| {
                 if restored_active_tools.is_empty() {
-                    INTERACTIVE_CORE_TOOLS
-                        .iter()
+                    let core = if has_interactive_capabilities {
+                        INTERACTIVE_CORE_TOOLS
+                    } else {
+                        AUTONOMOUS_CORE_TOOLS
+                    };
+                    core.iter()
                         .map(|name| (*name).to_owned())
                         .collect::<Vec<_>>()
                 } else {
@@ -362,8 +386,22 @@ impl Agent {
         let processes = options.processes.clone();
         let lsp = options.lsp.clone();
         let subagents = options.subagents.clone();
-        for step in 1..=self.config.agent.max_steps {
-            bind_pending_tool_results(&mut messages, &mut pending_tool_results);
+        'agent_loop: for step in 1..=self.config.agent.max_steps {
+            let mut repaired = pending_tool_turn
+                .take()
+                .map(|ledger| ledger.seal(&mut messages))
+                .unwrap_or_default();
+            repaired += repair_dangling_tool_calls(&mut messages);
+            if repaired > 0 {
+                turn_decoder.record_history_repairs(repaired);
+                self.emit(
+                    &recorder,
+                    Event::ToolProtocolRepaired {
+                        step,
+                        inserted_results: repaired,
+                    },
+                )?;
+            }
             if cancellation
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
@@ -382,14 +420,39 @@ impl Agent {
             self.deliver_lsp_notifications(step, &lsp, &recorder, &mut messages)?;
             self.deliver_subagent_notifications(step, &subagents, &recorder, &mut messages)?;
             self.deliver_steering(step, &input_queue, &recorder, &mut messages)?;
-            let removed = context.compact(&mut messages);
-            if removed > 0 {
-                self.emit(
-                    &recorder,
-                    Event::ContextCompacted {
-                        removed_messages: removed,
-                    },
-                )?;
+            match compaction::compact(
+                self.model.as_ref(),
+                &mut messages,
+                context.max_tokens(),
+                self.config.agent.context_keep_messages,
+                &session_id,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(Some(outcome)) => {
+                    total_usage.add(outcome.usage);
+                    turn_decoder.record_compaction();
+                    self.emit(
+                        &recorder,
+                        Event::ContextCompacted {
+                            removed_messages: outcome.report.removed_messages,
+                        },
+                    )?;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    summary = format!("context compaction failed: {error:#}");
+                    reason = "compaction_error".into();
+                    self.emit(
+                        &recorder,
+                        Event::Error {
+                            message: summary.clone(),
+                        },
+                    )?;
+                    break;
+                }
             }
             self.emit(&recorder, Event::ModelStarted { step })?;
             let stream = self.sink.wants_model_deltas().then(|| EventModelStream {
@@ -442,36 +505,22 @@ impl Agent {
                     usage: response.usage,
                 },
             )?;
-            let native_calls = response.take_tool_calls();
-            let mut actions = response.take_actions();
-            if !native_calls.is_empty() {
-                actions = native_calls
-                    .iter()
-                    .map(|call| call.action.clone())
-                    .collect();
-            }
-            let normalized_response = if actions.is_empty() {
-                response.text.clone()
-            } else {
-                action_batch_text(&actions)
-            };
+            let decoded = turn_decoder.decode(&mut response);
             self.emit(
                 &recorder,
                 Event::AssistantMessage {
                     step,
-                    text: normalized_response.clone(),
+                    text: decoded.assistant_text.clone(),
                 },
             )?;
-            if self.tool_profile == ToolProfile::Interactive
-                && self.config.model.native_tools
-                && !native_calls.is_empty()
-            {
-                let content = if response.text == normalized_response {
+            if turn_decoder.uses_native_tools() && !decoded.native_calls.is_empty() {
+                let content = if decoded.model_text == decoded.assistant_text {
                     String::new()
                 } else {
-                    response.text.clone()
+                    decoded.model_text.clone()
                 };
-                let calls = native_calls
+                let calls = decoded
+                    .native_calls
                     .iter()
                     .map(|call| ToolCallMessage {
                         id: call.id.clone(),
@@ -479,84 +528,100 @@ impl Agent {
                         arguments: call.arguments.clone(),
                     })
                     .collect::<Vec<_>>();
-                messages.push(Message::assistant_tool_calls(content, calls.clone()));
-                pending_tool_results = Some(PendingToolResults {
-                    first_result: messages.len(),
-                    calls,
-                });
+                pending_tool_turn = Some(ToolTurnLedger::record(&mut messages, content, calls));
             } else {
-                messages.push(Message::assistant(normalized_response));
+                messages.push(Message::assistant(decoded.assistant_text));
             }
 
-            if actions.is_empty() {
-                actions = match parse_action(&response.text) {
-                    Ok(action) => {
-                        format_errors = 0;
-                        vec![action]
-                    }
-                    Err(_)
-                        if !response.text.trim().is_empty()
-                            && (self.tool_profile == ToolProfile::Review
-                                || (self.tool_profile == ToolProfile::Interactive
-                                    && !looks_like_action_attempt(&response.text))) =>
-                    {
-                        format_errors = 0;
-                        vec![Action::Finish {
-                            summary: response.text.trim().to_owned(),
-                        }]
-                    }
-                    Err(error) => {
-                        format_errors += 1;
-                        if format_errors >= self.config.agent.max_format_errors {
-                            reason = "format_error_limit".into();
-                            break;
-                        }
-                        let observation = format!(
-                            "FORMAT ERROR: {error}\nReturn exactly one valid JSON action matching the system schema."
-                        );
-                        self.emit(
-                            &recorder,
-                            Event::ToolOutput {
-                                step,
-                                output: observation.clone(),
-                            },
-                        )?;
+            let mut actions = match decoded.disposition {
+                TurnDisposition::Execute(actions) => actions,
+                TurnDisposition::Complete { summary } => {
+                    vec![Action::Finish { summary }]
+                }
+                TurnDisposition::Recover { observation } => {
+                    self.emit(
+                        &recorder,
+                        Event::ToolOutput {
+                            step,
+                            output: observation.clone(),
+                        },
+                    )?;
+                    if let Some(ledger) = pending_tool_turn.as_mut() {
+                        ledger.fail_remaining(&mut messages, &observation);
+                    } else {
                         messages.push(Message::user(observation));
-                        continue;
                     }
-                };
-            }
-            if let Err(error) = ToolRegistry::validate_batch(&actions) {
-                let observation = format!("TOOL BATCH ERROR: {error}.");
-                self.emit(
-                    &recorder,
-                    Event::ToolOutput {
-                        step,
-                        output: observation.clone(),
-                    },
-                )?;
-                messages.push(Message::user(observation));
-                continue;
-            }
+                    continue;
+                }
+                TurnDisposition::Stop {
+                    reason: stop_reason,
+                } => {
+                    reason = stop_reason;
+                    break;
+                }
+            };
             if actions.len() > 1 {
                 for action in &actions {
                     self.emit_action(step, action, &recorder)?;
                 }
-                let concurrency = ToolRegistry::concurrency(&actions[0]);
+                let mut shell_denials = vec![None; actions.len()];
+                for (index, action) in actions.iter().enumerate() {
+                    if let Action::Shell { command, .. } = action {
+                        match self
+                            .authorize(
+                                step,
+                                ApprovalKind::Shell,
+                                classify_shell(command),
+                                "Run shell command",
+                                command,
+                                format!("shell:{command}"),
+                                &approval,
+                                &cancellation,
+                                &recorder,
+                            )
+                            .await?
+                        {
+                            Authorization::Allowed => {}
+                            Authorization::Denied(reason) => {
+                                shell_denials[index] = Some(reason);
+                            }
+                            Authorization::Cancelled => {
+                                summary = "cancelled by user".into();
+                                reason = "cancelled".into();
+                                self.emit(&recorder, Event::RunCancelled { step })?;
+                                break 'agent_loop;
+                            }
+                        }
+                    }
+                }
                 let batch_budget =
                     (self.config.agent.command_output_bytes / actions.len()).max(1_024);
                 let batch_tools = FileTools::new(self.workspace.clone(), batch_budget);
-                let execution = join_all(actions.iter().map(|action| async {
-                    match concurrency {
-                        crate::tool_registry::ToolConcurrency::ParallelRead => {
-                            execute_read_action(&batch_tools, action).await
-                        }
-                        crate::tool_registry::ToolConcurrency::ParallelSpawn => {
-                            execute_background_spawn_action(&subagents, action).await
-                        }
-                        crate::tool_registry::ToolConcurrency::Exclusive
-                        | crate::tool_registry::ToolConcurrency::Terminal => {
-                            unreachable!("validated batches use a parallel concurrency class")
+                let subagents_ref = &subagents;
+                let execution = join_all(actions.iter().enumerate().map(|(index, action)| {
+                    let batch_tools = &batch_tools;
+                    let executor = &executor;
+                    let subagents = subagents_ref;
+                    let shell_denial = shell_denials[index].as_deref();
+                    async move {
+                        match ToolRegistry::concurrency(action) {
+                            crate::tool_registry::ToolConcurrency::ParallelRead => {
+                                execute_read_action(batch_tools, action).await
+                            }
+                            crate::tool_registry::ToolConcurrency::ParallelShell => {
+                                if let Some(reason) = shell_denial {
+                                    Ok(permission_denied_execution(reason))
+                                } else {
+                                    execute_shell_action(executor, action).await
+                                }
+                            }
+                            crate::tool_registry::ToolConcurrency::ParallelSpawn => {
+                                execute_background_spawn_action(subagents, action).await
+                            }
+                            crate::tool_registry::ToolConcurrency::Exclusive
+                            | crate::tool_registry::ToolConcurrency::Terminal => {
+                                unreachable!("validated parallel batches exclude sequential tools")
+                            }
                         }
                     }
                 }));
@@ -575,7 +640,7 @@ impl Agent {
                     self.emit(&recorder, Event::RunCancelled { step })?;
                     break;
                 };
-                let native_batch = pending_tool_results.is_some();
+                let native_batch = pending_tool_turn.is_some();
                 let mut combined = String::new();
                 for (index, (action, result)) in actions.iter().zip(results).enumerate() {
                     let observation = self.execution_observation(step, result, &recorder, true)?;
@@ -594,8 +659,12 @@ impl Agent {
                             output: framed.clone(),
                         },
                     )?;
-                    if native_batch {
-                        messages.push(Message::user(framed.clone()));
+                    if let Some(ledger) = pending_tool_turn.as_mut() {
+                        ledger.record_result(
+                            &mut messages,
+                            framed.clone(),
+                            tool_observation_is_error(&observation),
+                        );
                     }
                     if !combined.is_empty() {
                         combined.push_str("\n\n");
@@ -637,7 +706,13 @@ impl Agent {
                         self.emit(&recorder, Event::RunCancelled { step })?;
                         break;
                     };
-                    self.handle_file_execution(step, result, &recorder, &mut messages)?;
+                    self.handle_file_execution(
+                        step,
+                        result,
+                        &recorder,
+                        &mut messages,
+                        &mut pending_tool_turn,
+                    )?;
                 }
                 Action::ListFiles { path, depth, limit } => {
                     let result = cancellable_execution(
@@ -651,7 +726,13 @@ impl Agent {
                         self.emit(&recorder, Event::RunCancelled { step })?;
                         break;
                     };
-                    self.handle_file_execution(step, result, &recorder, &mut messages)?;
+                    self.handle_file_execution(
+                        step,
+                        result,
+                        &recorder,
+                        &mut messages,
+                        &mut pending_tool_turn,
+                    )?;
                 }
                 Action::Glob {
                     pattern,
@@ -669,7 +750,13 @@ impl Agent {
                         self.emit(&recorder, Event::RunCancelled { step })?;
                         break;
                     };
-                    self.handle_file_execution(step, result, &recorder, &mut messages)?;
+                    self.handle_file_execution(
+                        step,
+                        result,
+                        &recorder,
+                        &mut messages,
+                        &mut pending_tool_turn,
+                    )?;
                 }
                 Action::Grep {
                     pattern,
@@ -699,7 +786,13 @@ impl Agent {
                         self.emit(&recorder, Event::RunCancelled { step })?;
                         break;
                     };
-                    self.handle_file_execution(step, result, &recorder, &mut messages)?;
+                    self.handle_file_execution(
+                        step,
+                        result,
+                        &recorder,
+                        &mut messages,
+                        &mut pending_tool_turn,
+                    )?;
                 }
                 Action::Shell { command, .. } => {
                     match self
@@ -718,7 +811,13 @@ impl Agent {
                     {
                         Authorization::Allowed => {}
                         Authorization::Denied(reason) => {
-                            self.handle_permission_denial(step, &reason, &recorder, &mut messages)?;
+                            self.handle_permission_denial(
+                                step,
+                                &reason,
+                                &recorder,
+                                &mut messages,
+                                &mut pending_tool_turn,
+                            )?;
                             continue;
                         }
                         Authorization::Cancelled => {
@@ -736,7 +835,13 @@ impl Agent {
                         self.emit(&recorder, Event::RunCancelled { step })?;
                         break;
                     };
-                    self.handle_execution(step, result, &recorder, &mut messages)?;
+                    self.handle_execution(
+                        step,
+                        result,
+                        &recorder,
+                        &mut messages,
+                        &mut pending_tool_turn,
+                    )?;
                 }
                 Action::Patch { patch, .. } => {
                     match self
@@ -758,7 +863,13 @@ impl Agent {
                     {
                         Authorization::Allowed => {}
                         Authorization::Denied(reason) => {
-                            self.handle_permission_denial(step, &reason, &recorder, &mut messages)?;
+                            self.handle_permission_denial(
+                                step,
+                                &reason,
+                                &recorder,
+                                &mut messages,
+                                &mut pending_tool_turn,
+                            )?;
                             continue;
                         }
                         Authorization::Cancelled => {
@@ -771,7 +882,13 @@ impl Agent {
                     let affected_paths = crate::patch::affected_paths(&patch).unwrap_or_default();
                     let result = executor.apply_patch(&patch).await;
                     let patch_applied = result.is_ok();
-                    self.handle_execution(step, result, &recorder, &mut messages)?;
+                    self.handle_execution(
+                        step,
+                        result,
+                        &recorder,
+                        &mut messages,
+                        &mut pending_tool_turn,
+                    )?;
                     if patch_applied && let Some(lsp) = &lsp {
                         lsp.sync_paths(&affected_paths).await;
                     }
@@ -796,7 +913,7 @@ impl Agent {
                             output: observation.clone(),
                         },
                     )?;
-                    messages.push(Message::user(observation));
+                    record_tool_observation(&mut messages, &mut pending_tool_turn, observation);
                 }
                 Action::RequestUserInput { questions } => {
                     let Some(user_input) = &options.user_input else {
@@ -808,7 +925,7 @@ impl Agent {
                                 output: observation.clone(),
                             },
                         )?;
-                        messages.push(Message::user(observation));
+                        record_tool_observation(&mut messages, &mut pending_tool_turn, observation);
                         continue;
                     };
                     let request = user_input.prepare(questions);
@@ -861,7 +978,7 @@ impl Agent {
                             output: observation.clone(),
                         },
                     )?;
-                    messages.push(Message::user(observation));
+                    record_tool_observation(&mut messages, &mut pending_tool_turn, observation);
                 }
                 Action::SearchTools { query, limit } => {
                     let extra = self
@@ -907,7 +1024,7 @@ impl Agent {
                             output: observation.clone(),
                         },
                     )?;
-                    messages.push(Message::user(observation));
+                    record_tool_observation(&mut messages, &mut pending_tool_turn, observation);
                 }
                 Action::McpCall {
                     server,
@@ -924,7 +1041,7 @@ impl Agent {
                                 output: observation.clone(),
                             },
                         )?;
-                        messages.push(Message::user(observation));
+                        record_tool_observation(&mut messages, &mut pending_tool_turn, observation);
                         continue;
                     };
                     let read_only = mcp.tool_is_read_only(&server, &tool);
@@ -951,6 +1068,7 @@ impl Agent {
                                     &reason,
                                     &recorder,
                                     &mut messages,
+                                    &mut pending_tool_turn,
                                 )?;
                                 continue;
                             }
@@ -980,7 +1098,13 @@ impl Agent {
                         self.emit(&recorder, Event::RunCancelled { step })?;
                         break;
                     };
-                    self.handle_execution(step, result, &recorder, &mut messages)?;
+                    self.handle_execution(
+                        step,
+                        result,
+                        &recorder,
+                        &mut messages,
+                        &mut pending_tool_turn,
+                    )?;
                 }
                 Action::LoadSkill {
                     name,
@@ -998,7 +1122,7 @@ impl Agent {
                                 output: observation.clone(),
                             },
                         )?;
-                        messages.push(Message::user(observation));
+                        record_tool_observation(&mut messages, &mut pending_tool_turn, observation);
                         continue;
                     };
                     let result = cancellable_execution(
@@ -1018,7 +1142,13 @@ impl Agent {
                         self.emit(&recorder, Event::RunCancelled { step })?;
                         break;
                     };
-                    self.handle_execution(step, result, &recorder, &mut messages)?;
+                    self.handle_execution(
+                        step,
+                        result,
+                        &recorder,
+                        &mut messages,
+                        &mut pending_tool_turn,
+                    )?;
                 }
                 Action::StartProcess {
                     command,
@@ -1040,7 +1170,13 @@ impl Agent {
                     {
                         Authorization::Allowed => {}
                         Authorization::Denied(reason) => {
-                            self.handle_permission_denial(step, &reason, &recorder, &mut messages)?;
+                            self.handle_permission_denial(
+                                step,
+                                &reason,
+                                &recorder,
+                                &mut messages,
+                                &mut pending_tool_turn,
+                            )?;
                             continue;
                         }
                         Authorization::Cancelled => {
@@ -1062,6 +1198,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::ProcessStatus { process_id, cursor } => {
@@ -1077,6 +1214,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::WriteProcess {
@@ -1096,6 +1234,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::StopProcess { process_id } => {
@@ -1111,6 +1250,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::Lsp {
@@ -1135,6 +1275,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::SpawnAgent {
@@ -1165,6 +1306,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::AgentStatus { agent_id } => {
@@ -1178,6 +1320,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::SendAgent { agent_id, message } => {
@@ -1191,6 +1334,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::WaitAgent {
@@ -1212,6 +1356,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::StopAgent { agent_id } => {
@@ -1225,6 +1370,7 @@ impl Agent {
                         background_operation_result(started, result),
                         &recorder,
                         &mut messages,
+                        &mut pending_tool_turn,
                     )?;
                 }
                 Action::Finish {
@@ -1327,7 +1473,21 @@ impl Agent {
             }
         }
 
-        bind_pending_tool_results(&mut messages, &mut pending_tool_results);
+        let mut repaired = pending_tool_turn
+            .take()
+            .map(|ledger| ledger.seal(&mut messages))
+            .unwrap_or_default();
+        repaired += repair_dangling_tool_calls(&mut messages);
+        if repaired > 0 {
+            turn_decoder.record_history_repairs(repaired);
+            self.emit(
+                &recorder,
+                Event::ToolProtocolRepaired {
+                    step: steps,
+                    inserted_results: repaired,
+                },
+            )?;
+        }
         let patch = collect_patch(&self.workspace).await.unwrap_or_default();
         if let Some(path) = &options.patch_out {
             if let Some(parent) = path.parent()
@@ -1350,6 +1510,7 @@ impl Agent {
             patch,
             cache_hits,
             usage: total_usage,
+            harness: turn_decoder.metrics().clone(),
         };
         if let Some(conversation) = conversation {
             conversation.messages = messages;
@@ -1376,6 +1537,7 @@ impl Agent {
                 patch_bytes: result.patch.len(),
                 cache_hits,
                 usage: total_usage,
+                harness: result.harness.clone(),
             },
         )?;
         Ok(result)
@@ -1387,8 +1549,9 @@ impl Agent {
         result: Result<ExecutionResult>,
         recorder: &JsonlSink,
         messages: &mut Vec<Message>,
+        pending_tool_turn: &mut Option<ToolTurnLedger>,
     ) -> Result<()> {
-        self.handle_execution_inner(step, result, recorder, messages, false)
+        self.handle_execution_inner(step, result, recorder, messages, pending_tool_turn, false)
     }
 
     fn handle_file_execution(
@@ -1397,8 +1560,9 @@ impl Agent {
         result: Result<ExecutionResult>,
         recorder: &JsonlSink,
         messages: &mut Vec<Message>,
+        pending_tool_turn: &mut Option<ToolTurnLedger>,
     ) -> Result<()> {
-        self.handle_execution_inner(step, result, recorder, messages, true)
+        self.handle_execution_inner(step, result, recorder, messages, pending_tool_turn, true)
     }
 
     fn handle_execution_inner(
@@ -1407,6 +1571,7 @@ impl Agent {
         result: Result<ExecutionResult>,
         recorder: &JsonlSink,
         messages: &mut Vec<Message>,
+        pending_tool_turn: &mut Option<ToolTurnLedger>,
         compact_output: bool,
     ) -> Result<()> {
         let observation = self.execution_observation(step, result, recorder, compact_output)?;
@@ -1417,7 +1582,7 @@ impl Agent {
                 output: observation.clone(),
             },
         )?;
-        messages.push(Message::user(observation));
+        record_tool_observation(messages, pending_tool_turn, observation);
         Ok(())
     }
 
@@ -1507,6 +1672,7 @@ impl Agent {
                 risk: risk.as_str().into(),
                 summary: request.summary.clone(),
                 detail: request.detail.clone(),
+                session_scope: request.session_scope.label.clone(),
             },
         )?;
         let decision = approval.request(request.clone());
@@ -1539,6 +1705,7 @@ impl Agent {
         reason: &str,
         recorder: &JsonlSink,
         messages: &mut Vec<Message>,
+        pending_tool_turn: &mut Option<ToolTurnLedger>,
     ) -> Result<()> {
         let observation = format!(
             "PERMISSION DENIED: {reason}\nChoose a safer approach or explain why the requested operation is necessary."
@@ -1550,7 +1717,7 @@ impl Agent {
                 output: observation.clone(),
             },
         )?;
-        messages.push(Message::user(observation));
+        record_tool_observation(messages, pending_tool_turn, observation);
         Ok(())
     }
 
@@ -1704,45 +1871,6 @@ enum Authorization {
     Allowed,
     Denied(String),
     Cancelled,
-}
-
-fn bind_pending_tool_results(
-    messages: &mut Vec<Message>,
-    pending: &mut Option<PendingToolResults>,
-) {
-    let Some(pending) = pending.take() else {
-        return;
-    };
-    let result_indices = messages
-        .iter()
-        .enumerate()
-        .skip(pending.first_result)
-        .filter_map(|(index, message)| {
-            (message.role == crate::context::Role::User && message.is_plain()).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    for (call_index, call) in pending.calls.into_iter().enumerate() {
-        if let Some(index) = result_indices.get(call_index).copied() {
-            let content = std::mem::take(&mut messages[index].content);
-            let is_error = tool_observation_is_error(&content);
-            messages[index] = Message::tool_result(call.id, call.name, content, is_error);
-        } else {
-            messages.push(Message::tool_result(
-                call.id,
-                call.name,
-                "TOOL ERROR: execution ended without a result",
-                true,
-            ));
-        }
-    }
-}
-
-fn tool_observation_is_error(observation: &str) -> bool {
-    observation.starts_with("TOOL ERROR:")
-        || observation.contains("\nTOOL ERROR:")
-        || observation.starts_with("PERMISSION DENIED:")
-        || observation.contains(" UNAVAILABLE:")
-        || observation.starts_with("USER INPUT CANCELLED:")
 }
 
 struct ToolSearchMatch {
@@ -2170,6 +2298,43 @@ async fn execute_read_action(file_tools: &FileTools, action: &Action) -> Result<
     }
 }
 
+async fn execute_shell_action(executor: &Executor, action: &Action) -> Result<ExecutionResult> {
+    let Action::Shell { command, .. } = action else {
+        unreachable!("only shell actions enter the parallel shell executor")
+    };
+    executor.shell(command).await
+}
+
+fn permission_denied_execution(reason: &str) -> ExecutionResult {
+    ExecutionResult {
+        exit_code: Some(126),
+        stdout: String::new(),
+        stderr: format!(
+            "PERMISSION DENIED: {reason}\nChoose a safer approach or explain why the requested operation is necessary."
+        ),
+        duration_ms: 0,
+        timed_out: false,
+        truncated_bytes: 0,
+    }
+}
+
+fn record_tool_observation(
+    messages: &mut Vec<Message>,
+    pending_tool_turn: &mut Option<ToolTurnLedger>,
+    observation: String,
+) {
+    if let Some(ledger) = pending_tool_turn.as_mut()
+        && ledger.record_result(
+            messages,
+            observation.clone(),
+            tool_observation_is_error(&observation),
+        )
+    {
+        return;
+    }
+    messages.push(Message::user(observation));
+}
+
 async fn execute_background_spawn_action(
     subagents: &Option<SubagentManager>,
     action: &Action,
@@ -2219,14 +2384,6 @@ fn compact_arguments(arguments: &serde_json::Value) -> String {
         end -= 1;
     }
     format!("{}…", &value[..end])
-}
-
-fn looks_like_action_attempt(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with('{')
-        || trimmed.starts_with('[')
-        || trimmed.starts_with("```")
-        || text.contains("\"action\"")
 }
 
 async fn cancellable_execution<F, T>(

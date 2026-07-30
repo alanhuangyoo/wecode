@@ -105,6 +105,8 @@ pub struct ModelConfig {
     pub api_key_file: Option<PathBuf>,
     pub max_output_tokens: u32,
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub prompt_cache: PromptCacheMode,
     pub send_prompt_cache_key: bool,
     pub native_tools: bool,
@@ -169,7 +171,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            mode: CacheMode::ReadWrite,
+            mode: CacheMode::Off,
             directory: default_cache_dir().join("responses"),
             max_megabytes: 2_048,
         }
@@ -599,6 +601,15 @@ impl Config {
         if self.model.max_retry_delay_seconds > 300 {
             bail!("model.max_retry_delay_seconds cannot exceed 300");
         }
+        if self.model.reasoning_effort.as_ref().is_some_and(|effort| {
+            effort.trim().is_empty()
+                || effort.len() > 32
+                || !effort
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        }) {
+            bail!("model.reasoning_effort must be a non-empty capability name");
+        }
         if self.agent.max_steps == 0 {
             bail!("agent.max_steps must be greater than zero");
         }
@@ -879,12 +890,13 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             provider: key,
             family: ProviderFamily::OpenAiCompatible,
             wire_api: WireApi::Responses,
-            model: "gpt-5.4".into(),
+            model: "gpt-5.5".into(),
             base_url: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             api_key_file: None,
             max_output_tokens: 8_192,
             temperature: None,
+            reasoning_effort: Some("high".into()),
             prompt_cache: PromptCacheMode::Auto,
             send_prompt_cache_key: true,
             native_tools: true,
@@ -902,6 +914,7 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             api_key_file: None,
             max_output_tokens: 8_192,
             temperature: None,
+            reasoning_effort: None,
             prompt_cache: PromptCacheMode::Long,
             send_prompt_cache_key: false,
             native_tools: true,
@@ -919,6 +932,7 @@ pub fn provider_preset(name: &str, model_override: Option<String>) -> Result<Mod
             api_key_file: None,
             max_output_tokens: 8_192,
             temperature: None,
+            reasoning_effort: None,
             prompt_cache: PromptCacheMode::Auto,
             send_prompt_cache_key: false,
             native_tools: true,
@@ -991,6 +1005,7 @@ fn openai_compatible(
         api_key_file: None,
         max_output_tokens: 8_192,
         temperature: None,
+        reasoning_effort: None,
         prompt_cache: PromptCacheMode::Auto,
         send_prompt_cache_key: false,
         native_tools: true,
@@ -1062,10 +1077,10 @@ mod tests {
 
     #[test]
     fn provider_presets_have_expected_protocols() {
-        assert_eq!(
-            provider_preset("openai", None).unwrap().wire_api,
-            WireApi::Responses
-        );
+        let openai = provider_preset("openai", None).unwrap();
+        assert_eq!(openai.wire_api, WireApi::Responses);
+        assert_eq!(openai.model, "gpt-5.5");
+        assert_eq!(openai.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(
             provider_preset("anthropic", None).unwrap().family,
             ProviderFamily::Anthropic
@@ -1074,7 +1089,35 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_is_optional_but_must_be_a_capability_name() {
+        let mut config = Config::default();
+        config.model.reasoning_effort = None;
+        assert!(config.validate().is_ok());
+        config.model.reasoning_effort = Some("xhigh".into());
+        assert!(config.validate().is_ok());
+        config.model.reasoning_effort = Some("".into());
+        assert!(config.validate().is_err());
+        config.model.reasoning_effort = Some("not valid".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn omitted_reasoning_effort_does_not_leak_from_the_openai_default() {
+        let model: ModelConfig = toml::from_str(
+            r#"
+provider = "custom"
+model = "plain-chat-model"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(model.reasoning_effort, None);
+    }
+
+    #[test]
     fn cache_modes_expose_correct_capabilities() {
+        assert_eq!(CacheConfig::default().mode, CacheMode::Off);
         assert!(CacheMode::ReadWrite.can_read());
         assert!(CacheMode::ReadWrite.can_write());
         assert!(!CacheMode::Refresh.can_read());

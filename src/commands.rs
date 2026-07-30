@@ -288,7 +288,7 @@ fn parse_command(path: &Path, scope: CommandScope, max_file_bytes: usize) -> Res
         .with_context(|| format!("failed to resolve command {}", path.display()))?;
     let raw = read_bounded(&canonical, max_file_bytes)?;
     let (frontmatter, template) = split_frontmatter(&raw)?;
-    let fields = parse_frontmatter_fields(frontmatter);
+    let fields = crate::frontmatter::parse_string_fields(frontmatter)?;
     let name = canonical
         .file_stem()
         .and_then(|name| name.to_str())
@@ -344,61 +344,8 @@ fn split_frontmatter(raw: &str) -> Result<(&str, &str)> {
     bail!("command frontmatter is missing its closing delimiter")
 }
 
-fn parse_frontmatter_fields(frontmatter: &str) -> BTreeMap<String, String> {
-    frontmatter
-        .lines()
-        .filter(|line| !line.starts_with([' ', '\t']))
-        .filter_map(|line| line.split_once(':'))
-        .map(|(key, value)| {
-            (
-                key.trim().to_ascii_lowercase(),
-                unquote_scalar(value.trim()),
-            )
-        })
-        .collect()
-}
-
-fn unquote_scalar(value: &str) -> String {
-    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        return serde_json::from_str(value)
-            .unwrap_or_else(|_| value[1..value.len() - 1].to_owned());
-    }
-    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-        return value[1..value.len() - 1].replace("''", "'");
-    }
-    value
-        .split_once(" #")
-        .map(|(value, _)| value)
-        .unwrap_or(value)
-        .trim()
-        .to_owned()
-}
-
 fn parse_arguments(value: &str) -> Vec<String> {
-    let mut arguments = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    for character in value.chars() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            } else {
-                current.push(character);
-            }
-        } else if matches!(character, '"' | '\'') {
-            quote = Some(character);
-        } else if character.is_whitespace() {
-            if !current.is_empty() {
-                arguments.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(character);
-        }
-    }
-    if !current.is_empty() {
-        arguments.push(current);
-    }
-    arguments
+    shell_words::split(value).unwrap_or_else(|_| vec![value.to_owned()])
 }
 
 fn substitute_arguments(template: &str, arguments: &[String]) -> Result<String> {

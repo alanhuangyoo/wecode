@@ -171,6 +171,7 @@ mod tests {
     async fn round_trips_cached_json() {
         let temp = tempfile::tempdir().unwrap();
         let cache = ResponseCache::new(CacheConfig {
+            mode: CacheMode::ReadWrite,
             directory: temp.path().into(),
             ..Default::default()
         })

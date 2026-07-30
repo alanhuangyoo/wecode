@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::ExternalPrinter;
 
 use crate::events::{Event, EventSink};
-use crate::tui::{TuiHandle, TuiTone};
+use crate::tui::{ApprovalPrompt, TuiHandle, TuiTone};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UiMode {
@@ -159,6 +159,14 @@ impl TerminalOutput {
             return false;
         };
         handle.set_composer(title, placeholder);
+        true
+    }
+
+    pub(crate) fn set_tui_approval(&self, approval: Option<ApprovalPrompt>) -> bool {
+        let TerminalOutputInner::Tui(handle) = self.inner.as_ref() else {
+            return false;
+        };
+        handle.set_approval(approval);
         true
     }
 
@@ -442,13 +450,14 @@ impl EventSink for TerminalUi {
                 risk,
                 summary,
                 detail,
+                session_scope,
                 ..
             } => {
                 self.stop_spinner();
                 if self.mode == UiMode::Run {
                     self.output.print(render_panel(
                         &format!("Approval · {kind} · {risk}"),
-                        &format!("{summary}\n{detail}"),
+                        &format!("{summary}\n{detail}\nSession scope: {session_scope}"),
                         PanelTone::Yellow,
                         10,
                     ))?;
@@ -605,6 +614,21 @@ impl EventSink for TerminalUi {
                 self.output.print(format!(
                     "  {} compacted {removed_messages} older messages\n",
                     Style::new().yellow().apply_to("↻")
+                ))?;
+            }
+            Event::ToolProtocolRepaired {
+                inserted_results, ..
+            } => {
+                if self.output.tui_entry(
+                    "CONTEXT",
+                    format!("repaired {inserted_results} interrupted tool result(s)"),
+                    TuiTone::Warning,
+                ) {
+                    return Ok(());
+                }
+                self.output.print(format!(
+                    "  {} repaired {inserted_results} interrupted tool result(s)\n",
+                    Style::new().yellow().apply_to("!")
                 ))?;
             }
             Event::SteeringDelivered { count, .. } => {

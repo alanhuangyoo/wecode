@@ -37,8 +37,8 @@ runtime.
 - **Managed subagents** — delegate focused implementation, exploration, planning, or review work
   in isolated model contexts, run independent tasks concurrently, and continue completed agents
   without losing their conversation.
-- **Cache efficient** — stable prompt prefixes, provider-side prompt-cache hints, and an on-disk
-  exact-response cache for cheap, fast reruns.
+- **Cache efficient** — stable prompt prefixes, provider-side prompt-cache hints, and an optional
+  on-disk exact-response cache for explicit deterministic replay.
 - **Benchmark ready** — non-interactive execution, JSONL events and trajectories, final Git patch
   output, verification retries, and a JSONL manifest runner.
 - **Predictable and safe by default** — bounded steps, timeouts, output truncation, API-key
@@ -101,7 +101,7 @@ export OPENAI_API_KEY="your-key"
 
 wecode run -C /path/to/repository \
   --provider openai \
-  --model gpt-5.4 \
+  --model gpt-5.5 \
   --verify "cargo test" \
   "Fix the failing tests and keep the public API unchanged."
 ```
@@ -190,10 +190,11 @@ The footer continuously shows estimated context usage and prompt-cache metrics. 
 its breakdown from the same request projection sent to the provider: named system-prompt sections,
 active tool schemas, rules, memory, Skills, messages, images, and free space, plus provider cache
 reads/writes and exact local cache hits. Stable and volatile prompt sections are labeled explicitly.
-`/compact [focus]` replaces eligible older turns in the model projection with a bounded local summary
-while preserving the initial task and recent messages. Compaction is transactional, costs no model
-call, drops old image payloads after recording durable facts, and appends an explicit compaction
-entry while the original JSONL message history remains inspectable.
+`/compact [focus]` uses a separate tool-free model request to replace eligible older turns with a
+structured checkpoint while preserving the initial task and recent complete tool exchanges. The
+flow follows Pi's compaction design: repeated compaction updates the previous checkpoint, image
+metadata is summarized without forwarding old Base64 payloads, and the original append-only JSONL
+history remains inspectable.
 
 Optional persistent memory can be stored in `~/.wecode/MEMORY.md` for global preferences and
 `.wecode/MEMORY.md` at the repository root for workspace facts. Both files are bounded and injected
@@ -244,8 +245,9 @@ For substantial work, the agent can create and maintain a plan that remains visi
 timeline; `/plan` shows it in the line-oriented fallback. When a choice materially changes the
 result, the agent can pause and present two to four concrete options. Reply with an option number
 or a free-form answer; for several questions, separate answers with semicolons. The composer changes
-its title and key hints while an answer or approval is pending. If a plan exists, the harness asks
-the model to mark every remaining step accurately before accepting `finish`.
+its title and key hints while an answer is pending. Approval requests open a keyboard-driven
+selection overlay. If a plan exists, the harness asks the model to mark every remaining step
+accurately before accepting a final response.
 
 During a running turn, press `Ctrl-C` once to cancel the active
 model request or shell command and return to the prompt; edits already applied are preserved.
@@ -257,10 +259,10 @@ application is never interrupted halfway through. Set `WECODE_TUI=0` to use the 
 fallback in a terminal that does not support the full-screen interface.
 The interactive renderer and provider streaming are isolated from
 `wecode run --output jsonl` and `wecode bench`, so benchmark event output and agent execution do not
-depend on terminal rendering or delta events. Plan, question, skill, managed-process, LSP, and
-subagent tools
-are exposed only by interactive `wecode` sessions; machine-oriented runs retain the original
-seven-tool profile and the same cache namespace.
+depend on terminal rendering or delta events. Chat, `run`, and `bench` use the same interactive
+prompt, while the harness exposes only tools backed by the current runtime. Capabilities that
+require a live broker, such as questions, managed processes, LSP, subagents, Skills, and MCP, are
+advertised only when that broker is attached.
 
 Interactive agents can keep development servers, watchers, and long tests running without blocking
 the conversation. `start_process` returns an ID, `process_status` reads bounded output incrementally
@@ -283,10 +285,9 @@ there is no automatic Git worktree isolation yet. Concurrency, records, steps, r
 notifications, and waits all have hard limits. Subagents cannot recursively create more agents,
 and all active child work is cancelled when the session changes or WeCode exits.
 
-Long conversations are compacted locally into a deterministic, bounded summary that retains task
-intent, inspected or edited paths, validation results, failures, and pending facts. Repeated
-compaction replaces the previous summary instead of nesting summaries, while the original task
-message remains a stable provider-cache prefix.
+Long conversations use Pi-style model compaction instead of task-specific local extraction
+heuristics. A dedicated no-tools request creates or updates a structured checkpoint, while the
+original task message remains a stable provider-cache prefix and recent messages remain verbatim.
 
 ## Repository tools
 
@@ -376,7 +377,7 @@ approval_policy = "on-request"
 trajectory_directory = "/path/to/wecode/sessions"
 
 [cache]
-mode = "read-write"
+mode = "off"
 max_megabytes = 2048
 
 [processes]
@@ -458,6 +459,10 @@ async = false
 fail_closed = true
 status_message = "prompt policy"
 ```
+
+`reasoning_effort` is optional and is sent only when configured. Use a provider-supported
+capability name such as `"low"`, `"medium"`, `"high"`, or `"xhigh"`. The built-in OpenAI preset
+uses `"high"`; generic OpenAI-compatible presets leave it unset.
 
 Provider-specific variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`
 are supported. `WECODE_API_KEY` overrides the provider-specific variable. To avoid environment
@@ -614,10 +619,13 @@ benchmark tool registry or prompt path.
 ## Approvals
 
 Shell commands are classified as `read-only`, `workspace-write`, or `elevated`. Interactive
-approval requests include the exact command or patch summary and support:
+approval requests include the exact command or patch summary, plus the reusable rule that a session
+grant would create. The TUI supports arrow-key selection, number keys, and direct shortcuts; the
+line-oriented commands remain available:
 
 - `/approve` — allow this invocation once.
-- `/approve-session` — remember the matching command or workspace-patch grant until WeCode exits.
+- `/approve-session` — remember the displayed command-arity, SSH-host, workspace-patch, or MCP-tool
+  rule until WeCode exits. Destructive and arbitrary-code commands remain exact-only.
 - `/deny [reason]` — reject it and return the reason to the model so it can choose a safer approach.
 - `Ctrl-C` — cancel the active run while leaving undelivered queue items intact.
 
@@ -629,10 +637,9 @@ Available policies are:
 - `never` — never prompt. The dangerous-command denylist still applies unless `--unsafe-local` is
   also selected.
 
-Override the policy with `--approval-policy`. Non-interactive JSONL runs never wait for a reviewer:
-an action that requires approval is returned to the model as denied. `wecode bench` defaults to
-`never` unless a policy is explicitly supplied, because benchmark workers are expected to provide
-their own container or VM isolation.
+Override the policy with `--approval-policy`. Non-interactive JSONL and benchmark runs never wait
+for a reviewer: an action that requires approval is returned to the model as denied. Use
+`--approval-policy never --unsafe-local` only inside an outer benchmark container or VM.
 
 ## Custom OpenAI-compatible gateways
 
@@ -661,10 +668,12 @@ workspace mutations.
 
 Available modes are:
 
-- `read-write` — reuse existing entries and save new responses.
+- `read-write` — reuse existing entries and save new responses. This is opt-in because tool results
+  and external state may change between otherwise identical requests.
 - `read-only` — deterministic replay without adding entries.
 - `refresh` — bypass reads and replace entries.
-- `off` — disable the exact-response cache for clean measurements.
+- `off` — disable the exact-response cache. This is the default for fresh configurations and clean
+  agent or benchmark runs.
 
 ```bash
 wecode cache stats
@@ -677,7 +686,7 @@ wecode run --cache-mode off -C /path/to/repository "Run a cold evaluation."
 A manifest is a JSONL file with one prepared workspace per record:
 
 ```json
-{"id":"task-001","task":"Fix the failing parser tests.","workspace":"/work/repo","verify":"cargo test","max_steps":40}
+{"id":"task-001","task":"Fix the failing parser tests.","workspace":"/work/repo","verify":"cargo test","max_steps":40,"required_tools":["read_file"],"forbidden_tools":[],"max_recoveries":1}
 ```
 
 Run the manifest sequentially:
@@ -707,7 +716,9 @@ printf '%s' "$SWE_TASK" | wecode run \
 
 JSONL and benchmark sinks intentionally use buffered model responses and emit no UI delta events,
 even when `streaming = true`. Benchmark runs do not create an interactive input queue. This keeps
-their prompts, trajectories, and execution deterministic and machine-readable.
+their prompts, trajectories, and execution deterministic and machine-readable. `bench` disables
+the exact-response cache and records pass/fail checks plus model-turn, tool-call, per-tool, recovery,
+loop-nudge, history-repair, and finish-attempt metrics.
 
 WeCode never resets or cleans a worktree. The benchmark harness is responsible for repository
 checkout, task isolation, and grading. See [docs/benchmarking.md](docs/benchmarking.md) for a

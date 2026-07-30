@@ -31,7 +31,9 @@ use crate::interaction::{
 };
 use crate::lsp::LspManager;
 use crate::mcp::McpManager;
-use crate::model::{ToolProfile, Usage, create_model, create_model_with_tools, tool_definitions};
+use crate::model::{
+    ToolProfile, Usage, create_model_with_profile, create_model_with_tools, tool_definitions,
+};
 use crate::prompt_context::{PromptContext, PromptContextOptions};
 use crate::review::{ReviewRequest, ReviewTarget, parse_review, review_prompt};
 use crate::session::ChatSession;
@@ -219,7 +221,7 @@ pub struct SessionsArgs {
 pub struct BenchArgs {
     #[command(flatten)]
     pub common: CommonArgs,
-    /// JSONL file with id, task, workspace, and optional verify fields.
+    /// JSONL tasks with optional verification and trajectory expectations.
     pub manifest: PathBuf,
     /// JSONL destination for task results.
     #[arg(long, default_value = "wecode-results.jsonl")]
@@ -325,7 +327,12 @@ async fn run_once(args: RunArgs) -> Result<()> {
     let files = load_attachments(&args.files, &workspace)?;
     let (task, images) = prepare_message(&task, files)?;
     let cache = ResponseCache::new(config.cache.clone())?;
-    let model = create_model(&config.model, config.api_key()?, cache)?;
+    let model = create_model_with_profile(
+        &config.model,
+        config.api_key()?,
+        cache,
+        ToolProfile::Interactive,
+    )?;
     let sink: Box<dyn EventSink> = match args.output {
         OutputMode::Human => Box::new(TerminalUi::new()),
         OutputMode::Jsonl => Box::new(JsonlSink::stdout()),
@@ -340,7 +347,8 @@ async fn run_once(args: RunArgs) -> Result<()> {
         } else {
             (None, None)
         };
-    let mut agent = Agent::new(config, model, sink, workspace);
+    let mut agent =
+        Agent::new_with_profile(config, model, sink, workspace, ToolProfile::Interactive);
     let cancellation = CancellationToken::new();
     let signal_task = spawn_cancellation_signal(cancellation.clone());
     let result = agent
@@ -677,11 +685,24 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 )?;
             }
             ChatInput::Command(ChatCommand::Compact(focus)) => {
-                let report = conversation.compact(
-                    config.agent.context_max_tokens,
-                    config.agent.context_keep_messages,
-                    focus.as_deref(),
-                );
+                if agent.is_none() {
+                    agent = match create_chat_agent(&config, &workspace, &mcp, &skills, &view) {
+                        Ok(agent) => Some(agent),
+                        Err(error) => {
+                            view.show_setup_required(&error)?;
+                            continue;
+                        }
+                    };
+                }
+                let report = agent
+                    .as_ref()
+                    .expect("chat agent initialized")
+                    .compact_conversation(
+                        &mut conversation,
+                        &session.summary().id,
+                        focus.as_deref(),
+                    )
+                    .await?;
                 match report {
                     Some(report) => {
                         session.save(&conversation)?;
@@ -1106,30 +1127,13 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 let mut contexts = std::mem::take(&mut pending_session_hook_context);
                 contexts.extend(prompt_contexts);
                 if agent.is_none() {
-                    let api_key = match config.api_key() {
-                        Ok(api_key) => api_key,
+                    agent = match create_chat_agent(&config, &workspace, &mcp, &skills, &view) {
+                        Ok(agent) => Some(agent),
                         Err(error) => {
                             view.show_setup_required(&error)?;
                             continue;
                         }
                     };
-                    let cache = ResponseCache::new(config.cache.clone())?;
-                    let model = create_model_with_tools(
-                        &config.model,
-                        api_key,
-                        cache,
-                        ToolProfile::Interactive,
-                        mcp.definitions(),
-                    )?;
-                    agent = Some(Agent::new_with_extensions(
-                        config.clone(),
-                        model,
-                        Box::new(TerminalUi::chat(view.output())),
-                        workspace.clone(),
-                        ToolProfile::Interactive,
-                        mcp.clone(),
-                        skills.clone(),
-                    ));
                 }
                 let Some((task, images)) = prepare_chat_message(
                     &task,
@@ -1278,6 +1282,32 @@ fn create_background_process_manager(
         let _ = event_view.show_process_event(&event);
     });
     manager
+}
+
+fn create_chat_agent(
+    config: &Config,
+    workspace: &Path,
+    mcp: &McpManager,
+    skills: &SkillCatalog,
+    view: &ChatView,
+) -> Result<Agent> {
+    let cache = ResponseCache::new(config.cache.clone())?;
+    let model = create_model_with_tools(
+        &config.model,
+        config.api_key()?,
+        cache,
+        ToolProfile::Interactive,
+        mcp.definitions(),
+    )?;
+    Ok(Agent::new_with_extensions(
+        config.clone(),
+        model,
+        Box::new(TerminalUi::chat(view.output())),
+        workspace.to_path_buf(),
+        ToolProfile::Interactive,
+        mcp.clone(),
+        skills.clone(),
+    ))
 }
 
 fn create_lsp_manager(config: &Config, workspace: &Path, view: &ChatView) -> Result<LspManager> {

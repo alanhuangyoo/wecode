@@ -46,6 +46,13 @@ pub struct ApprovalRequest {
     pub summary: String,
     pub detail: String,
     pub fingerprint: String,
+    pub session_scope: ApprovalScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalScope {
+    pub key: String,
+    pub label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +137,8 @@ impl ApprovalClient {
         detail: impl Into<String>,
         fingerprint: impl Into<String>,
     ) -> ApprovalRequest {
+        let detail = detail.into();
+        let fingerprint = fingerprint.into();
         ApprovalRequest {
             id: self
                 .inner
@@ -139,8 +148,9 @@ impl ApprovalClient {
             kind,
             risk,
             summary: summary.into(),
-            detail: detail.into(),
-            fingerprint: fingerprint.into(),
+            session_scope: session_scope(kind, risk, &fingerprint, &detail),
+            detail,
+            fingerprint,
         }
     }
 
@@ -150,11 +160,11 @@ impl ApprovalClient {
             .session_grants
             .lock()
             .expect("approval grants lock poisoned")
-            .contains(&request.fingerprint)
+            .contains(&request.session_scope.key)
         {
             return ApprovalDecision::AllowSession;
         }
-        let fingerprint = request.fingerprint.clone();
+        let session_scope = request.session_scope.key.clone();
         let (response, decision) = oneshot::channel();
         if self
             .inner
@@ -177,10 +187,166 @@ impl ApprovalClient {
                 .session_grants
                 .lock()
                 .expect("approval grants lock poisoned")
-                .insert(fingerprint);
+                .insert(session_scope);
         }
         decision
     }
+}
+
+fn session_scope(
+    kind: ApprovalKind,
+    risk: RiskLevel,
+    fingerprint: &str,
+    detail: &str,
+) -> ApprovalScope {
+    match kind {
+        ApprovalKind::Patch => ApprovalScope {
+            key: "patch:workspace".into(),
+            label: "all workspace patches".into(),
+        },
+        ApprovalKind::Mcp => ApprovalScope {
+            key: fingerprint.to_owned(),
+            label: format!("all calls to {}", fingerprint.trim_start_matches("mcp:")),
+        },
+        ApprovalKind::Shell => shell_session_scope(risk, fingerprint, detail),
+    }
+}
+
+fn shell_session_scope(risk: RiskLevel, fingerprint: &str, command: &str) -> ApprovalScope {
+    let namespace = fingerprint.split(':').next().unwrap_or("shell");
+    let tokens = match shell_words::split(command) {
+        Ok(tokens) if !tokens.is_empty() => tokens,
+        _ => return exact_scope(fingerprint, command),
+    };
+    let executable = executable_name(&tokens[0]);
+    let lowered = tokens
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if exact_only_command(&lowered, risk) {
+        return exact_scope(fingerprint, command);
+    }
+
+    if executable == "ssh"
+        && let Some(host) = ssh_host(&tokens)
+    {
+        return ApprovalScope {
+            key: format!("{namespace}:ssh:{host}"),
+            label: format!("`ssh {host} ...` for this session"),
+        };
+    }
+
+    let arity = command_arity(&tokens);
+    ApprovalScope {
+        key: format!("{namespace}:{}", arity.join("\u{1f}")),
+        label: format!("`{} ...` for this session", arity.join(" ")),
+    }
+}
+
+fn exact_scope(fingerprint: &str, command: &str) -> ApprovalScope {
+    let label = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    ApprovalScope {
+        key: fingerprint.to_owned(),
+        label: format!("only `{}`", truncate_scope_label(&label)),
+    }
+}
+
+fn executable_name(value: &str) -> String {
+    std::path::Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value)
+        .to_ascii_lowercase()
+}
+
+fn command_arity(tokens: &[String]) -> Vec<String> {
+    let mut normalized = tokens.to_vec();
+    normalized[0] = executable_name(&normalized[0]);
+    crate::bash_arity::prefix(&normalized)
+}
+
+fn ssh_host(tokens: &[String]) -> Option<&str> {
+    let mut skip_next = false;
+    for token in tokens.iter().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            token.as_str(),
+            "-b" | "-c"
+                | "-D"
+                | "-E"
+                | "-e"
+                | "-F"
+                | "-I"
+                | "-i"
+                | "-J"
+                | "-L"
+                | "-l"
+                | "-m"
+                | "-O"
+                | "-o"
+                | "-p"
+                | "-Q"
+                | "-R"
+                | "-S"
+                | "-W"
+                | "-w"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+fn exact_only_command(tokens: &[String], risk: RiskLevel) -> bool {
+    let first = tokens.first().map(String::as_str).unwrap_or_default();
+    let second = tokens.get(1).map(String::as_str).unwrap_or_default();
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            ";" | "&&" | "||" | "|" | "&" | ">" | ">>" | "2>" | "2>>"
+        )
+    }) || matches!(
+        first,
+        "sudo"
+            | "su"
+            | "rm"
+            | "kill"
+            | "pkill"
+            | "shutdown"
+            | "reboot"
+            | "chmod"
+            | "chown"
+            | "curl"
+            | "wget"
+            | "scp"
+            | "python"
+            | "python3"
+            | "node"
+            | "bash"
+            | "sh"
+            | "zsh"
+    ) || (first == "git" && matches!(second, "push" | "reset" | "clean"))
+        || matches!(second, "publish" | "install" | "uninstall")
+        || (risk == RiskLevel::Elevated && first != "ssh")
+}
+
+fn truncate_scope_label(value: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_owned();
+    }
+    let mut truncated = value.chars().take(MAX_CHARS - 1).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 pub fn classify_shell(command: &str) -> RiskLevel {
@@ -384,5 +550,57 @@ mod tests {
             ApprovalDecision::AllowSession
         );
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_grant_reuses_an_ssh_host_scope() {
+        let (client, mut requests) = ApprovalClient::channel();
+        let first = client.prepare(
+            ApprovalKind::Shell,
+            RiskLevel::Elevated,
+            "inspect host",
+            "ssh -o BatchMode=yes -o ConnectTimeout=8 5090-2 uptime",
+            "shell:ssh -o BatchMode=yes -o ConnectTimeout=8 5090-2 uptime",
+        );
+        assert_eq!(first.session_scope.key, "shell:ssh:5090-2");
+        assert!(first.session_scope.label.contains("ssh 5090-2"));
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(first).await }
+        });
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .resolve(ApprovalDecision::AllowSession);
+        assert_eq!(task.await.unwrap(), ApprovalDecision::AllowSession);
+
+        let second = client.prepare(
+            ApprovalKind::Shell,
+            RiskLevel::Elevated,
+            "inspect GPU",
+            "ssh 5090-2 nvidia-smi",
+            "shell:ssh 5090-2 nvidia-smi",
+        );
+        assert_eq!(client.request(second).await, ApprovalDecision::AllowSession);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn destructive_session_scope_stays_exact() {
+        let scope = shell_session_scope(
+            RiskLevel::Elevated,
+            "shell:git push origin main",
+            "git push origin main",
+        );
+        assert_eq!(scope.key, "shell:git push origin main");
+        assert!(scope.label.starts_with("only `git push"));
+
+        let compound = shell_session_scope(
+            RiskLevel::WorkspaceWrite,
+            "shell:echo ok && rm output",
+            "echo ok && rm output",
+        );
+        assert_eq!(compound.key, "shell:echo ok && rm output");
     }
 }

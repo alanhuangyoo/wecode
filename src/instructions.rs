@@ -4,11 +4,18 @@ use std::io::{Read, Take};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use directories::BaseDirs;
 use sha2::{Digest, Sha256};
 
 use crate::config::wecode_home_dir;
 
-const INSTRUCTION_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"];
+// Matches Codex's preferred local override, then falls back to common agent instruction files.
+const PROJECT_INSTRUCTION_NAMES: &[&str] = &[
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "CLAUDE.local.md",
+    "CLAUDE.md",
+];
 const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_BYTES: usize = 192 * 1024;
 
@@ -50,15 +57,29 @@ impl InstructionSet {
 }
 
 pub fn discover(workspace: &Path) -> Result<InstructionSet> {
-    discover_with_home(workspace, &wecode_home_dir())
+    let user_home = BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    discover_with_homes(workspace, &wecode_home_dir(), user_home.as_deref())
 }
 
+#[cfg(test)]
 fn discover_with_home(workspace: &Path, home: &Path) -> Result<InstructionSet> {
+    discover_with_homes(workspace, home, None)
+}
+
+fn discover_with_homes(
+    workspace: &Path,
+    wecode_home: &Path,
+    user_home: Option<&Path>,
+) -> Result<InstructionSet> {
     let mut candidates = Vec::new();
-    for name in INSTRUCTION_NAMES {
-        candidates.push(home.join(name));
+    if let Some(home) = user_home {
+        candidates.push(home.join(".config/opencode/AGENTS.md"));
+        candidates.push(home.join(".claude/CLAUDE.md"));
+        candidates.push(home.join(".claude/CLAUDE.local.md"));
+        candidates.push(home.join(".codex/AGENTS.md"));
     }
-    append_markdown_files(&home.join("rules"), &mut candidates)?;
+    append_first_instruction_file(wecode_home, &mut candidates);
+    append_markdown_files(&wecode_home.join("rules"), &mut candidates)?;
 
     let root = repository_root(workspace);
     let mut directories = workspace
@@ -69,9 +90,7 @@ fn discover_with_home(workspace: &Path, home: &Path) -> Result<InstructionSet> {
     directories.push(root.to_path_buf());
     directories.reverse();
     for directory in directories {
-        for name in INSTRUCTION_NAMES {
-            candidates.push(directory.join(name));
-        }
+        append_first_instruction_file(&directory, &mut candidates);
         append_markdown_files(&directory.join(".wecode/rules"), &mut candidates)?;
         append_markdown_files(&directory.join(".claude/rules"), &mut candidates)?;
     }
@@ -111,6 +130,16 @@ fn repository_root(workspace: &Path) -> &Path {
         .ancestors()
         .find(|directory| directory.join(".git").exists())
         .unwrap_or(workspace)
+}
+
+fn append_first_instruction_file(directory: &Path, candidates: &mut Vec<PathBuf>) {
+    if let Some(path) = PROJECT_INSTRUCTION_NAMES
+        .iter()
+        .map(|name| directory.join(name))
+        .find(|path| path.is_file())
+    {
+        candidates.push(path);
+    }
 }
 
 fn append_markdown_files(directory: &Path, candidates: &mut Vec<PathBuf>) -> Result<()> {
@@ -196,5 +225,48 @@ mod tests {
 
         assert_eq!(instructions.files[0].content.len(), MAX_FILE_BYTES);
         assert!(instructions.files[0].truncated);
+    }
+
+    #[test]
+    fn codex_override_wins_over_fallback_instruction_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("repo");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(workspace.join("AGENTS.override.md"), "override").unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "agents").unwrap();
+        std::fs::write(workspace.join("CLAUDE.md"), "claude").unwrap();
+
+        let instructions = discover_with_home(&workspace, &home).unwrap();
+
+        assert_eq!(instructions.files.len(), 1);
+        assert_eq!(instructions.files[0].content, "override");
+    }
+
+    #[test]
+    fn loads_compatible_global_instruction_files_before_wecode_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_home = temp.path().join("user");
+        let wecode_home = user_home.join(".wecode");
+        let workspace = temp.path().join("repo");
+        std::fs::create_dir_all(user_home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(user_home.join(".claude")).unwrap();
+        std::fs::create_dir_all(user_home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&wecode_home).unwrap();
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        std::fs::write(user_home.join(".config/opencode/AGENTS.md"), "opencode").unwrap();
+        std::fs::write(user_home.join(".claude/CLAUDE.md"), "claude").unwrap();
+        std::fs::write(user_home.join(".codex/AGENTS.md"), "codex").unwrap();
+        std::fs::write(wecode_home.join("AGENTS.md"), "wecode").unwrap();
+
+        let instructions = discover_with_homes(&workspace, &wecode_home, Some(&user_home)).unwrap();
+        let contents = instructions
+            .files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(contents, ["opencode", "claude", "codex", "wecode"]);
     }
 }

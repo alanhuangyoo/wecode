@@ -511,7 +511,7 @@ fn parse_skill(
 ) -> Result<(Skill, Vec<String>)> {
     let raw = read_bounded(path, max_file_bytes)?;
     let (frontmatter, _) = split_frontmatter(&raw)?;
-    let fields = parse_frontmatter_fields(frontmatter)?;
+    let fields = crate::frontmatter::parse_string_fields(frontmatter)?;
     let name = fields
         .get("name")
         .map(String::as_str)
@@ -575,88 +575,6 @@ fn split_frontmatter(raw: &str) -> Result<(&str, &str)> {
         }
     }
     bail!("skill frontmatter is missing its closing delimiter")
-}
-
-fn parse_frontmatter_fields(frontmatter: &str) -> Result<BTreeMap<String, String>> {
-    let lines = frontmatter.lines().collect::<Vec<_>>();
-    let mut fields = BTreeMap::new();
-    let mut index = 0_usize;
-    while index < lines.len() {
-        let line = lines[index];
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            index += 1;
-            continue;
-        }
-        if line.starts_with([' ', '\t']) {
-            index += 1;
-            continue;
-        }
-        let Some((key, raw_value)) = line.split_once(':') else {
-            index += 1;
-            continue;
-        };
-        let key = key.trim().to_ascii_lowercase();
-        let raw_value = raw_value.trim();
-        if matches!(raw_value, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
-            let folded = raw_value.starts_with('>');
-            let mut block = Vec::new();
-            index += 1;
-            while index < lines.len() {
-                let next = lines[index];
-                if !next.trim().is_empty() && !next.starts_with([' ', '\t']) {
-                    break;
-                }
-                block.push(next.trim_start().to_owned());
-                index += 1;
-            }
-            fields.insert(
-                key,
-                if folded {
-                    fold_yaml_block(&block)
-                } else {
-                    block.join("\n")
-                },
-            );
-            continue;
-        }
-        fields.insert(key, unquote_yaml_scalar(raw_value));
-        index += 1;
-    }
-    Ok(fields)
-}
-
-fn fold_yaml_block(lines: &[String]) -> String {
-    let mut output = String::new();
-    let mut prior_blank = false;
-    for line in lines {
-        if line.is_empty() {
-            output.push('\n');
-            prior_blank = true;
-        } else {
-            if !output.is_empty() && !prior_blank && !output.ends_with('\n') {
-                output.push(' ');
-            }
-            output.push_str(line);
-            prior_blank = false;
-        }
-    }
-    output
-}
-
-fn unquote_yaml_scalar(value: &str) -> String {
-    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        return serde_json::from_str::<String>(value)
-            .unwrap_or_else(|_| value[1..value.len() - 1].to_owned());
-    }
-    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-        return value[1..value.len() - 1].replace("''", "'");
-    }
-    value
-        .split_once(" #")
-        .map(|(value, _)| value)
-        .unwrap_or(value)
-        .trim()
-        .to_owned()
 }
 
 fn validate_name(name: &str) -> Result<()> {

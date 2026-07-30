@@ -151,7 +151,7 @@ struct SubagentSink {
 enum TaskOutcome {
     Finished {
         runtime: SubagentRuntime,
-        result: RunResult,
+        result: Box<RunResult>,
     },
     Error {
         runtime: Option<SubagentRuntime>,
@@ -594,7 +594,10 @@ Completion will be delivered automatically; continue non-overlapping work."
                 &mut runtime.conversation,
             );
             let outcome = match tokio::time::timeout(timeout, task).await {
-                Ok(Ok(result)) => TaskOutcome::Finished { runtime, result },
+                Ok(Ok(result)) => TaskOutcome::Finished {
+                    runtime,
+                    result: Box::new(result),
+                },
                 Ok(Err(error)) => TaskOutcome::Error {
                     runtime: Some(runtime),
                     message: format!("{error:#}"),
@@ -1100,6 +1103,7 @@ mod tests {
                 additional_actions: Vec::new(),
                 usage: Usage::default(),
                 cache_hit: false,
+                stop_reason: Default::default(),
             })
         }
     }

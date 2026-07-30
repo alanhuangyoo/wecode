@@ -109,7 +109,9 @@ impl Executor {
         #[cfg(windows)]
         let (program, args): (&str, &[&str]) = ("cmd", &["/D", "/S", "/C", shell_command]);
         #[cfg(not(windows))]
-        let (program, args): (&str, &[&str]) = ("/bin/sh", &["-lc", shell_command]);
+        let shell = user_shell();
+        #[cfg(not(windows))]
+        let (program, args): (&str, &[&str]) = (shell.as_str(), &["-lc", shell_command]);
         let mut command = Command::new(program);
         command.args(args).current_dir(&self.workspace);
         scrub_secret_environment(&mut command, self.extra_secret_env.as_deref());
@@ -172,6 +174,14 @@ impl Executor {
             truncated_bytes: stdout.omitted.saturating_add(stderr.omitted),
         })
     }
+}
+
+#[cfg(not(windows))]
+fn user_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|path| path.starts_with('/') && Path::new(path).is_file())
+        .unwrap_or_else(|| "/bin/sh".into())
 }
 
 pub(crate) fn scrub_secret_environment(command: &mut Command, extra_secret_env: Option<&str>) {

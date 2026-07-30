@@ -58,6 +58,7 @@ impl Model for FakeModel {
                 ..Default::default()
             },
             cache_hit: false,
+            stop_reason: Default::default(),
         })
     }
 }
@@ -79,6 +80,12 @@ struct CapturingModel {
 struct NativeCallCapturingModel {
     calls: AtomicUsize,
     requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    final_text: String,
+}
+
+struct ScriptedResponseModel {
+    requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    responses: Mutex<VecDeque<ModelResponse>>,
 }
 
 #[async_trait]
@@ -107,17 +114,36 @@ impl Model for NativeCallCapturingModel {
                 additional_actions: Vec::new(),
                 usage: Usage::default(),
                 cache_hit: false,
+                stop_reason: Default::default(),
             }
         } else {
             ModelResponse {
-                text: "Inspected tracked.txt successfully.".into(),
+                text: self.final_text.clone(),
                 tool_calls: Vec::new(),
                 action: None,
                 additional_actions: Vec::new(),
                 usage: Usage::default(),
                 cache_hit: false,
+                stop_reason: Default::default(),
             }
         })
+    }
+}
+
+#[async_trait]
+impl Model for ScriptedResponseModel {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+        _stream: Option<&dyn ModelStream>,
+    ) -> Result<ModelResponse> {
+        self.requests.lock().expect("request capture").push(request);
+        Ok(self
+            .responses
+            .lock()
+            .expect("fake model lock")
+            .pop_front()
+            .expect("fake model response"))
     }
 }
 
@@ -142,6 +168,7 @@ impl Model for CapturingModel {
             additional_actions: Vec::new(),
             usage: Usage::default(),
             cache_hit: false,
+            stop_reason: Default::default(),
         })
     }
 }
@@ -170,6 +197,7 @@ impl Model for NativeFakeModel {
                 ..Default::default()
             },
             cache_hit: false,
+            stop_reason: Default::default(),
         })
     }
 }
@@ -196,6 +224,7 @@ impl Model for BatchFakeModel {
             additional_actions: actions,
             usage: Usage::default(),
             cache_hit: false,
+            stop_reason: Default::default(),
         })
     }
 }
@@ -246,6 +275,7 @@ impl Model for GatedChildModel {
             additional_actions: Vec::new(),
             usage: Usage::default(),
             cache_hit: false,
+            stop_reason: Default::default(),
         })
     }
 }
@@ -284,6 +314,7 @@ impl Model for BackgroundParentModel {
             additional_actions: Vec::new(),
             usage: Usage::default(),
             cache_hit: false,
+            stop_reason: Default::default(),
         })
     }
 }
@@ -314,6 +345,7 @@ impl Model for SteeringGateModel {
             additional_actions: Vec::new(),
             usage: Usage::default(),
             cache_hit: false,
+            stop_reason: Default::default(),
         })
     }
 }
@@ -347,11 +379,19 @@ async fn completes_task_verifies_and_collects_untracked_patch() {
     let temp = tempfile::tempdir().unwrap();
     init_fixture(temp.path());
 
-    let model = FakeModel {
+    let model = NativeFakeModel {
         responses: Mutex::new(VecDeque::from([
-            r#"{"action":"shell","command":"printf hello > result.txt","description":"create result"}"#.into(),
-            r#"{"action":"shell","command":"test \"$(cat result.txt)\" = hello","description":"check result"}"#.into(),
-            r#"{"action":"finish","summary":"created and checked result.txt"}"#.into(),
+            Action::Shell {
+                command: "printf hello > result.txt".into(),
+                description: "create result".into(),
+            },
+            Action::Shell {
+                command: "test \"$(cat result.txt)\" = hello".into(),
+                description: "check result".into(),
+            },
+            Action::Finish {
+                summary: "created and checked result.txt".into(),
+            },
         ])),
     };
     let mut config = Config::default();
@@ -428,6 +468,101 @@ async fn native_tool_action_applies_codex_patch_and_finishes() {
     assert_eq!(result.steps, 2);
     assert!(result.patch.contains("native.txt"));
     assert!(result.patch.contains("+native tools work"));
+}
+
+#[tokio::test]
+async fn failed_final_verification_reopens_a_native_tool_loop() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedResponseModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            ModelResponse {
+                text: "The requested file is ready.".into(),
+                tool_calls: Vec::new(),
+                action: None,
+                additional_actions: Vec::new(),
+                usage: Usage::default(),
+                cache_hit: false,
+                stop_reason: Default::default(),
+            },
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![ModelToolCall {
+                    id: "call_create_result".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "printf hello > result.txt",
+                        "description": "create the requested file"
+                    }),
+                    action: Action::Shell {
+                        command: "printf hello > result.txt".into(),
+                        description: "create the requested file".into(),
+                    },
+                }],
+                action: None,
+                additional_actions: Vec::new(),
+                usage: Usage::default(),
+                cache_hit: false,
+                stop_reason: Default::default(),
+            },
+            ModelResponse {
+                text: "Created result.txt and verified its contents.".into(),
+                tool_calls: Vec::new(),
+                action: None,
+                additional_actions: Vec::new(),
+                usage: Usage::default(),
+                cache_hit: false,
+                stop_reason: Default::default(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent
+        .run(
+            "create result.txt",
+            RunOptions {
+                verify: Some("test \"$(cat result.txt)\" = hello".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.steps, 3);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("result.txt")).unwrap(),
+        "hello"
+    );
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("FINAL VERIFICATION FAILED"))
+    );
+    assert!(
+        requests[2]
+            .messages
+            .iter()
+            .any(
+                |message| message.tool_result.as_ref().is_some_and(|result| {
+                    result.call_id == "call_create_result" && result.name == "shell"
+                })
+            )
+    );
 }
 
 #[tokio::test]
@@ -554,11 +689,10 @@ async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
     )
     .unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let model = CapturingModel {
+    let model = NativeCallCapturingModel {
+        calls: AtomicUsize::new(1),
         requests: requests.clone(),
-        responses: Mutex::new(VecDeque::from([Action::Finish {
-            summary: "你好，有什么可以帮你？".into(),
-        }])),
+        final_text: "你好，有什么可以帮你？".into(),
     };
     let mut config = Config::default();
     config.model.model = "gpt-5.4-mini".into();
@@ -575,12 +709,23 @@ async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
     let result = agent.run("你好", RunOptions::default()).await.unwrap();
 
     assert_eq!(result.steps, 1);
+    assert_eq!(result.summary, "你好，有什么可以帮你？");
     let requests = requests.lock().unwrap();
-    assert!(requests[0].system.contains("Treat greetings"));
+    assert!(requests[0].system.contains("boundary of every request"));
     assert!(
         requests[0]
             .system
-            .contains("without scanning the repository")
+            .contains("Treat short requests as sufficient direction")
+    );
+    assert!(
+        requests[0]
+            .system
+            .contains("When uncertain, investigate to find the truth")
+    );
+    assert!(
+        requests[0]
+            .system
+            .contains("merely because a working directory exists")
     );
     assert!(
         requests[0]
@@ -612,7 +757,7 @@ async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        wecode::tool_registry::INTERACTIVE_CORE_TOOLS
+        wecode::tool_registry::AUTONOMOUS_CORE_TOOLS
     );
     assert!(
         !requests[0]
@@ -632,6 +777,7 @@ async fn interactive_native_tool_result_keeps_the_provider_call_id() {
     let model = NativeCallCapturingModel {
         calls: AtomicUsize::new(0),
         requests: requests.clone(),
+        final_text: "Inspected tracked.txt successfully.".into(),
     };
     let mut config = Config::default();
     config.agent.trajectory_directory = temp.path().join("trajectories");
@@ -665,6 +811,107 @@ async fn interactive_native_tool_result_keeps_the_provider_call_id() {
     assert_eq!(assistant_call.id, "call_read_1");
     assert_eq!(tool_result.call_id, assistant_call.id);
     assert_eq!(tool_result.name, "read_file");
+}
+
+#[tokio::test]
+async fn native_mixed_parallel_batch_preserves_order_without_protocol_repair() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let sink = CapturingSink::default();
+    let events = sink.events.clone();
+    let model = ScriptedResponseModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            ModelResponse {
+                text: String::new(),
+                tool_calls: vec![
+                    ModelToolCall {
+                        id: "call_list_1".into(),
+                        name: "list_files".into(),
+                        arguments: serde_json::json!({"path": ".", "depth": 1}),
+                        action: Action::ListFiles {
+                            path: ".".into(),
+                            depth: Some(1),
+                            limit: None,
+                        },
+                    },
+                    ModelToolCall {
+                        id: "call_shell_2".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({
+                            "command": "printf runtime-ok",
+                            "description": "inspect runtime"
+                        }),
+                        action: Action::Shell {
+                            command: "printf runtime-ok".into(),
+                            description: "inspect runtime".into(),
+                        },
+                    },
+                ],
+                action: None,
+                additional_actions: Vec::new(),
+                usage: Usage::default(),
+                cache_hit: false,
+                stop_reason: Default::default(),
+            },
+            ModelResponse {
+                text: "Inspection complete.".into(),
+                tool_calls: Vec::new(),
+                action: None,
+                additional_actions: Vec::new(),
+                usage: Usage::default(),
+                cache_hit: false,
+                stop_reason: Default::default(),
+            },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(sink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent
+        .run("inspect independent local facts", RunOptions::default())
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.steps, 2);
+    assert_eq!(result.harness.history_repairs, 0);
+    let requests = requests.lock().unwrap();
+    let results = requests[1]
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_result.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["call_list_1", "call_shell_2"]
+    );
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .filter(|message| message.tool_result.is_some())
+            .any(|message| message.content.contains("runtime-ok"))
+    );
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, Event::ToolProtocolRepaired { .. }))
+    );
 }
 
 #[tokio::test]
@@ -726,6 +973,14 @@ async fn interactive_question_waits_for_and_returns_the_user_choice() {
 
     assert!(result.success);
     let requests = requests.lock().unwrap();
+    assert!(
+        requests[0]
+            .enabled_tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "request_user_input")
+    );
     assert!(
         requests[1]
             .messages
@@ -888,6 +1143,55 @@ async fn independent_read_tools_share_one_parallel_model_step() {
         })
         .collect::<Vec<_>>();
     assert_eq!(actions, ["read_file", "grep"]);
+}
+
+#[tokio::test]
+async fn independent_shell_tools_share_one_parallel_model_step() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = BatchFakeModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            vec![
+                Action::Shell {
+                    command: "printf shell-alpha".into(),
+                    description: "first probe".into(),
+                },
+                Action::Shell {
+                    command: "printf shell-beta".into(),
+                    description: "second probe".into(),
+                },
+            ],
+            vec![Action::Finish {
+                summary: "parallel shell inspection complete".into(),
+            }],
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+    );
+
+    let result = agent
+        .run("run two independent probes", RunOptions::default())
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.steps, 2);
+    assert_eq!(result.harness.tool_counts.get("shell"), Some(&2));
+    let requests = requests.lock().unwrap();
+    let observation = &requests[1].messages.last().unwrap().content;
+    assert!(observation.contains("TOOL RESULT 1/2 [shell"));
+    assert!(observation.contains("shell-alpha"));
+    assert!(observation.contains("TOOL RESULT 2/2 [shell"));
+    assert!(observation.contains("shell-beta"));
 }
 
 #[tokio::test]
@@ -1625,6 +1929,88 @@ async fn interactive_plain_text_is_a_smooth_final_response() {
     assert!(result.success);
     assert_eq!(result.steps, 1);
     assert_eq!(result.summary, "The review is complete.");
+}
+
+#[tokio::test]
+async fn automatic_compaction_uses_a_tool_free_model_checkpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let response = |text: &str| ModelResponse {
+        text: text.into(),
+        tool_calls: Vec::new(),
+        action: None,
+        additional_actions: Vec::new(),
+        usage: Usage::default(),
+        cache_hit: false,
+        stop_reason: Default::default(),
+    };
+    let model = ScriptedResponseModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            response("## Goal\nContinue the parser work\n\n## Next Steps\n1. Finish the parser"),
+            response("Compaction preserved the work."),
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.context_max_tokens = 1;
+    config.agent.context_keep_messages = 4;
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+    let history = (0..12)
+        .flat_map(|index| {
+            [
+                serde_json::json!({"role": "assistant", "content": format!("analysis {index}")}),
+                serde_json::json!({"role": "user", "content": format!("result {index}")}),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut messages = vec![serde_json::json!({"role": "user", "content": "original task"})];
+    messages.extend(history);
+    let mut conversation: Conversation =
+        serde_json::from_value(serde_json::json!({"messages": messages})).unwrap();
+
+    let result = agent
+        .run_in_conversation(
+            "continue",
+            RunOptions {
+                session_id: Some("compaction-test".into()),
+                ..RunOptions::default()
+            },
+            &mut conversation,
+        )
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.harness.compactions, 1);
+    assert_eq!(result.harness.model_turns, 2);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0]
+            .enabled_tools
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+    );
+    assert!(
+        requests[0]
+            .system
+            .contains("context summarization assistant")
+    );
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.starts_with("[wecode-context-summary-v2]"))
+    );
 }
 
 #[tokio::test]

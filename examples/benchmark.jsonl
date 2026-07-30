@@ -1,2 +1,1 @@
-{"id":"example-fix","task":"Fix the failing unit test without changing its assertion.","workspace":"../fixture","verify":"cargo test","max_steps":30}
-
+{"id":"inspect-harness","task":"Read src/harness.rs and summarize the responsibilities of TurnDecoder. Do not modify files.","workspace":"..","max_steps":8,"required_tools":["read_file"],"forbidden_tools":["patch"],"max_recoveries":0}

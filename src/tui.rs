@@ -18,11 +18,15 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
+};
 use tokio::sync::mpsc as tokio_mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::chat::{ChatInput, parse_input};
+use crate::chat::{ChatCommand, ChatInput, parse_input};
+use crate::viewport::ViewportState;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommandCompletion {
@@ -88,8 +92,35 @@ pub(crate) enum TuiMessage {
         title: Option<String>,
         placeholder: Option<String>,
     },
+    Approval(Option<ApprovalPrompt>),
     Attachments(Vec<String>),
     Files(Vec<String>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ApprovalPrompt {
+    pub action: String,
+    pub risk: String,
+    pub detail: String,
+    pub session_scope: String,
+    selected: usize,
+}
+
+impl ApprovalPrompt {
+    pub(crate) fn new(
+        action: impl Into<String>,
+        risk: impl Into<String>,
+        detail: impl Into<String>,
+        session_scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            action: action.into(),
+            risk: risk.into(),
+            detail: detail.into(),
+            session_scope: session_scope.into(),
+            selected: 0,
+        }
+    }
 }
 
 impl TuiHandle {
@@ -174,6 +205,10 @@ impl TuiHandle {
         let _ = self
             .sender
             .send(TuiMessage::Composer { title, placeholder });
+    }
+
+    pub(crate) fn set_approval(&self, approval: Option<ApprovalPrompt>) {
+        let _ = self.sender.send(TuiMessage::Approval(approval));
     }
 
     pub fn set_attachments(&self, attachments: Vec<String>) {
@@ -269,11 +304,11 @@ pub(crate) fn run(
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    state.scroll = state.scroll.saturating_add(3);
+                    state.scroll_up(3);
                     redraw = true;
                 }
                 MouseEventKind::ScrollDown => {
-                    state.scroll = state.scroll.saturating_sub(3);
+                    state.scroll_down(3);
                     redraw = true;
                 }
                 _ => {}
@@ -320,11 +355,12 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
                 state.transcript.clear();
                 state.live_response = None;
                 state.metrics = None;
-                state.scroll = 0;
+                state.scroll_to_bottom();
                 state.status = None;
                 state.plan = None;
                 state.composer_title = None;
                 state.composer_placeholder = None;
+                state.approval = None;
                 state.attachments.clear();
                 changed = true;
             }
@@ -380,7 +416,6 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
                         kind: TranscriptKind::Agent,
                         text: response.text.trim().to_owned(),
                     });
-                    state.scroll = 0;
                 }
                 changed = true;
             }
@@ -391,6 +426,10 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
             Ok(TuiMessage::Composer { title, placeholder }) => {
                 state.composer_title = title;
                 state.composer_placeholder = placeholder;
+                changed = true;
+            }
+            Ok(TuiMessage::Approval(approval)) => {
+                state.approval = approval;
                 changed = true;
             }
             Ok(TuiMessage::Attachments(attachments)) => {
@@ -489,6 +528,7 @@ struct LiveResponse {
 }
 
 struct TuiState {
+    approval: Option<ApprovalPrompt>,
     attachments: Vec<String>,
     composer: Composer,
     composer_placeholder: Option<String>,
@@ -504,7 +544,7 @@ struct TuiState {
     metrics: Option<String>,
     models: Vec<String>,
     plan: Option<Vec<String>>,
-    scroll: u16,
+    viewport: ViewportState,
     status: Option<String>,
     tick: usize,
     transcript: Vec<TranscriptEntry>,
@@ -514,6 +554,7 @@ struct TuiState {
 impl TuiState {
     fn new(history: Vec<String>, completions: Vec<CommandCompletion>) -> Self {
         Self {
+            approval: None,
             attachments: Vec::new(),
             composer: Composer::default(),
             composer_placeholder: None,
@@ -529,7 +570,7 @@ impl TuiState {
             metrics: None,
             models: Vec::new(),
             plan: None,
-            scroll: 0,
+            viewport: ViewportState::default(),
             status: None,
             tick: 0,
             transcript: Vec::new(),
@@ -546,7 +587,6 @@ impl TuiState {
             kind: TranscriptKind::Agent,
             text: clean,
         });
-        self.scroll = 0;
     }
 
     fn append_user(&mut self, message: &str) {
@@ -554,7 +594,7 @@ impl TuiState {
             kind: TranscriptKind::User,
             text: message.trim().to_owned(),
         });
-        self.scroll = 0;
+        self.scroll_to_bottom();
     }
 
     fn append_entry(&mut self, label: String, text: String, tone: TuiTone) {
@@ -562,7 +602,6 @@ impl TuiState {
             kind: TranscriptKind::Custom { label, tone },
             text: strip_ansi_codes(&text).trim().to_owned(),
         });
-        self.scroll = 0;
     }
 
     fn append_tool(&mut self, step: usize, label: String, text: String, tone: TuiTone) {
@@ -575,7 +614,6 @@ impl TuiState {
             },
             text: strip_ansi_codes(&text).trim().to_owned(),
         });
-        self.scroll = 0;
     }
 
     fn finish_tool(&mut self, step: usize, text: String, tone: TuiTone) {
@@ -595,7 +633,22 @@ impl TuiState {
         } else {
             self.append_entry("TOOL".into(), text, tone);
         }
-        self.scroll = 0;
+    }
+
+    fn scroll_up(&mut self, amount: u16) {
+        self.viewport.scroll_up(amount);
+    }
+
+    fn scroll_down(&mut self, amount: u16) {
+        self.viewport.scroll_down(amount);
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.viewport.goto_top();
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.viewport.goto_bottom();
     }
 
     fn is_shell_mode(&self) -> bool {
@@ -603,6 +656,9 @@ impl TuiState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> KeyOutcome {
+        if self.approval.is_some() {
+            return self.handle_approval_key(key);
+        }
         let modifiers = key.modifiers;
         if modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -634,7 +690,7 @@ impl TuiState {
                 }
                 KeyCode::Char('l') => {
                     self.transcript.clear();
-                    self.scroll = 0;
+                    self.scroll_to_bottom();
                     return KeyOutcome::changed();
                 }
                 _ => {}
@@ -701,6 +757,14 @@ impl TuiState {
                 }
                 KeyOutcome::changed()
             }
+            KeyCode::Home if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_to_top();
+                KeyOutcome::changed()
+            }
+            KeyCode::End if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_to_bottom();
+                KeyOutcome::changed()
+            }
             KeyCode::Home => {
                 self.composer.home();
                 KeyOutcome::changed()
@@ -726,6 +790,14 @@ impl TuiState {
                     KeyOutcome::unchanged()
                 }
             }
+            KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll_up(3);
+                KeyOutcome::changed()
+            }
+            KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll_down(3);
+                KeyOutcome::changed()
+            }
             KeyCode::Up if self.active_completion_count() > 0 => {
                 let count = self.active_completion_count();
                 self.completion_selected =
@@ -746,11 +818,11 @@ impl TuiState {
                 KeyOutcome::changed()
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_add(8);
+                self.scroll_up(self.viewport.page_scroll_rows());
                 KeyOutcome::changed()
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(8);
+                self.scroll_down(self.viewport.page_scroll_rows());
                 KeyOutcome::changed()
             }
             KeyCode::Esc => {
@@ -759,6 +831,41 @@ impl TuiState {
             }
             _ => KeyOutcome::unchanged(),
         }
+    }
+
+    fn handle_approval_key(&mut self, key: KeyEvent) -> KeyOutcome {
+        let selected = self
+            .approval
+            .as_ref()
+            .map(|approval| approval.selected)
+            .unwrap_or_default();
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(approval) = &mut self.approval {
+                    approval.selected = approval.selected.checked_sub(1).unwrap_or(2);
+                }
+                KeyOutcome::changed()
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(approval) = &mut self.approval {
+                    approval.selected = (approval.selected + 1) % 3;
+                }
+                KeyOutcome::changed()
+            }
+            KeyCode::Enter => self.resolve_approval(selected),
+            KeyCode::Char('1' | 'y' | 'Y') => self.resolve_approval(0),
+            KeyCode::Char('2' | 's' | 'S' | 'a' | 'A') => self.resolve_approval(1),
+            KeyCode::Char('3' | 'n' | 'N') | KeyCode::Esc => self.resolve_approval(2),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.resolve_approval(2)
+            }
+            _ => KeyOutcome::unchanged(),
+        }
+    }
+
+    fn resolve_approval(&mut self, selected: usize) -> KeyOutcome {
+        self.approval = None;
+        approval_input(selected)
     }
 
     fn recall_history(&mut self, older: bool) {
@@ -1207,6 +1314,104 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     }
     draw_composer(frame, chunks[index], state);
     draw_footer(frame, chunks[index + 1], state);
+    if state.approval.is_some() {
+        draw_approval(frame, area, state);
+    }
+}
+
+fn draw_approval(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(approval) = &state.approval else {
+        return;
+    };
+    let width = area.width.saturating_sub(4).clamp(36, 88);
+    let height = area.height.saturating_sub(2).clamp(12, 18);
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+
+    let options = [
+        ("Allow once", "Run only this action"),
+        ("Allow for session", approval.session_scope.as_str()),
+        ("Deny", "Return the denial to the agent"),
+    ];
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            format!("{} · {} risk", approval.action, approval.risk),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+    ];
+    for detail in approval.detail.lines().take(4) {
+        lines.push(Line::from(Span::styled(
+            truncate(detail, width.saturating_sub(6) as usize),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    lines.push(Line::from(""));
+    for (index, (label, description)) in options.iter().enumerate() {
+        let selected = approval.selected == index;
+        let color = if selected { Color::Cyan } else { Color::Gray };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}. {label}", index + 1),
+                Style::default().fg(color).add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::styled(
+                format!(
+                    " · {}",
+                    truncate(description, width.saturating_sub(30) as usize)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓ select · Enter confirm · Esc deny",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(Span::styled(
+                    " Permission required ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .padding(Padding::horizontal(1)),
+        ),
+        popup,
+    );
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width.min(area.width),
+        height.min(area.height),
+    )
+}
+
+fn approval_input(selected: usize) -> KeyOutcome {
+    let command = match selected {
+        0 => ChatCommand::Approve,
+        1 => ChatCommand::ApproveSession,
+        _ => ChatCommand::Deny("denied by user".into()),
+    };
+    KeyOutcome::input(ChatInput::Command(command))
 }
 
 fn draw_attachments(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
@@ -1378,7 +1583,7 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
 
 fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
     let width = area.width.saturating_sub(4).max(1) as usize;
-    let mut lines = Vec::new();
+    let mut lines = Vec::<Line<'static>>::new();
     if state.transcript.is_empty() && state.live_response.is_none() {
         render_empty_state(&mut lines, state, width, area.height);
     } else {
@@ -1423,22 +1628,28 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    label,
+                    label.to_owned(),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
             ]));
+            if matches!(entry.kind, TranscriptKind::Agent) {
+                render_markdown(&mut lines, &entry.text, width);
+                continue;
+            }
             let raw_lines = entry.text.lines().collect::<Vec<_>>();
             let limit = transcript_line_limit(&entry.kind);
             for raw in raw_lines.iter().take(limit).copied() {
                 let style = match &entry.kind {
                     TranscriptKind::Custom { label, .. } if label == "DIFF" => diff_line_style(raw),
-                    TranscriptKind::Agent => markdown_line_style(raw),
                     TranscriptKind::User => Style::default().fg(Color::White),
                     TranscriptKind::Custom {
                         tone: TuiTone::Dim, ..
                     } => Style::default().fg(Color::Gray),
                     TranscriptKind::Tool { .. } => {
                         unreachable!("tool entries render separately")
+                    }
+                    TranscriptKind::Agent => {
+                        unreachable!("agent entries render through the markdown renderer")
                     }
                     _ => Style::default(),
                 };
@@ -1458,20 +1669,26 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
         }
     }
 
-    let visible = area.height.saturating_sub(1);
-    let content_height = lines.len().min(u16::MAX as usize) as u16;
-    let max_scroll = content_height.saturating_sub(visible);
-    let offset = max_scroll.saturating_sub(state.scroll.min(max_scroll));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((offset, 0))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let content_height = paragraph.line_count(area.width);
+    state.viewport.update_layout(content_height, area.height);
+    let scroll = state.viewport.offset().min(u16::MAX as usize) as u16;
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
+    if state.viewport.max_scroll_offset() > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_style(Style::default().fg(Color::DarkGray))
+            .thumb_style(Style::default().fg(Color::Cyan));
+        let mut scrollbar_state = ScrollbarState::new(content_height)
+            .position(state.viewport.offset())
+            .viewport_content_length(area.height as usize);
+        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+    }
 }
 
-fn render_tool_entry<'a>(
-    lines: &mut Vec<Line<'a>>,
+fn render_tool_entry(
+    lines: &mut Vec<Line<'static>>,
     label: &str,
     detail: &str,
     tone: TuiTone,
@@ -1592,12 +1809,7 @@ fn tone_color(tone: TuiTone) -> Color {
     }
 }
 
-fn render_empty_state<'a>(
-    lines: &mut Vec<Line<'a>>,
-    state: &'a TuiState,
-    width: usize,
-    height: u16,
-) {
+fn render_empty_state(lines: &mut Vec<Line<'static>>, state: &TuiState, width: usize, height: u16) {
     let top_padding = height.saturating_sub(14) / 3;
     lines.extend((0..top_padding).map(|_| Line::from("")));
     lines.push(centered_line(
@@ -1658,9 +1870,16 @@ fn centered_line(value: &str, width: usize, style: Style) -> Line<'static> {
     Line::from(vec![Span::raw(padding), Span::styled(value, style)])
 }
 
-fn render_live_response<'a>(
-    lines: &mut Vec<Line<'a>>,
-    response: &'a LiveResponse,
+fn render_markdown(lines: &mut Vec<Line<'static>>, markdown: &str, _width: usize) {
+    for mut source in crate::markdown_render::render_markdown_text(markdown).lines {
+        source.spans.insert(0, Span::raw("    "));
+        lines.push(source);
+    }
+}
+
+fn render_live_response(
+    lines: &mut Vec<Line<'static>>,
+    response: &LiveResponse,
     tick: usize,
     width: usize,
 ) {
@@ -1711,24 +1930,26 @@ fn render_live_response<'a>(
         )));
         return;
     }
-    for raw in visible
+    let recent = visible
         .lines()
         .rev()
         .take(12)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-    {
-        for line in wrap_plain(raw, width) {
-            lines.push(Line::from(Span::styled(
-                format!("    {line}"),
-                if response.text.is_empty() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    markdown_line_style(raw)
-                },
-            )));
+        .collect::<Vec<_>>()
+        .join("\n");
+    if response.text.is_empty() {
+        for raw in recent.lines() {
+            for line in wrap_plain(raw, width) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {line}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
+    } else {
+        render_markdown(lines, &recent, width);
     }
 }
 
@@ -1760,23 +1981,6 @@ fn tool_marker(label: &str) -> &'static str {
         "!"
     } else {
         "•"
-    }
-}
-
-fn markdown_line_style(line: &str) -> Style {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if trimmed.starts_with("```") {
-        Style::default().fg(Color::Magenta)
-    } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-        Style::default().fg(Color::White)
-    } else if trimmed.starts_with('>') {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default()
     }
 }
 
@@ -2158,6 +2362,16 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn composer_edits_unicode_by_character() {
         let mut composer = Composer::default();
@@ -2188,6 +2402,90 @@ mod tests {
     #[test]
     fn output_is_wrapped_without_losing_blank_lines() {
         assert_eq!(wrap_plain("abcd\n\nxy", 2), ["ab", "cd", "", "xy"]);
+    }
+
+    #[test]
+    fn assistant_markdown_renders_structure_and_inline_styles() {
+        let mut lines = Vec::new();
+        render_markdown(
+            &mut lines,
+            "### GPU\n- 型号：**NVIDIA RTX 5090**\n- 驱动：`595.71.05`\n\n1. **检查进程**",
+            80,
+        );
+
+        let visible = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(visible.contains("GPU"));
+        assert!(visible.contains("NVIDIA RTX 5090"));
+        assert!(visible.contains("595.71.05"));
+        assert!(visible.contains("1. 检查进程"));
+        assert!(!visible.contains("**"));
+        assert!(!visible.contains('`'));
+
+        let heading = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("GPU")))
+            .expect("heading line");
+        let strong = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("NVIDIA RTX 5090"))
+            .expect("strong span");
+        assert!(strong.style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            heading
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        let code = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("595.71.05"))
+            .expect("inline code span");
+        assert!(code.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn transcript_scrolls_by_rendered_rows_and_preserves_history_position() {
+        let backend = TestBackend::new(60, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        let body = std::iter::once("START".to_owned())
+            .chain((0..30).map(|index| {
+                format!("- row {index}: **a long markdown value that wraps across the viewport**")
+            }))
+            .chain(std::iter::once("TAIL".to_owned()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.append_output(&body);
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        assert!(state.viewport.max_scroll_offset() > 0);
+        assert_eq!(state.viewport.offset(), state.viewport.max_scroll_offset());
+        assert!(state.viewport.is_follow_mode());
+        let bottom = terminal_text(&terminal);
+        assert!(bottom.contains("TAIL"), "rendered bottom: {bottom:?}");
+
+        state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        assert_eq!(state.viewport.offset(), 0);
+        assert!(!state.viewport.is_follow_mode());
+        assert!(terminal_text(&terminal).contains("START"));
+
+        state.append_entry("NOTICE".into(), "new output".into(), TuiTone::Dim);
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        assert_eq!(state.viewport.offset(), 0);
+        assert!(!state.viewport.is_follow_mode());
+
+        state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        assert_eq!(state.viewport.offset(), state.viewport.max_scroll_offset());
+        assert!(state.viewport.is_follow_mode());
+        assert!(terminal_text(&terminal).contains("new output"));
     }
 
     #[test]
@@ -2482,6 +2780,37 @@ mod tests {
         assert!(rendered.contains("Answer WeCode"));
         assert!(rendered.contains("another answer"));
         assert!(rendered.contains("cancel task"));
+    }
+
+    #[test]
+    fn approval_overlay_selects_session_scope_without_text_commands() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.approval = Some(ApprovalPrompt::new(
+            "Run shell command",
+            "elevated",
+            "ssh 5090-2 nvidia-smi",
+            "`ssh 5090-2 ...` for this session",
+        ));
+        let moved = state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(moved.changed);
+        let selected = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            selected.input,
+            Some(ChatInput::Command(ChatCommand::ApproveSession))
+        );
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("Permission required"));
+        assert!(!rendered.contains("Allow for session"));
     }
 
     #[test]

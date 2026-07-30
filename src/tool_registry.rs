@@ -13,6 +13,14 @@ pub const INTERACTIVE_CORE_TOOLS: &[&str] = &[
     "request_user_input",
     "search_tools",
 ];
+pub const AUTONOMOUS_CORE_TOOLS: &[&str] = &[
+    "read_file",
+    "list_files",
+    "glob",
+    "grep",
+    "shell",
+    "apply_patch",
+];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolProfile {
@@ -26,6 +34,7 @@ pub enum ToolProfile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolConcurrency {
     ParallelRead,
+    ParallelShell,
     ParallelSpawn,
     Exclusive,
     Terminal,
@@ -87,8 +96,8 @@ impl ToolRegistry {
             | Action::ListFiles { .. }
             | Action::Glob { .. }
             | Action::Grep { .. } => ToolConcurrency::ParallelRead,
-            Action::Shell { .. }
-            | Action::Patch { .. }
+            Action::Shell { .. } => ToolConcurrency::ParallelShell,
+            Action::Patch { .. }
             | Action::UpdatePlan { .. }
             | Action::RequestUserInput { .. }
             | Action::SearchTools { .. }
@@ -120,19 +129,17 @@ impl ToolRegistry {
                 actions.len()
             );
         }
-        if actions.len() > 1 {
-            let concurrency = Self::concurrency(&actions[0]);
-            if !matches!(
-                concurrency,
-                ToolConcurrency::ParallelRead | ToolConcurrency::ParallelSpawn
-            ) || !actions
-                .iter()
-                .all(|action| Self::concurrency(action) == concurrency)
-            {
-                bail!(
-                    "only independent repository reads or background spawn_agent calls may be batched; other tools must run one at a time"
-                );
-            }
+        if actions.len() > 1
+            && actions.iter().any(|action| {
+                matches!(
+                    Self::concurrency(action),
+                    ToolConcurrency::Exclusive | ToolConcurrency::Terminal
+                )
+            })
+        {
+            bail!(
+                "a sequential tool was combined with other calls; sequential tools must be issued in their own model turn"
+            );
         }
         Ok(())
     }
@@ -339,7 +346,7 @@ fn interactive_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "search_tools",
-            "description": "Search deferred WeCode and MCP capabilities. Use this when a task needs a tool that is not currently loaded, such as LSP, skills, background processes, subagents, web, images, or an external integration. Matching tools become callable on the next turn.",
+            "description": "Search deferred WeCode and MCP capabilities only when the currently loaded file and shell tools cannot perform the task, such as for LSP, skills, background processes, subagents, web, images, or an external integration. Matching tools become callable on the next turn.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -654,11 +661,11 @@ fn builtin_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "shell",
-            "description": "Run one non-interactive shell command in the repository workspace.",
+            "description": "Execute a shell command on the user's computer from the current working directory. Use it for terminal, system, git, build, test, and remote operations. Returns stdout and stderr.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The shell command to execute."},
+                    "command": {"type": "string", "description": "The command to execute with the user's shell."},
                     "description": {"type": "string", "description": "A short description of the intent."}
                 },
                 "required": ["command"],
@@ -741,7 +748,20 @@ mod tests {
                     limit: None,
                 },
             ])
-            .is_err()
+            .is_ok()
+        );
+        assert!(
+            ToolRegistry::validate_batch(&[
+                Action::Shell {
+                    command: "pwd".into(),
+                    description: String::new(),
+                },
+                Action::Shell {
+                    command: "uname -a".into(),
+                    description: String::new(),
+                },
+            ])
+            .is_ok()
         );
     }
 
@@ -787,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn only_background_subagent_spawns_may_be_batched() {
+    fn parallel_tools_can_be_mixed_but_sequential_tools_cannot() {
         let background = |description: &str| Action::SpawnAgent {
             description: description.into(),
             prompt: "Inspect the repository.".into(),
@@ -814,7 +834,7 @@ mod tests {
                     limit: None,
                 },
             ])
-            .is_err()
+            .is_ok()
         );
     }
 

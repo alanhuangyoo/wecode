@@ -6,8 +6,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::agent::{Agent, RunOptions, RunResult};
 use crate::cache::ResponseCache;
-use crate::config::Config;
-use crate::model::create_model;
+use crate::config::{CacheMode, Config};
+use crate::model::{ToolProfile, create_model_with_profile};
 use crate::ui::TerminalUi;
 
 #[derive(Clone, Debug)]
@@ -26,6 +26,19 @@ pub struct BenchTask {
     pub workspace: Option<PathBuf>,
     pub verify: Option<String>,
     pub max_steps: Option<usize>,
+    #[serde(default)]
+    pub required_tools: Vec<String>,
+    #[serde(default)]
+    pub forbidden_tools: Vec<String>,
+    pub max_recoveries: Option<usize>,
+    pub expected_success: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BenchCheck {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,8 +46,10 @@ pub struct BenchTask {
 enum BenchRecord {
     Completed {
         id: String,
+        passed: bool,
+        checks: Vec<BenchCheck>,
         #[serde(flatten)]
-        result: RunResult,
+        result: Box<RunResult>,
     },
     Error {
         id: String,
@@ -67,24 +82,41 @@ pub async fn run_manifest(options: BenchOptions) -> Result<()> {
         if let Some(max_steps) = task.max_steps {
             config.agent.max_steps = max_steps;
         }
+        config.cache.mode = CacheMode::Off;
         let cache = ResponseCache::new(config.cache.clone())?;
-        let model = create_model(&config.model, config.api_key()?, cache)?;
-        let mut agent = Agent::new(config, model, Box::new(TerminalUi::benchmark()), workspace);
+        let model = create_model_with_profile(
+            &config.model,
+            config.api_key()?,
+            cache,
+            ToolProfile::Interactive,
+        )?;
+        let mut agent = Agent::new_with_profile(
+            config,
+            model,
+            Box::new(TerminalUi::benchmark()),
+            workspace,
+            ToolProfile::Interactive,
+        );
         let record = match agent
             .run(
                 &task.task,
                 RunOptions {
-                    verify: task.verify,
+                    verify: task.verify.clone(),
                     task_id: Some(task.id.clone()),
                     ..Default::default()
                 },
             )
             .await
         {
-            Ok(result) => BenchRecord::Completed {
-                id: task.id,
-                result,
-            },
+            Ok(result) => {
+                let checks = evaluate(&task, &result);
+                BenchRecord::Completed {
+                    id: task.id,
+                    passed: checks.iter().all(|check| check.passed),
+                    checks,
+                    result: Box::new(result),
+                }
+            }
             Err(error) => {
                 let record = BenchRecord::Error {
                     id: task.id,
@@ -104,6 +136,56 @@ pub async fn run_manifest(options: BenchOptions) -> Result<()> {
     }
     output.flush().await?;
     Ok(())
+}
+
+fn evaluate(task: &BenchTask, result: &RunResult) -> Vec<BenchCheck> {
+    let mut checks = vec![BenchCheck {
+        name: "success".into(),
+        passed: result.success == task.expected_success.unwrap_or(true),
+        detail: format!(
+            "expected {}, got {} ({})",
+            task.expected_success.unwrap_or(true),
+            result.success,
+            result.reason
+        ),
+    }];
+    checks.extend(task.required_tools.iter().map(|tool| {
+        let count = result
+            .harness
+            .tool_counts
+            .get(tool)
+            .copied()
+            .unwrap_or_default();
+        BenchCheck {
+            name: format!("required_tool:{tool}"),
+            passed: count > 0,
+            detail: format!("called {count} time(s)"),
+        }
+    }));
+    checks.extend(task.forbidden_tools.iter().map(|tool| {
+        let count = result
+            .harness
+            .tool_counts
+            .get(tool)
+            .copied()
+            .unwrap_or_default();
+        BenchCheck {
+            name: format!("forbidden_tool:{tool}"),
+            passed: count == 0,
+            detail: format!("called {count} time(s)"),
+        }
+    }));
+    if let Some(max_recoveries) = task.max_recoveries {
+        checks.push(BenchCheck {
+            name: "max_recoveries".into(),
+            passed: result.harness.recoveries <= max_recoveries,
+            detail: format!(
+                "{} recoveries, maximum {max_recoveries}",
+                result.harness.recoveries
+            ),
+        });
+    }
+    checks
 }
 
 fn parse_manifest(contents: &str) -> Result<Vec<BenchTask>> {
@@ -152,5 +234,16 @@ mod tests {
         .unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].max_steps, Some(12));
+    }
+
+    #[test]
+    fn parses_optional_trajectory_expectations() {
+        let tasks = parse_manifest(
+            r#"{"id":"tools","task":"inspect","required_tools":["grep","read_file"],"forbidden_tools":["shell"],"max_recoveries":0}"#,
+        )
+        .unwrap();
+        assert_eq!(tasks[0].required_tools, ["grep", "read_file"]);
+        assert_eq!(tasks[0].forbidden_tools, ["shell"]);
+        assert_eq!(tasks[0].max_recoveries, Some(0));
     }
 }

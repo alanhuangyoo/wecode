@@ -59,6 +59,31 @@ pub struct ModelResponse {
     pub usage: Usage,
     #[serde(default)]
     pub cache_hit: bool,
+    #[serde(default)]
+    pub stop_reason: StopReason,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    Refusal,
+    ContentFilter,
+    Error,
+    #[default]
+    Unknown,
+}
+
+impl StopReason {
+    pub fn is_truncated(self) -> bool {
+        self == Self::MaxTokens
+    }
+
+    pub fn is_blocked(self) -> bool {
+        matches!(self, Self::Refusal | Self::ContentFilter | Self::Error)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -346,6 +371,7 @@ mod tests {
                     ..Default::default()
                 },
                 cache_hit: false,
+                stop_reason: Default::default(),
             })
         }
     }
@@ -359,6 +385,7 @@ mod tests {
                 calls: calls.clone(),
             }),
             cache: ResponseCache::new(CacheConfig {
+                mode: crate::config::CacheMode::ReadWrite,
                 directory: temp.path().join("cache"),
                 ..Default::default()
             })

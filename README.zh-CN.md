@@ -31,8 +31,8 @@ WeCode 为大模型提供一个专注的代码执行循环：检查仓库、运�
   调用层级或诊断时按需启动。
 - **受管理的子代理**：把实现、探索、规划或审查任务交给隔离模型上下文，独立任务可并发，
   已完成的子代理可保留原对话继续追问。
-- **高缓存命中设计**：稳定的 Prompt 前缀、服务端 Prompt Cache 提示，以及本地精确响应缓存，
-  让重复运行更快、更省 Token。
+- **高缓存命中设计**：稳定的 Prompt 前缀、服务端 Prompt Cache 提示，以及可选的本地精确
+  响应缓存；后者只用于主动启用的确定性重放。
 - **适合跑榜**：支持非交互运行、JSONL 事件与轨迹、最终 Git Patch、验证重试和 JSONL
   批量任务。
 - **默认行为可预测**：限制最大步骤、执行时间和命令输出，并隔离 API Key、提供风险分级审批
@@ -92,7 +92,7 @@ export OPENAI_API_KEY="your-key"
 
 wecode run -C /path/to/repository \
   --provider openai \
-  --model gpt-5.4 \
+  --model gpt-5.5 \
   --verify "cargo test" \
   "修复失败的测试，并保持公开 API 不变。"
 ```
@@ -176,9 +176,10 @@ Agent 工作时仍可继续编辑。
 Footer 会持续显示上下文估算和 Prompt Cache 指标。`/context` 直接从发送给 Provider 的同一份
 请求投影生成明细：具名系统提示词段、当前激活的工具 Schema、规则、记忆、Skills、消息、
 图片与剩余空间，同时显示 Provider Cache 读写和本地精确缓存命中；稳定段与动态段也会明确
-标注。`/compact [重点]` 会保留初始任务和最近消息，把模型投影中符合条件的旧消息替换为有
-硬上限的本地摘要。压缩过程是事务式的，不额外调用模型；旧图片会先记录为持久事实再移除
-Base64，并追加一条明确的 compaction 事件，原始 JSONL 消息历史仍可检查。
+标注。`/compact [重点]` 会发起一次不带工具的独立模型请求，把符合条件的旧消息替换为结构化
+checkpoint，同时保留初始任务和最近的完整工具调用。该流程采用 Pi 的 compaction 设计：
+重复压缩会更新上一份 checkpoint；旧图片只发送名称和媒体类型，不会再次发送 Base64；
+原始 append-only JSONL 历史仍可检查。
 
 可选的持久记忆可写入 `~/.wecode/MEMORY.md`（全局偏好）和仓库根目录下的
 `.wecode/MEMORY.md`（工作区事实）。两者都有大小限制，并作为具名上下文段注入；当前用户请求
@@ -253,9 +254,9 @@ Steer、排队的 Follow-up、持久化会话、Fork 和 Rewind。没有附件�
 Worktree 隔离。并发数、记录数、步骤、运行时间、输出、通知队列和等待时间都有硬上限。
 子代理不能递归创建子代理；切换会话或退出 WeCode 时，所有仍在运行的子任务都会被取消。
 
-长对话会在本地压缩为确定且有硬上限的结构化摘要，保留任务意图、检查或修改过的路径、
-验证结果、失败信息和待处理事实。重复压缩会替换上一份摘要，不会产生“摘要套摘要”；
-最初的任务消息保持不变，可作为稳定的 Provider 缓存前缀。
+长对话采用 Pi 风格的模型 compaction，不再依赖针对命令、路径或验证步骤的本地关键词提取。
+独立的无工具请求会生成或更新结构化 checkpoint；最初的任务消息保持不变，可作为稳定的
+Provider 缓存前缀，最近消息则原样保留。
 
 ## 仓库工具
 
@@ -341,7 +342,7 @@ approval_policy = "on-request"
 trajectory_directory = "/path/to/wecode/sessions"
 
 [cache]
-mode = "read-write"
+mode = "off"
 max_megabytes = 2048
 
 [processes]
@@ -423,6 +424,10 @@ async = false
 fail_closed = true
 status_message = "prompt policy"
 ```
+
+`reasoning_effort` 为可选配置，仅在显式设置后发送。其值应使用供应商支持的能力名，例如
+`"low"`、`"medium"`、`"high"` 或 `"xhigh"`。内置 OpenAI 预设使用 `"high"`，
+通用 OpenAI-compatible 预设默认不发送该参数。
 
 支持 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY` 等服务商变量。
 `WECODE_API_KEY` 会覆盖服务商专用变量。也可以把密钥放在工作区外部文件中：
@@ -557,11 +562,12 @@ Hooks 只在交互模式启用。`wecode run` 和 `wecode bench` 可能会反序
 
 ## 权限审批
 
-Shell 命令会分为 `read-only`、`workspace-write` 和 `elevated`。交互审批会显示完整命令或
-Patch 摘要，并支持：
+Shell 命令会分为 `read-only`、`workspace-write` 和 `elevated`。交互审批会弹出可用方向键、
+数字键和快捷键操作的选择框，同时显示本次命令和“本会话允许”将创建的规则：
 
 - `/approve`：仅允许本次执行。
-- `/approve-session`：在 WeCode 退出前记住相同命令或工作区 Patch 授权。
+- `/approve-session`：在 WeCode 退出前记住显示的命令层级、SSH 主机、工作区 Patch 或 MCP
+  工具规则；破坏性命令和任意代码执行仍只允许精确命令。
 - `/deny [原因]`：拒绝操作，并把原因反馈给模型，让它选择更安全的方案。
 - `Ctrl-C`：取消当前运行，同时保留尚未投递的队列消息。
 
@@ -571,9 +577,9 @@ Patch 摘要，并支持：
 - `untrusted`：仅自动允许已知只读操作；工作区写入和 Patch 都需要审批。
 - `never`：绝不弹出审批；除非同时使用 `--unsafe-local`，危险命令拦截仍然生效。
 
-可以用 `--approval-policy` 覆盖配置。非交互 JSONL 运行绝不会等待审批人：需要审批的操作
-会直接以拒绝结果反馈给模型。`wecode bench` 在没有显式策略时默认使用 `never`，因为
-Benchmark Worker 应由外层容器或虚拟机负责隔离。
+可以用 `--approval-policy` 覆盖配置。非交互 JSONL 和 Benchmark 运行绝不会等待审批人：
+需要审批的操作会直接以拒绝结果反馈给模型。只有在外层容器或虚拟机中，才应同时使用
+`--approval-policy never --unsafe-local`。
 
 ## 接入 OpenAI 兼容网关
 
@@ -601,10 +607,10 @@ wecode run -C /path/to/repository \
 
 缓存模式：
 
-- `read-write`：读取已有缓存并保存新响应。
+- `read-write`：读取已有缓存并保存新响应。由于工具结果和外部状态可能变化，这一模式需要主动启用。
 - `read-only`：只重放已有缓存，不写入新条目。
 - `refresh`：忽略已有缓存并覆盖结果。
-- `off`：关闭精确响应缓存，适合冷启动测量。
+- `off`：关闭精确响应缓存。新配置默认使用该模式，适合真实 agent 运行和冷启动测量。
 
 ```bash
 wecode cache stats
@@ -617,7 +623,7 @@ wecode run --cache-mode off -C /path/to/repository "执行一次冷启动评测�
 Manifest 是 JSONL 文件，每条记录指向一个已准备好的独立工作区：
 
 ```json
-{"id":"task-001","task":"修复失败的解析器测试。","workspace":"/work/repo","verify":"cargo test","max_steps":40}
+{"id":"task-001","task":"修复失败的解析器测试。","workspace":"/work/repo","verify":"cargo test","max_steps":40,"required_tools":["read_file"],"forbidden_tools":[],"max_recoveries":1}
 ```
 
 顺序执行任务：
@@ -646,7 +652,8 @@ printf '%s' "$SWE_TASK" | wecode run \
 
 JSONL 和 Benchmark 输出会有意使用完整模型响应，并且不输出 UI 流式增量事件，即使配置中
 `streaming = true`；Benchmark 运行也不会创建交互输入队列，因此 Prompt、轨迹和执行结果
-保持稳定且便于机器解析。
+保持稳定且便于机器解析。`bench` 会关闭精确响应缓存，并输出检查结果以及模型轮数、工具
+调用数、各工具次数、协议恢复次数和完成尝试次数。
 
 WeCode 不会重置或清理工作树。仓库检出、任务隔离和评分应由 Benchmark Harness 负责。
 更完整的建议见 [docs/benchmarking.md](docs/benchmarking.md)。

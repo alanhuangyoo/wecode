@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::harness::HarnessMetrics;
 use crate::interaction::UserAnswer;
 use crate::model::Usage;
 use crate::protocol::{PlanItem, UserQuestion};
@@ -49,6 +50,7 @@ pub enum Event {
         risk: String,
         summary: String,
         detail: String,
+        session_scope: String,
     },
     ApprovalResolved {
         id: u64,
@@ -83,6 +85,10 @@ pub enum Event {
     ContextCompacted {
         removed_messages: usize,
     },
+    ToolProtocolRepaired {
+        step: usize,
+        inserted_results: usize,
+    },
     SteeringDelivered {
         step: usize,
         count: usize,
@@ -102,6 +108,7 @@ pub enum Event {
         patch_bytes: usize,
         cache_hits: usize,
         usage: Usage,
+        harness: HarnessMetrics,
     },
     Error {
         message: String,

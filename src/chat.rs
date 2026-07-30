@@ -297,7 +297,7 @@ fn completion_files(workspace: &Path) -> Vec<String> {
 
 fn model_completions(config: &Config) -> Vec<String> {
     let suggested: &[&str] = match config.model.provider.as_str() {
-        "openai" => &["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-codex"],
+        "openai" => &["gpt-5.5", "gpt-5.4-mini", "gpt-5.4-codex"],
         "anthropic" => &["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-6"],
         "gemini" => &[
             "gemini-2.5-pro",
@@ -306,7 +306,7 @@ fn model_completions(config: &Config) -> Vec<String> {
         ],
         "openrouter" => &[
             "anthropic/claude-sonnet-4.6",
-            "openai/gpt-5.4",
+            "openai/gpt-5.5",
             "google/gemini-2.5-pro",
         ],
         "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
@@ -1503,30 +1503,23 @@ impl ChatView {
     }
 
     pub fn show_approval(&self, request: &ApprovalRequest) -> Result<()> {
-        self.output.set_tui_composer(
-            Some(" Approval decision ".into()),
-            Some("Type /approve, /approve-session, or /deny [reason]".into()),
-        );
-        if self.output.tui_entry(
-            "APPROVAL REQUIRED",
-            format!(
-                "{} · {} risk\n{}\n\n/approve once · /approve-session · /deny [reason]",
-                request.kind.as_str(),
-                request.risk.as_str(),
-                request.detail
-            ),
-            TuiTone::Warning,
-        ) {
+        if self.output.set_tui_approval(Some(tui::ApprovalPrompt::new(
+            request.summary.clone(),
+            request.risk.as_str(),
+            request.detail.clone(),
+            request.session_scope.label.clone(),
+        ))) {
             return Ok(());
         }
         self.output.print(format!(
-            "\n{}\n  id       #{}\n  action   {}\n  risk     {}\n  summary  {}\n  detail   {}\n\n  {} allow once · {} allow session · {} deny\n\n",
+            "\n{}\n  id       #{}\n  action   {}\n  risk     {}\n  summary  {}\n  detail   {}\n  session  {}\n\n  {} allow once · {} allow session · {} deny\n\n",
             Style::new().yellow().bold().apply_to("Approval required"),
             request.id,
             request.kind.as_str(),
             request.risk.as_str(),
             request.summary,
             one_line(&request.detail),
+            request.session_scope.label,
             Style::new().cyan().apply_to("/approve"),
             Style::new().cyan().apply_to("/approve-session"),
             Style::new().cyan().apply_to("/deny [reason]"),
@@ -1579,6 +1572,7 @@ impl ChatView {
     }
 
     pub fn clear_interaction_prompt(&self) {
+        self.output.set_tui_approval(None);
         self.output.set_tui_composer(None, None);
     }
 

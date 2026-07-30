@@ -6,8 +6,9 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, ToolProfile, Usage,
-    action_batch_text, merge_adjacent_messages, model_tool_call, request_tool_definitions,
+    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, StopReason,
+    ToolProfile, Usage, action_batch_text, merge_adjacent_messages, model_tool_call,
+    request_tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode};
 use crate::context::Role;
@@ -201,6 +202,7 @@ struct AnthropicStreamState {
     text: String,
     tool_calls: BTreeMap<usize, PartialToolUse>,
     usage: Usage,
+    stop_reason: StopReason,
 }
 
 #[derive(Default)]
@@ -253,6 +255,7 @@ impl AnthropicStreamState {
             additional_actions: actions,
             usage: self.usage,
             cache_hit: false,
+            stop_reason: self.stop_reason,
         })
     }
 }
@@ -348,6 +351,9 @@ fn ingest_stream_event(
         }
         "message_delta" => {
             state.usage.output_tokens = at(&value, "/usage/output_tokens");
+            if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                state.stop_reason = anthropic_stop_reason(reason);
+            }
         }
         _ => {}
     }
@@ -420,7 +426,22 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
             cache_write_tokens: at(&value, "/usage/cache_creation_input_tokens"),
         },
         cache_hit: false,
+        stop_reason: value
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .map(anthropic_stop_reason)
+            .unwrap_or(StopReason::Unknown),
     })
+}
+
+fn anthropic_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "end_turn" | "stop_sequence" => StopReason::EndTurn,
+        "tool_use" | "pause_turn" => StopReason::ToolUse,
+        "max_tokens" | "model_context_window_exceeded" => StopReason::MaxTokens,
+        "refusal" => StopReason::Refusal,
+        _ => StopReason::Unknown,
+    }
 }
 
 fn at(value: &Value, pointer: &str) -> u64 {
@@ -544,6 +565,7 @@ mod tests {
                     "description": "add fixture"
                 }
             }],
+            "stop_reason": "tool_use",
             "usage": {"input_tokens": 10, "output_tokens": 4}
         }))
         .unwrap();
@@ -553,6 +575,7 @@ mod tests {
             Some(crate::protocol::Action::Patch { .. })
         ));
         assert_eq!(response.usage.input_tokens, 10);
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
     }
 
     #[test]

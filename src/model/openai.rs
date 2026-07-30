@@ -6,8 +6,8 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, ToolProfile, Usage,
-    action_batch_text, model_tool_call, request_tool_definitions,
+    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, StopReason,
+    ToolProfile, Usage, action_batch_text, model_tool_call, request_tool_definitions,
 };
 use crate::config::{ModelConfig, PromptCacheMode, WireApi};
 use crate::context::Role;
@@ -64,6 +64,9 @@ impl OpenAiModel {
         if let Some(temperature) = self.config.temperature {
             body["temperature"] = json!(temperature);
         }
+        if let Some(reasoning_effort) = &self.config.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort);
+        }
         if self.config.send_prompt_cache_key && self.config.prompt_cache != PromptCacheMode::Off {
             body["prompt_cache_key"] = json!(clamp_cache_key(&request.session_id));
             if self.config.prompt_cache == PromptCacheMode::Long {
@@ -94,6 +97,12 @@ impl OpenAiModel {
         });
         if let Some(temperature) = self.config.temperature {
             body["temperature"] = json!(temperature);
+        }
+        if let Some(reasoning_effort) = &self.config.reasoning_effort {
+            body["reasoning"] = json!({
+                "effort": reasoning_effort,
+                "summary": "auto",
+            });
         }
         if self.config.prompt_cache != PromptCacheMode::Off {
             body["prompt_cache_key"] = json!(clamp_cache_key(&request.session_id));
@@ -321,6 +330,7 @@ struct OpenAiStreamState {
     text: String,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     usage: Usage,
+    stop_reason: StopReason,
 }
 
 #[derive(Default)]
@@ -369,6 +379,7 @@ impl OpenAiStreamState {
             additional_actions: actions,
             usage: self.usage,
             cache_hit: false,
+            stop_reason: self.stop_reason,
         })
     }
 }
@@ -399,6 +410,12 @@ fn ingest_chat_event(
                 .unwrap_or(0),
             cache_write_tokens: 0,
         };
+    }
+    if let Some(reason) = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+    {
+        state.stop_reason = openai_stop_reason(reason);
     }
     let Some(delta) = value.pointer("/choices/0/delta") else {
         return Ok(());
@@ -561,6 +578,11 @@ fn parse_chat_response(value: Value) -> Result<ModelResponse> {
         additional_actions: actions,
         usage,
         cache_hit: false,
+        stop_reason: value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .map(openai_stop_reason)
+            .unwrap_or(StopReason::Unknown),
     })
 }
 
@@ -613,7 +635,42 @@ fn parse_responses_response(value: Value) -> Result<ModelResponse> {
         additional_actions: actions,
         usage,
         cache_hit: false,
+        stop_reason: responses_stop_reason(&value),
     })
+}
+
+fn openai_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "stop" => StopReason::EndTurn,
+        "tool_calls" | "function_call" => StopReason::ToolUse,
+        "length" | "max_tokens" | "max_output_tokens" => StopReason::MaxTokens,
+        "content_filter" => StopReason::ContentFilter,
+        "refusal" => StopReason::Refusal,
+        "error" => StopReason::Error,
+        _ => StopReason::Unknown,
+    }
+}
+
+fn responses_stop_reason(value: &Value) -> StopReason {
+    match value.get("status").and_then(Value::as_str) {
+        Some("failed" | "cancelled") => StopReason::Error,
+        Some("incomplete") => value
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .map(openai_stop_reason)
+            .filter(|reason| *reason != StopReason::Unknown)
+            .unwrap_or(StopReason::Error),
+        _ if value
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call")) =>
+        {
+            StopReason::ToolUse
+        }
+        _ => StopReason::EndTurn,
+    }
 }
 
 fn parse_openai_tool_call(call: &Value, index: usize) -> Option<Result<super::ModelToolCall>> {
@@ -659,6 +716,38 @@ mod tests {
             self.0.lock().unwrap().push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn maps_reasoning_effort_to_each_openai_wire_protocol() {
+        let config = ModelConfig {
+            reasoning_effort: Some("high".into()),
+            native_tools: false,
+            ..Default::default()
+        };
+        let model = OpenAiModel::new(
+            config,
+            None,
+            reqwest::Client::new(),
+            ToolProfile::Interactive,
+            Vec::new(),
+        );
+        let request = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message::user("inspect")],
+            session_id: "session".into(),
+            enabled_tools: None,
+        };
+
+        assert_eq!(model.chat_body(&request)["reasoning_effort"], "high");
+        assert_eq!(
+            model.responses_body(&request)["reasoning"]["effort"],
+            "high"
+        );
+        assert_eq!(
+            model.responses_body(&request)["reasoning"]["summary"],
+            "auto"
+        );
     }
 
     #[test]
@@ -719,18 +808,25 @@ mod tests {
     #[test]
     fn parses_both_openai_response_shapes() {
         let chat = parse_chat_response(json!({
-            "choices": [{"message": {"content": "{\"action\":\"finish\",\"summary\":\"ok\"}"}}],
+            "choices": [{
+                "message": {"content": "{\"action\":\"finish\",\"summary\":\"ok\"}"},
+                "finish_reason": "stop"
+            }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 8}}
         }))
         .unwrap();
         assert_eq!(chat.usage.cache_read_tokens, 8);
+        assert_eq!(chat.stop_reason, StopReason::EndTurn);
 
         let responses = parse_responses_response(json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
             "output": [{"content": [{"type": "output_text", "text": "done"}]}],
             "usage": {"input_tokens": 4, "output_tokens": 1}
         }))
         .unwrap();
         assert_eq!(responses.text, "done");
+        assert_eq!(responses.stop_reason, StopReason::MaxTokens);
     }
 
     #[test]

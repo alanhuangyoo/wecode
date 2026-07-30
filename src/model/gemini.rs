@@ -5,8 +5,9 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, ToolProfile, Usage,
-    action_batch_text, merge_adjacent_messages, model_tool_call, request_tool_definitions,
+    CompletionRequest, ModelResponse, ModelStream, ModelStreamEvent, RawModel, StopReason,
+    ToolProfile, Usage, action_batch_text, merge_adjacent_messages, model_tool_call,
+    request_tool_definitions,
 };
 use crate::config::ModelConfig;
 use crate::context::Role;
@@ -186,6 +187,7 @@ struct GeminiStreamState {
     text: String,
     tool_calls: Vec<(String, Value)>,
     usage: Usage,
+    stop_reason: StopReason,
 }
 
 impl GeminiStreamState {
@@ -217,6 +219,7 @@ impl GeminiStreamState {
             additional_actions: actions,
             usage: self.usage,
             cache_hit: false,
+            stop_reason: self.stop_reason,
         })
     }
 }
@@ -246,6 +249,12 @@ fn ingest_stream_event(
                 .unwrap_or(0),
             cache_write_tokens: 0,
         };
+    }
+    if let Some(reason) = value
+        .pointer("/candidates/0/finishReason")
+        .and_then(Value::as_str)
+    {
+        state.stop_reason = gemini_stop_reason(reason);
     }
     for part in value
         .pointer("/candidates/0/content/parts")
@@ -339,7 +348,23 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
             cache_write_tokens: 0,
         },
         cache_hit: false,
+        stop_reason: value
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+            .map(gemini_stop_reason)
+            .unwrap_or(StopReason::Unknown),
     })
+}
+
+fn gemini_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "STOP" => StopReason::EndTurn,
+        "MAX_TOKENS" => StopReason::MaxTokens,
+        "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => StopReason::ContentFilter,
+        "RECITATION" => StopReason::Refusal,
+        "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" | "OTHER" => StopReason::Error,
+        _ => StopReason::Unknown,
+    }
 }
 
 fn at(value: &Value, pointer: &str) -> u64 {
@@ -431,6 +456,7 @@ mod tests {
     fn parses_native_function_call() {
         let response = parse_response(json!({
             "candidates": [{
+                "finishReason": "STOP",
                 "content": {
                     "parts": [{
                         "functionCall": {
@@ -451,6 +477,7 @@ mod tests {
             })
         );
         assert_eq!(response.usage.output_tokens, 2);
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
     }
 
     #[test]
