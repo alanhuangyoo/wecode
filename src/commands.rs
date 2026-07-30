@@ -474,26 +474,39 @@ fn validate_name(name: &str) -> Result<()> {
 fn is_reserved(name: &str) -> bool {
     matches!(
         name,
-        "allow"
+        "agents"
+            | "allow"
             | "always"
             | "approve"
             | "approve-session"
+            | "attach"
+            | "attachments"
             | "branch"
             | "cancel"
             | "checkpoint"
             | "checkpoints"
             | "clear"
             | "clear-queue"
+            | "commands"
+            | "compact"
             | "config"
+            | "context"
             | "deny"
+            | "detach"
+            | "diff"
             | "exit"
+            | "files"
             | "follow-up"
             | "followup"
             | "fork"
             | "help"
             | "history"
+            | "hooks"
+            | "image"
             | "instructions"
             | "later"
+            | "lsp"
+            | "lsp-restart"
             | "mark"
             | "marks"
             | "mcp"
@@ -501,10 +514,13 @@ fn is_reserved(name: &str) -> bool {
             | "name"
             | "new"
             | "plan"
+            | "processes"
             | "queue"
             | "quit"
             | "reject"
+            | "remove-attachment"
             | "rename"
+            | "review"
             | "resume"
             | "rewind"
             | "rollback"
@@ -514,6 +530,8 @@ fn is_reserved(name: &str) -> bool {
             | "status"
             | "steer"
             | "stop"
+            | "stop-agent"
+            | "stop-process"
             | "todo"
             | "todos"
     )
@@ -586,7 +604,7 @@ mod tests {
         let root = temp.path().join("commands");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
-            root.join("review.md"),
+            root.join("audit.md"),
             "---\ndescription: Review a target\nargument-hint: \"<target> [focus]\"\n---\nReview $1. Focus on ${@:2}. All: $ARGUMENTS. Mode: ${3:-carefully}.",
         )
         .unwrap();
@@ -605,7 +623,7 @@ mod tests {
         assert_eq!(command.argument_hint.as_deref(), Some("<target> [focus]"));
         assert_eq!(
             catalog
-                .expand("review", "src \"error paths\" strict")
+                .expand("audit", "src \"error paths\" strict")
                 .unwrap(),
             "Review src. Focus on error paths strict. All: src error paths strict. Mode: strict."
         );
@@ -618,8 +636,8 @@ mod tests {
         let project = temp.path().join("project");
         std::fs::create_dir_all(&user).unwrap();
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(user.join("review.md"), "user").unwrap();
-        std::fs::write(project.join("review.md"), "project").unwrap();
+        std::fs::write(user.join("audit.md"), "user").unwrap();
+        std::fs::write(project.join("audit.md"), "project").unwrap();
         let catalog = CommandCatalog::discover_roots(
             &[
                 DiscoveryRoot {
@@ -636,7 +654,7 @@ mod tests {
             &config(),
         )
         .unwrap();
-        assert_eq!(catalog.expand("review", "").unwrap(), "project");
+        assert_eq!(catalog.expand("audit", "").unwrap(), "project");
         assert_eq!(catalog.commands()[0].scope, CommandScope::Project);
     }
 
@@ -646,6 +664,7 @@ mod tests {
         let root = temp.path().join("commands");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("help.md"), "shadow built-in").unwrap();
+        std::fs::write(root.join("review.md"), "shadow built-in").unwrap();
         std::fs::write(root.join("Bad Name.md"), "invalid").unwrap();
         std::fs::write(root.join("large.md"), "x".repeat(20_000)).unwrap();
         let catalog = CommandCatalog::discover_roots(
@@ -658,7 +677,13 @@ mod tests {
         )
         .unwrap();
         assert!(catalog.is_empty());
-        assert_eq!(catalog.diagnostics().len(), 3);
+        assert!(
+            catalog
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.path.ends_with("review.md"))
+        );
+        assert_eq!(catalog.diagnostics().len(), 4);
     }
 
     #[test]

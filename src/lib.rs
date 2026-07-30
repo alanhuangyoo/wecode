@@ -24,6 +24,7 @@ pub mod model;
 pub mod patch;
 mod process_tree;
 pub mod protocol;
+pub mod review;
 pub mod session;
 pub mod setup;
 pub mod skills;

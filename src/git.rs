@@ -38,6 +38,60 @@ pub async fn collect_diff(workspace: &Path) -> Result<Option<String>> {
     collect_worktree_diff(workspace, false).await
 }
 
+/// Collect the current branch and worktree changes relative to the merge base with `base`.
+pub async fn collect_diff_against_base(
+    workspace: &Path,
+    base: &str,
+) -> Result<Option<(String, String)>> {
+    validate_revision(base)?;
+    if !inside_git_repo(workspace).await? {
+        return Ok(None);
+    }
+    let base_commit = resolve_commit(workspace, base).await?;
+    let head_commit = resolve_commit(workspace, "HEAD").await?;
+    let merge_base = git_stdout(
+        workspace,
+        &[],
+        &["merge-base", &head_commit, &base_commit],
+        false,
+    )
+    .await?;
+    let merge_base = String::from_utf8_lossy(&merge_base).trim().to_owned();
+    if merge_base.is_empty() {
+        bail!("Git could not find a merge base between HEAD and {base:?}");
+    }
+    let patch = collect_worktree_diff_from(workspace, &merge_base, false).await?;
+    Ok(Some((merge_base, patch)))
+}
+
+/// Collect the patch introduced by one commit.
+pub async fn collect_commit_diff(
+    workspace: &Path,
+    revision: &str,
+) -> Result<Option<(String, String)>> {
+    validate_revision(revision)?;
+    if !inside_git_repo(workspace).await? {
+        return Ok(None);
+    }
+    let commit = resolve_commit(workspace, revision).await?;
+    let filter_overrides = executable_filter_overrides(workspace).await?;
+    let args = [
+        "show",
+        "--format=",
+        "--no-textconv",
+        "--no-ext-diff",
+        "--submodule=short",
+        "--ignore-submodules=dirty",
+        "--no-color",
+        &commit,
+        "--",
+    ];
+    let patch =
+        String::from_utf8_lossy(&git_stdout(workspace, &filter_overrides, &args, false).await?)
+            .into_owned();
+    Ok(Some((commit, patch)))
+}
+
 async fn collect_worktree_diff(workspace: &Path, binary: bool) -> Result<Option<String>> {
     if !inside_git_repo(workspace).await? {
         return Ok(None);
@@ -54,7 +108,7 @@ async fn collect_worktree_diff(workspace: &Path, binary: bool) -> Result<Option<
             .map(Some);
     }
 
-    let mut patch = tracked_diff(workspace, &filter_overrides, binary, true).await?;
+    let mut patch = tracked_diff(workspace, &filter_overrides, binary, Some("HEAD")).await?;
     let untracked = git_stdout(
         workspace,
         &filter_overrides,
@@ -72,6 +126,32 @@ async fn collect_worktree_diff(workspace: &Path, binary: bool) -> Result<Option<
         );
     }
     Ok(Some(patch))
+}
+
+async fn collect_worktree_diff_from(
+    workspace: &Path,
+    revision: &str,
+    binary: bool,
+) -> Result<String> {
+    let filter_overrides = executable_filter_overrides(workspace).await?;
+    let mut patch = tracked_diff(workspace, &filter_overrides, binary, Some(revision)).await?;
+    let untracked = git_stdout(
+        workspace,
+        &filter_overrides,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        false,
+    )
+    .await?;
+    for raw_path in untracked
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = String::from_utf8_lossy(raw_path);
+        patch.push_str(
+            &untracked_file_diff(workspace, &filter_overrides, path.as_ref(), binary).await?,
+        );
+    }
+    Ok(patch)
 }
 
 async fn collect_unborn_diff(
@@ -111,7 +191,7 @@ async fn tracked_diff(
     workspace: &Path,
     filter_overrides: &[String],
     binary: bool,
-    against_head: bool,
+    revision: Option<&str>,
 ) -> Result<String> {
     let mut args = vec![
         "diff",
@@ -124,12 +204,44 @@ async fn tracked_diff(
     if binary {
         args.push("--binary");
     }
-    if against_head {
-        args.push("HEAD");
+    if let Some(revision) = revision {
+        args.push(revision);
     }
     args.push("--");
     let output = git_output(workspace, filter_overrides, &args).await?;
     checked_diff_stdout(output, &args)
+}
+
+async fn resolve_commit(workspace: &Path, revision: &str) -> Result<String> {
+    validate_revision(revision)?;
+    let commitish = format!("{revision}^{{commit}}");
+    let args = ["rev-parse", "--verify", commitish.as_str()];
+    let output = git_output(workspace, &[], &args).await?;
+    if !output.status.success() {
+        bail!(
+            "Git revision {revision:?} does not resolve to a commit: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if commit.is_empty() {
+        bail!("Git revision {revision:?} resolved to an empty commit id");
+    }
+    Ok(commit)
+}
+
+fn validate_revision(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.starts_with('-')
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '_' | '/' | '-' | '@' | '~' | '^'))
+        })
+    {
+        bail!("invalid Git revision {value:?}");
+    }
+    Ok(())
 }
 
 async fn untracked_file_diff(
@@ -264,7 +376,8 @@ async fn git_output(
     let mut command = Command::new("git");
     command
         .args(["-c", &format!("core.hooksPath={null_device}")])
-        .args(["-c", "core.fsmonitor=false"]);
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.quotePath=false"]);
     for value in config_overrides {
         command.args(["-c", value]);
     }
@@ -356,6 +469,59 @@ mod tests {
         assert_eq!(diff.matches("diff --git").count(), 1);
         assert!(diff.contains("+current"));
         assert!(!diff.contains("+staged"));
+    }
+
+    #[tokio::test]
+    async fn review_diffs_support_commit_and_merge_base_targets() {
+        let repository = repository();
+        std::fs::write(repository.path().join("tracked.txt"), "second\n").unwrap();
+        git(repository.path(), &["add", "tracked.txt"]);
+        git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=WeCode Test",
+                "-c",
+                "user.email=wecode@example.invalid",
+                "commit",
+                "-m",
+                "second",
+            ],
+        );
+        let commit = head_id(repository.path()).await.unwrap();
+
+        let (resolved, patch) = collect_commit_diff(repository.path(), "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, commit);
+        assert!(patch.contains("+second"));
+        assert!(patch.contains("-before"));
+
+        std::fs::write(repository.path().join("tracked.txt"), "worktree\n").unwrap();
+        std::fs::write(repository.path().join("new.txt"), "new\n").unwrap();
+        let (_, patch) = collect_diff_against_base(repository.path(), "HEAD~1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(patch.contains("+worktree"));
+        assert!(patch.contains("+new"));
+        assert!(patch.contains("-before"));
+    }
+
+    #[tokio::test]
+    async fn review_revisions_reject_option_injection() {
+        let repository = repository();
+        assert!(
+            collect_commit_diff(repository.path(), "--output=/tmp/owned")
+                .await
+                .is_err()
+        );
+        assert!(
+            collect_diff_against_base(repository.path(), "main;touch-owned")
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(unix)]

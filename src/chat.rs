@@ -32,6 +32,7 @@ use crate::lsp::{LspEvent, LspServerStatus, LspServerSummary};
 use crate::mcp::{McpServerReport, McpServerState};
 use crate::model::Usage;
 use crate::protocol::PlanStatus;
+use crate::review::ParsedReview;
 use crate::session::{SessionCheckpoint, SessionSummary};
 use crate::skills::Skill;
 use crate::subagent::{SubagentEvent, SubagentStatus, SubagentSummary};
@@ -68,6 +69,7 @@ pub enum ChatCommand {
     Plan,
     Processes,
     Rename(String),
+    Review(String),
     Rewind(Option<String>),
     Resume(Option<String>),
     Rules,
@@ -345,6 +347,10 @@ fn command_completions(
         ("/compact", "Compact older context with an optional focus"),
         ("/context", "Show context usage and prompt-cache metrics"),
         ("/model", "Show or switch the session model"),
+        (
+            "/review",
+            "Review current changes, a base branch, or a commit",
+        ),
         ("/status", "Show session status"),
         ("/mcp", "Show MCP servers"),
         ("/lsp", "Show language servers"),
@@ -470,6 +476,7 @@ impl ChatView {
              \n  {:12} Remove the last, selected, or all attachments\
              \n  {:12} Fuzzy-search and attach a repository file\
              \n  {:12} Show staged, unstaged, and untracked changes\
+             \n  {:12} Run an isolated read-only code review\
              \n  {:12} Run a shell command and include its result in context\
              \n  {:12} Run a shell command without saving it to context\
              \n  {:12} Show the current task plan\
@@ -517,6 +524,7 @@ impl ChatView {
             "/detach [number|all]",
             "@path",
             "/diff",
+            "/review [target]",
             "!command",
             "!!command",
             "/plan",
@@ -764,6 +772,55 @@ impl ChatView {
             "\n{}\n{}\n",
             Style::new().cyan().bold().apply_to("Working tree diff"),
             body
+        ))
+    }
+
+    pub fn show_review(&self, label: &str, review: &ParsedReview) -> Result<()> {
+        self.output.set_tui_status(None);
+        let count = review.output.findings.len();
+        let mut body = review.output.render();
+        if review.dropped_findings > 0 {
+            body.push_str(&format!(
+                "\n\n{} invalid or out-of-diff finding{} omitted.",
+                review.dropped_findings,
+                if review.dropped_findings == 1 {
+                    " was"
+                } else {
+                    "s were"
+                }
+            ));
+        }
+        if !review.structured {
+            body.push_str(
+                "\n\nThe reviewer did not return the structured schema; this fallback was preserved.",
+            );
+        }
+        let tone = if !review.structured
+            || review
+                .output
+                .findings
+                .iter()
+                .any(|finding| finding.priority <= 1)
+        {
+            TuiTone::Error
+        } else if count > 0 {
+            TuiTone::Warning
+        } else {
+            TuiTone::Success
+        };
+        let title = format!(
+            "REVIEW · {label} · {count} finding{}",
+            if count == 1 { "" } else { "s" }
+        );
+        if self.output.tui_entry(title, &body, tone) {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "\n{}\n{body}\n",
+            Style::new().cyan().bold().apply_to(format!(
+                "Review · {label} · {count} finding{}",
+                if count == 1 { "" } else { "s" }
+            ))
         ))
     }
 
@@ -1661,6 +1718,7 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
             (!argument.is_empty()).then(|| argument.to_owned()),
         )),
         "/rules" | "/instructions" => ChatInput::Command(ChatCommand::Rules),
+        "/review" => ChatInput::Command(ChatCommand::Review(argument.to_owned())),
         "/sessions" => ChatInput::Command(ChatCommand::Sessions),
         "/skills" => ChatInput::Command(ChatCommand::Skills),
         "/stop-process" | "/process-stop" => {
@@ -1893,6 +1951,10 @@ mod tests {
             )))
         );
         assert_eq!(
+            parse_input("/review --base main portability"),
+            ChatInput::Command(ChatCommand::Review("--base main portability".into()))
+        );
+        assert_eq!(
             parse_input("! cargo test"),
             ChatInput::Shell {
                 command: "cargo test".into(),
@@ -1908,10 +1970,7 @@ mod tests {
         );
         assert_eq!(
             parse_input("/review src \"error paths\""),
-            ChatInput::Command(ChatCommand::Unknown {
-                name: "review".into(),
-                arguments: "src \"error paths\"".into(),
-            })
+            ChatInput::Command(ChatCommand::Review("src \"error paths\"".into()))
         );
         assert_eq!(
             parse_input("/followup run tests"),

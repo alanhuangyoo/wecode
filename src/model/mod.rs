@@ -211,6 +211,7 @@ fn cache_namespace(
         ToolProfile::ReadOnlySubagent => {
             format!("{config}:subagent-read-only:{credential_scope}")
         }
+        ToolProfile::Review => format!("{config}:review:{credential_scope}"),
     })
 }
 
@@ -348,6 +349,20 @@ mod tests {
             first,
             cache_namespace(&config, Some("test-key-one"), ToolProfile::Interactive).unwrap()
         );
+    }
+
+    #[test]
+    fn review_cache_namespace_is_isolated_from_chat_and_subagents() {
+        let config = ModelConfig::default();
+        let review = cache_namespace(&config, Some("test-key"), ToolProfile::Review).unwrap();
+        let chat = cache_namespace(&config, Some("test-key"), ToolProfile::Interactive).unwrap();
+        let subagent =
+            cache_namespace(&config, Some("test-key"), ToolProfile::ReadOnlySubagent).unwrap();
+
+        assert_ne!(review, chat);
+        assert_ne!(review, subagent);
+        assert!(review.contains(":review:"));
+        assert!(!review.contains("test-key"));
     }
 
     #[test]

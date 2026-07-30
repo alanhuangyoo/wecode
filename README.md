@@ -132,6 +132,7 @@ composer remains editable while the agent works.
 /attachments Show files attached to the next message
 /detach      Remove the last, selected, or all attachments
 /diff        Show staged, unstaged, and untracked changes
+/review      Review current changes in an isolated read-only session
 !command     Run a shell command and include its result in model context
 !!command    Run a shell command without saving it to context or session history
 /plan        Show the current task plan
@@ -192,6 +193,14 @@ Use `/diff` for an immediate working-tree review without spending a model call. 
 state against `HEAD`, including staged, unstaged, and untracked files. Diff collection has a
 30-second per-command timeout and disables repository-controlled hooks, fsmonitor, textconv,
 external diff commands, and clean/process filters.
+
+Use `/review [focus]` for a model-backed review of staged, unstaged, and untracked changes.
+`/review --base <branch> [focus]` reviews the merge-base diff plus current worktree state, while
+`/review --commit <revision> [focus]` reviews one commit. The reviewer runs in an isolated,
+cancelable session with only read, list, glob, grep, and finish tools. Findings are structured,
+priority-sorted, normalized to workspace paths, checked against changed line ranges, and saved into
+the main session for the next fix request. Review has its own cache namespace and does not alter the
+seven-tool benchmark profile.
 
 Prefix input with `!` to run a shell command directly in the workspace. The composer turns green
 and the result is stored as bounded context for the next model turn. Use `!!` when the command or
@@ -548,8 +557,9 @@ unchanged seven-tool benchmark profile.
 ### Prompt commands
 
 Reusable Markdown prompts turn common workflows into slash commands without adding runtime weight
-or changing the model tool set. Put `review.md` in `~/.wecode/commands/` or
-`.wecode/commands/`, then invoke it as `/review`. WeCode also discovers compatible
+or changing the model tool set. Put `audit.md` in `~/.wecode/commands/` or
+`.wecode/commands/`, then invoke it as `/audit`. Built-in command names such as `/review` are
+reserved and produce a visible discovery diagnostic. WeCode also discovers compatible
 Pi, Claude Code, and OpenCode prompt directories, including `~/.pi/agent/prompts/`,
 `~/.claude/commands/`, `~/.config/opencode/{command,commands}/`, `.pi/prompts/`,
 `.claude/commands/`, and `.opencode/{command,commands}/`, when compatibility is enabled.

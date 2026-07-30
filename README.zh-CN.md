@@ -122,6 +122,7 @@ Agent 工作时仍可继续编辑。
 /attachments 查看下一条消息的待发送附件
 /detach      删除最后一个、指定或全部附件
 /diff        查看 staged、unstaged 和 untracked 改动
+/review      在隔离的只读会话中审查当前改动
 !命令        直接执行 Shell，并把结果加入模型上下文
 !!命令       直接执行 Shell，但不写入上下文或会话历史
 /plan        查看当前任务计划
@@ -177,6 +178,13 @@ Footer 会持续显示对话上下文估算和 Prompt Cache 指标。`/context` 
 使用 `/diff` 可以立即检查工作区改动，不消耗模型调用。它按相对 `HEAD` 的最终状态展示
 staged、unstaged 和 untracked 文件。Diff 收集为每条 Git 命令设置 30 秒超时，并禁用
 仓库可控制的 Hooks、fsmonitor、textconv、外部 Diff 和 clean/process Filter。
+
+使用 `/review [重点]` 可以让模型审查 staged、unstaged 和 untracked 改动；
+`/review --base <分支> [重点]` 会审查相对 Merge Base 的改动和当前工作区状态，
+`/review --commit <版本> [重点]` 则审查单个 Commit。Reviewer 在可取消的隔离会话中运行，
+只拥有 read、list、glob、grep 和 finish 工具。Findings 会按优先级排序、归一化为工作区路径、
+校验是否落在改动行，并写回主 Session 供下一轮修复使用。Review 使用独立缓存命名空间，不会
+改变 Benchmark 的七工具 Profile。
 
 输入以 `!` 开头时，会直接在工作区执行 Shell；输入框会变为绿色，带大小上限的结果会进入
 下一轮模型上下文。使用 `!!` 可执行临时命令：结果只在本地显示，不进入模型上下文、会话
@@ -499,8 +507,9 @@ Skill 会按确定顺序从以下位置发现：
 ### Prompt 命令
 
 可复用 Markdown Prompt 可以把常见工作流变成斜杠命令，不增加运行时负担，也不改变模型工具
-集合。把 `review.md` 放进 `~/.wecode/commands/` 或 `.wecode/commands/`，即可通过
-`/review` 调用。启用兼容目录时，还会发现 `~/.pi/agent/prompts/`、
+集合。把 `audit.md` 放进 `~/.wecode/commands/` 或 `.wecode/commands/`，即可通过
+`/audit` 调用。`/review` 等内置命令名会被保留，发生冲突时显示发现诊断。启用兼容目录时，
+还会发现 `~/.pi/agent/prompts/`、
 `~/.claude/commands/`、`~/.config/opencode/{command,commands}/`、`.pi/prompts/`、
 `.claude/commands/` 和 `.opencode/{command,commands}/` 等 Pi、Claude Code 与 OpenCode
 Prompt 目录。

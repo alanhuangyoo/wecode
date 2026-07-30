@@ -24,6 +24,7 @@ use wecode::lsp::LspManager;
 use wecode::mcp::McpManager;
 use wecode::model::{CompletionRequest, Model, ModelResponse, ModelStream, ToolProfile, Usage};
 use wecode::protocol::{Action, LspOperation, PlanItem, PlanStatus, QuestionOption, UserQuestion};
+use wecode::review::{ReviewRequest, parse_review, review_prompt};
 use wecode::skills::SkillCatalog;
 use wecode::subagent::{SubagentManager, SubagentStatus};
 
@@ -1368,6 +1369,121 @@ async fn interactive_plain_text_is_a_smooth_final_response() {
     assert!(result.success);
     assert_eq!(result.steps, 1);
     assert_eq!(result.summary, "The review is complete.");
+}
+
+#[tokio::test]
+async fn isolated_review_reads_context_and_returns_validated_findings() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    std::fs::write(
+        temp.path().join("src.rs"),
+        "pub fn divide(value: u64, divisor: u64) -> u64 {\n    value / divisor\n}\n",
+    )
+    .unwrap();
+    let patch = "\
+diff --git a/src.rs b/src.rs
+new file mode 100644
+--- /dev/null
++++ b/src.rs
+@@ -0,0 +1,3 @@
++pub fn divide(value: u64, divisor: u64) -> u64 {
++    value / divisor
++}
+";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let summary = serde_json::json!({
+        "findings": [{
+            "title": "[P1] Guard a zero divisor",
+            "body": "Calling this API with a zero divisor panics instead of returning a controlled error.",
+            "confidence_score": 0.99,
+            "priority": 1,
+            "code_location": {
+                "path": "src.rs",
+                "line_range": {"start": 2, "end": 2}
+            }
+        }],
+        "overall_correctness": "patch is incorrect",
+        "overall_explanation": "The new API has one input-triggered panic.",
+        "overall_confidence_score": 0.98
+    })
+    .to_string();
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([
+            Action::ReadFile {
+                path: "src.rs".into(),
+                offset: None,
+                limit: None,
+            },
+            Action::Finish { summary },
+        ])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Review,
+    );
+    let prompt = review_prompt(
+        &ReviewRequest::parse("panic behavior").unwrap(),
+        patch,
+        90_000,
+    );
+
+    let result = agent.run(&prompt, RunOptions::default()).await.unwrap();
+    let parsed = parse_review(&result.summary, temp.path(), patch);
+
+    assert!(result.success);
+    assert!(parsed.structured);
+    assert_eq!(parsed.output.findings.len(), 1);
+    assert_eq!(parsed.output.findings[0].priority, 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].system.contains("read-only code reviewer"));
+    assert!(
+        requests[0].messages[0]
+            .content
+            .contains("UNTRUSTED GIT PATCH")
+    );
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("value / divisor"))
+    );
+}
+
+#[tokio::test]
+async fn review_accepts_plain_structured_json_without_format_retries() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let summary = r#"{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"No actionable findings.","overall_confidence_score":0.9}"#;
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from([summary.into()])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Review,
+    );
+
+    let result = agent
+        .run("review the supplied patch", RunOptions::default())
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.steps, 1);
+    assert_eq!(result.summary, summary);
 }
 
 #[tokio::test]

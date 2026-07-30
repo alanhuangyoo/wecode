@@ -61,6 +61,9 @@ Plan state + question broker + approval broker
 - Tool profiles are explicit. Interactive sessions add `update_plan` and `request_user_input`;
   `run --output jsonl` and `bench` retain the seven-tool coding profile, unchanged system prompt,
   and backward-compatible exact-cache namespace.
+- Review runs in an isolated five-tool read-only profile with a dedicated prompt and cache
+  namespace. Structured findings are normalized and checked against changed line ranges before
+  being recorded into the main session.
 - Runtime trajectories and caches are stored outside the target repository unless explicitly
   redirected.
 

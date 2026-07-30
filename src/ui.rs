@@ -14,6 +14,7 @@ pub enum UiMode {
     #[default]
     Run,
     Chat,
+    Review,
 }
 
 #[derive(Clone)]
@@ -173,6 +174,10 @@ impl TerminalUi {
         Self::with_mode(UiMode::Chat, output, true)
     }
 
+    pub fn review(output: TerminalOutput) -> Self {
+        Self::with_mode(UiMode::Review, output, true)
+    }
+
     fn with_mode(mode: UiMode, output: TerminalOutput, allow_deltas: bool) -> Self {
         Self {
             spinner: Mutex::new(None),
@@ -198,11 +203,17 @@ impl TerminalUi {
             .lock()
             .expect("stream preview lock poisoned")
             .clear();
+        let activity = if self.mode == UiMode::Review {
+            "Reviewing"
+        } else {
+            "Thinking"
+        };
         if self.output.is_tui() {
             self.output
-                .set_tui_status(Some(format!("⠋ Thinking · step {step}")));
+                .set_tui_status(Some(format!("⠋ {activity} · step {step}")));
         } else if self.output.is_external() {
-            self.output.print(format!("  ⠋ Thinking · step {step}\n"))?;
+            self.output
+                .print(format!("  ⠋ {activity} · step {step}\n"))?;
         } else if self.interactive {
             let spinner = ProgressBar::new_spinner();
             spinner.set_style(
@@ -210,11 +221,11 @@ impl TerminalUi {
                     .expect("valid spinner template")
                     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
             );
-            spinner.set_message(format!("Thinking · step {step}"));
+            spinner.set_message(format!("{activity} · step {step}"));
             spinner.enable_steady_tick(std::time::Duration::from_millis(90));
             *self.spinner.lock().expect("spinner lock poisoned") = Some(spinner);
         } else {
-            self.output.print(format!("  Thinking · step {step}\n"))?;
+            self.output.print(format!("  {activity} · step {step}\n"))?;
         }
         Ok(())
     }
@@ -315,6 +326,9 @@ impl EventSink for TerminalUi {
                 ..
             } => {
                 self.stop_spinner();
+                if self.mode == UiMode::Review && kind == "finish" {
+                    return Ok(());
+                }
                 if self.output.is_tui() {
                     let (label, text, tone) = match kind.as_str() {
                         "read_file" => ("READ".into(), detail.to_owned(), TuiTone::Normal),
@@ -538,16 +552,20 @@ impl EventSink for TerminalUi {
             }
             Event::RunCancelled { .. } => {
                 self.stop_spinner();
-                if self.output.tui_entry(
-                    "CANCELLED",
-                    "workspace changes made before cancellation were preserved",
-                    TuiTone::Warning,
-                ) {
+                let message = if self.mode == UiMode::Review {
+                    "review cancelled; the workspace was not modified"
+                } else {
+                    "workspace changes made before cancellation were preserved"
+                };
+                if self
+                    .output
+                    .tui_entry("CANCELLED", message, TuiTone::Warning)
+                {
                     return Ok(());
                 }
                 self.output.print(format!(
-                    "  {} cancelled · workspace changes made before cancellation were preserved\n",
-                    Style::new().yellow().bold().apply_to("■")
+                    "  {} cancelled · {message}\n",
+                    Style::new().yellow().bold().apply_to("■"),
                 ))?;
             }
             Event::Verification { passed, .. } => {
@@ -588,6 +606,9 @@ impl EventSink for TerminalUi {
                     compact_number(usage.output_tokens),
                     compact_number(usage.cache_read_tokens),
                 )));
+                if self.mode == UiMode::Review {
+                    return Ok(());
+                }
                 let marker = if *success {
                     Style::new().green().bold().apply_to("✓ Done")
                 } else {

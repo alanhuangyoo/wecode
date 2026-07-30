@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::agent::{Agent, Conversation, RunOptions};
+use crate::agent::{Agent, Conversation, RunOptions, RunResult};
 use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalEnvelope};
 use crate::attachments::{
     PendingAttachment, load as load_attachment, normalized_path_text, prepare_message,
@@ -32,6 +32,7 @@ use crate::interaction::{
 use crate::lsp::LspManager;
 use crate::mcp::McpManager;
 use crate::model::{ToolProfile, Usage, create_model, create_model_with_tools, tool_definitions};
+use crate::review::{ReviewRequest, ReviewTarget, parse_review, review_prompt};
 use crate::session::ChatSession;
 use crate::setup::{SetupOptions, run as run_setup};
 use crate::skills::SkillCatalog;
@@ -529,10 +530,16 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     }
     sync_context_metrics(&conversation, &config, last_usage, &view);
     let mut inputs = shell.into_input_stream();
+    let mut deferred_input = None::<ChatInput>;
 
     loop {
-        let Some(input) = inputs.recv().await else {
-            break;
+        let input = if let Some(input) = deferred_input.take() {
+            Ok(input)
+        } else {
+            let Some(input) = inputs.recv().await else {
+                break;
+            };
+            input
         };
         let mut title_override = None;
         let input = match input? {
@@ -995,6 +1002,74 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 }
             }
             ChatInput::Command(ChatCommand::Rules) => view.show_rules(&instruction_set)?,
+            ChatInput::Command(ChatCommand::Review(arguments)) => {
+                let request = match ReviewRequest::parse(&arguments) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        view.warning(error.to_string())?;
+                        continue;
+                    }
+                };
+                let Some((label, patch)) =
+                    resolve_review_patch(&request, &workspace, &view).await?
+                else {
+                    continue;
+                };
+                if patch.is_empty() {
+                    view.notice(format!("No changes found for {label}."))?;
+                    continue;
+                }
+                let api_key = match config.api_key() {
+                    Ok(api_key) => api_key,
+                    Err(error) => {
+                        view.show_setup_required(&error)?;
+                        continue;
+                    }
+                };
+                let cache = ResponseCache::new(config.cache.clone())?;
+                let model = create_model_with_tools(
+                    &config.model,
+                    api_key,
+                    cache,
+                    ToolProfile::Review,
+                    Vec::new(),
+                )?;
+                let mut reviewer = Agent::new_with_profile(
+                    config.clone(),
+                    model,
+                    Box::new(TerminalUi::review(view.output())),
+                    workspace.clone(),
+                    ToolProfile::Review,
+                );
+                let prompt = review_prompt(&request, &patch, config.agent.context_max_tokens);
+                let review = run_review_task(
+                    &mut reviewer,
+                    &prompt,
+                    session.summary(),
+                    &mut inputs,
+                    &view,
+                )
+                .await?;
+                if let Some(input) = review.deferred_input {
+                    deferred_input = Some(input);
+                }
+                if review.exit_requested {
+                    break;
+                }
+                let Some(result) = review.result else {
+                    continue;
+                };
+                last_usage = Some((result.usage, result.cache_hits));
+                if result.reason != "finished" {
+                    sync_context_metrics(&conversation, &config, last_usage, &view);
+                    continue;
+                }
+                let parsed = parse_review(&result.summary, &workspace, &patch);
+                view.show_review(&label, &parsed)?;
+                conversation.record_review(&label, &parsed.output.render());
+                session.save(&conversation)?;
+                sync_context_metrics(&conversation, &config, last_usage, &view);
+            }
             ChatInput::Command(ChatCommand::Sessions) => {
                 let sessions = ChatSession::list(&state_directory, &workspace)?;
                 view.show_sessions(&sessions)?;
@@ -1563,6 +1638,132 @@ struct ActiveChatResult {
     cache_hits: usize,
 }
 
+struct ActiveReviewResult {
+    result: Option<RunResult>,
+    deferred_input: Option<ChatInput>,
+    exit_requested: bool,
+}
+
+async fn resolve_review_patch(
+    request: &ReviewRequest,
+    workspace: &Path,
+    view: &ChatView,
+) -> Result<Option<(String, String)>> {
+    let result = match &request.target {
+        ReviewTarget::WorkingTree => crate::git::collect_diff(workspace)
+            .await
+            .map(|patch| patch.map(|patch| (request.label(), patch))),
+        ReviewTarget::Base(branch) => crate::git::collect_diff_against_base(workspace, branch)
+            .await
+            .map(|patch| {
+                patch.map(|(merge_base, patch)| {
+                    (
+                        format!(
+                            "{} (merge base {})",
+                            request.label(),
+                            &merge_base[..merge_base.len().min(12)]
+                        ),
+                        patch,
+                    )
+                })
+            }),
+        ReviewTarget::Commit(revision) => crate::git::collect_commit_diff(workspace, revision)
+            .await
+            .map(|patch| {
+                patch.map(|(commit, patch)| {
+                    (format!("commit {}", &commit[..commit.len().min(12)]), patch)
+                })
+            }),
+    };
+    match result {
+        Ok(Some(review)) => Ok(Some(review)),
+        Ok(None) => {
+            view.warning("This workspace is not inside a Git repository.")?;
+            Ok(None)
+        }
+        Err(error) => {
+            view.warning(format!("Could not prepare review: {error:#}"))?;
+            Ok(None)
+        }
+    }
+}
+
+async fn run_review_task(
+    reviewer: &mut Agent,
+    prompt: &str,
+    session: &crate::session::SessionSummary,
+    inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
+    view: &ChatView,
+) -> Result<ActiveReviewResult> {
+    let cancellation = CancellationToken::new();
+    let signal_task = spawn_cancellation_signal(cancellation.clone());
+    let run = reviewer.run(
+        prompt,
+        RunOptions {
+            session_id: Some(format!(
+                "{}-review-{}",
+                session.id,
+                crate::events::timestamp_ms()
+            )),
+            cancellation: Some(cancellation.clone()),
+            ..Default::default()
+        },
+    );
+    tokio::pin!(run);
+    let mut deferred_input = None;
+    let mut exit_requested = false;
+    let result = loop {
+        tokio::select! {
+            result = &mut run => break result,
+            input = inputs.recv(), if deferred_input.is_none() => {
+                let Some(input) = input else {
+                    exit_requested = true;
+                    cancellation.cancel();
+                    continue;
+                };
+                match input? {
+                    ChatInput::Interrupted | ChatInput::Command(ChatCommand::Cancel) => {
+                        cancellation.cancel();
+                    }
+                    ChatInput::Exit => {
+                        exit_requested = true;
+                        cancellation.cancel();
+                    }
+                    ChatInput::Task(task) if task.trim().is_empty() => {
+                        view.warning("Message cannot be empty.")?;
+                    }
+                    input @ (ChatInput::Task(_)
+                    | ChatInput::FollowUp(_)
+                    | ChatInput::Shell { .. }) => {
+                        deferred_input = Some(input);
+                        view.notice("Queued input for after the review.")?;
+                    }
+                    ChatInput::Command(ChatCommand::Help) => view.show_help()?,
+                    ChatInput::Command(ChatCommand::Context) => {
+                        view.notice("Live review token and cache metrics are visible in the footer.")?;
+                    }
+                    _ => {
+                        view.warning("Review is read-only and isolated; use /cancel or wait for it to finish.")?;
+                    }
+                }
+            }
+        }
+    };
+    signal_task.abort();
+    let result = match result {
+        Ok(result) => Some(result),
+        Err(error) => {
+            view.warning(format!("Review failed: {error:#}"))?;
+            None
+        }
+    };
+    Ok(ActiveReviewResult {
+        result,
+        deferred_input,
+        exit_requested,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_active_chat_task(
     agent: &mut Agent,
@@ -1963,6 +2164,11 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Compact(_)) => {
                         view.warning(
                             "Compact context after the active task finishes; use /cancel first if needed.",
+                        )?;
+                    }
+                    ChatInput::Command(ChatCommand::Review(_)) => {
+                        view.warning(
+                            "Start a review after the active task finishes; use /cancel first if needed.",
                         )?;
                     }
                     ChatInput::Command(ChatCommand::Commands) => {

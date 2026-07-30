@@ -11,6 +11,7 @@ pub enum ToolProfile {
     Coding,
     Interactive,
     ReadOnlySubagent,
+    Review,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +53,7 @@ impl ToolRegistry {
                         .map(|definition| ToolSpec { definition }),
                 );
             }
-            ToolProfile::ReadOnlySubagent => {
+            ToolProfile::ReadOnlySubagent | ToolProfile::Review => {
                 registry.tools.retain(|tool| {
                     matches!(
                         tool.definition.get("name").and_then(Value::as_str),
@@ -722,6 +723,7 @@ mod tests {
         let coding = ToolRegistry::for_profile(ToolProfile::Coding).definitions();
         let interactive = ToolRegistry::for_profile(ToolProfile::Interactive).definitions();
         let read_only = ToolRegistry::for_profile(ToolProfile::ReadOnlySubagent).definitions();
+        let review = ToolRegistry::for_profile(ToolProfile::Review).definitions();
         assert_eq!(coding.len(), 7);
         assert_eq!(interactive.len(), 20);
         assert_eq!(
@@ -753,6 +755,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["read_file", "list_files", "glob", "grep", "finish"]
         );
+        assert_eq!(review, read_only);
     }
 
     #[test]
