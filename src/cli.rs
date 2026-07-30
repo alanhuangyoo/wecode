@@ -379,7 +379,7 @@ enum ChatStart {
 }
 
 async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
-    let (config, workspace) = resolve_config(&common)?;
+    let (mut config, workspace) = resolve_config(&common)?;
     let instruction_set = instructions::discover(&workspace)?;
     let skills = SkillCatalog::discover(&workspace, &config.skills)?;
     let commands = CommandCatalog::discover(&workspace, &config.commands)?;
@@ -389,7 +389,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         Some(config.model.api_key_env.clone()),
     );
     let state_directory = config.agent.trajectory_directory.clone();
-    let shell = ChatShell::new(&workspace, &commands.commands(), &skills.skills())?;
+    let shell = ChatShell::new(&workspace, &config, &commands.commands(), &skills.skills())?;
     let view = shell.view();
     let mut processes = create_background_process_manager(&config, &workspace, &view);
     let mut lsp = create_lsp_manager(&config, &workspace, &view)?;
@@ -411,6 +411,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             (session, conversation, "resume")
         }
     };
+    session.set_model(&config.model.provider, &config.model.model)?;
     let mut agent: Option<Agent> = None;
     let input_queue = InputQueue::new();
     let (approval, mut approval_requests) = ApprovalClient::channel();
@@ -676,6 +677,43 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::History) => view.show_history_path()?,
             ChatInput::Command(ChatCommand::Hooks) => view.show_hooks(&hooks.summaries())?,
             ChatInput::Command(ChatCommand::Mcp) => view.show_mcp(&mcp.reports())?,
+            ChatInput::Command(ChatCommand::Model(model)) => {
+                let Some(model) = model else {
+                    view.show_model(&config)?;
+                    continue;
+                };
+                let model = model.trim();
+                if model.is_empty() {
+                    view.warning("Usage: /model <id>")?;
+                    continue;
+                }
+                if model == config.model.model {
+                    view.notice(format!(
+                        "{} / {} is already active.",
+                        config.model.provider, config.model.model
+                    ))?;
+                    continue;
+                }
+                let mut next = config.clone();
+                next.model.model = model.to_owned();
+                if let Err(error) = next.validate() {
+                    view.warning(format!("Could not switch model: {error}"))?;
+                    continue;
+                }
+                subagents.shutdown().await;
+                config = next;
+                session.set_model(&config.model.provider, &config.model.model)?;
+                agent = None;
+                subagents = create_subagent_manager(&config, &workspace, &view)?;
+                view.refresh_model_header(
+                    &config,
+                    &workspace,
+                    session.summary(),
+                    &instruction_set,
+                    skills.len(),
+                    commands.len(),
+                )?;
+            }
             ChatInput::Command(ChatCommand::Lsp) => view.show_lsp(&lsp.summaries().await)?,
             ChatInput::Command(ChatCommand::LspRestart) => {
                 lsp.restart().await;
@@ -1739,6 +1777,11 @@ async fn run_active_chat_task(
                     }
                     ChatInput::Command(ChatCommand::Mcp) => {
                         view.show_mcp(&mcp.reports())?;
+                    }
+                    ChatInput::Command(ChatCommand::Model(_)) => {
+                        view.warning(
+                            "Switch models after the active task finishes; use /cancel first if needed.",
+                        )?;
                     }
                     ChatInput::Command(ChatCommand::Commands) => {
                         view.show_commands(&commands.commands())?;

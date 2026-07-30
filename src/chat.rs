@@ -56,6 +56,7 @@ pub enum ChatCommand {
     Lsp,
     LspRestart,
     Mcp,
+    Model(Option<String>),
     Fork(Option<String>),
     New,
     Plan,
@@ -90,6 +91,7 @@ pub struct ChatShell {
     output: TerminalOutput,
     tui_receiver: Option<std::sync::mpsc::Receiver<TuiMessage>>,
     completions: Vec<tui::CommandCompletion>,
+    models: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -99,7 +101,12 @@ pub struct ChatView {
 }
 
 impl ChatShell {
-    pub fn new(workspace: &Path, commands: &[PromptCommand], skills: &[Skill]) -> Result<Self> {
+    pub fn new(
+        workspace: &Path,
+        config: &Config,
+        commands: &[PromptCommand],
+        skills: &[Skill],
+    ) -> Result<Self> {
         let history_path = default_history_path();
         if let Some(parent) = history_path.parent() {
             create_private_directory(parent)?;
@@ -150,6 +157,7 @@ impl ChatShell {
             output,
             tui_receiver,
             completions: command_completions(commands, skills),
+            models: model_completions(config),
         })
     }
 
@@ -165,10 +173,15 @@ impl ChatShell {
         if let Some(tui_receiver) = self.tui_receiver.take() {
             let history_path = self.history_path.clone();
             let completions = self.completions.clone();
+            let models = self.models.clone();
             thread::spawn(move || {
-                if let Err(error) =
-                    tui::run(tui_receiver, sender.clone(), history_path, completions)
-                {
+                if let Err(error) = tui::run(
+                    tui_receiver,
+                    sender.clone(),
+                    history_path,
+                    completions,
+                    models,
+                ) {
                     let _ = sender.send(Err(error));
                 }
             });
@@ -265,6 +278,36 @@ fn completion_files(workspace: &Path) -> Vec<String> {
     files
 }
 
+fn model_completions(config: &Config) -> Vec<String> {
+    let suggested: &[&str] = match config.model.provider.as_str() {
+        "openai" => &["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-codex"],
+        "anthropic" => &["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-6"],
+        "gemini" => &[
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ],
+        "openrouter" => &[
+            "anthropic/claude-sonnet-4.6",
+            "openai/gpt-5.4",
+            "google/gemini-2.5-pro",
+        ],
+        "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
+        "groq" => &["openai/gpt-oss-120b", "qwen/qwen3-32b"],
+        "xai" => &["grok-code-fast-1", "grok-4.1-fast"],
+        "mistral" => &["devstral-medium-latest", "devstral-small-latest"],
+        "ollama" => &["qwen3-coder", "gpt-oss"],
+        _ => &[],
+    };
+    let mut models = Vec::new();
+    for model in std::iter::once(config.model.model.as_str()).chain(suggested.iter().copied()) {
+        if !models.iter().any(|current| current == model) {
+            models.push(model.to_owned());
+        }
+    }
+    models
+}
+
 fn command_completions(
     commands: &[PromptCommand],
     skills: &[Skill],
@@ -286,6 +329,7 @@ fn command_completions(
         ("/queue", "Show queued messages"),
         ("/clear-queue", "Clear queued messages"),
         ("/cancel", "Cancel the active task"),
+        ("/model", "Show or switch the session model"),
         ("/status", "Show session status"),
         ("/mcp", "Show MCP servers"),
         ("/lsp", "Show language servers"),
@@ -421,6 +465,7 @@ impl ChatView {
              \n  {:12} Allow a pending action once\
              \n  {:12} Allow matching actions for this session\
              \n  {:12} Deny a pending action with optional feedback\
+             \n  {:12} Show or switch the model for this session\
              \n  {:12} Show model, workspace, cache, and context\
              \n  {:12} Show MCP server and tool status\
              \n  {:12} Show language-server status\
@@ -462,6 +507,7 @@ impl ChatView {
             "/approve",
             "/approve-session",
             "/deny [reason]",
+            "/model [id]",
             "/status",
             "/mcp",
             "/lsp",
@@ -509,6 +555,47 @@ impl ChatView {
             self.show_queue(queue)?;
         }
         Ok(())
+    }
+
+    pub fn show_model(&self, config: &Config) -> Result<()> {
+        self.output.print(format!(
+            "\n{}\n  provider  {}\n  model     {}\n  protocol  {}\n\n  Switch with /model <id>. The change applies to this session only.\n",
+            Style::new().cyan().bold().apply_to("Model"),
+            config.model.provider,
+            config.model.model,
+            protocol_name(config.model.family, config.model.wire_api),
+        ))
+    }
+
+    pub fn refresh_model_header(
+        &self,
+        config: &Config,
+        workspace: &Path,
+        session: &SessionSummary,
+        instructions: &InstructionSet,
+        skill_count: usize,
+        command_count: usize,
+    ) -> Result<()> {
+        self.output.set_tui_header(
+            format!(
+                "{} · {}  |  {}",
+                config.model.provider,
+                config.model.model,
+                compact_path(workspace)
+            ),
+            format!(
+                "session {} · {} rules · {} skills · {} commands · {} · /help",
+                short_id(&session.id),
+                instructions.files.len(),
+                skill_count,
+                command_count,
+                protocol_name(config.model.family, config.model.wire_api)
+            ),
+        );
+        self.notice(format!(
+            "Model switched to {} / {} for this session.",
+            config.model.provider, config.model.model
+        ))
     }
 
     pub fn show_rules(&self, instructions: &InstructionSet) -> Result<()> {
@@ -1366,7 +1453,10 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
             ChatInput::Command(ChatCommand::StopAgent(argument.parse::<u64>().ok()))
         }
         "/steer" => ChatInput::Task(argument.to_owned()),
-        "/model" | "/status" => ChatInput::Command(ChatCommand::Status),
+        "/model" => ChatInput::Command(ChatCommand::Model(
+            (!argument.is_empty()).then(|| argument.to_owned()),
+        )),
+        "/status" => ChatInput::Command(ChatCommand::Status),
         command if command.starts_with("/skill:") => ChatInput::Command(ChatCommand::Skill {
             name: command.trim_start_matches("/skill:").to_owned(),
             arguments: argument.to_owned(),
@@ -1507,7 +1597,11 @@ mod tests {
         );
         assert_eq!(
             parse_input("/model"),
-            ChatInput::Command(ChatCommand::Status)
+            ChatInput::Command(ChatCommand::Model(None))
+        );
+        assert_eq!(
+            parse_input("/model gpt-fast"),
+            ChatInput::Command(ChatCommand::Model(Some("gpt-fast".into())))
         );
         assert_eq!(
             parse_input("/review src \"error paths\""),

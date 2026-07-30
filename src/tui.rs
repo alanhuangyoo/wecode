@@ -128,10 +128,12 @@ pub(crate) fn run(
     inputs: tokio_mpsc::UnboundedSender<Result<ChatInput>>,
     history_path: PathBuf,
     completions: Vec<CommandCompletion>,
+    models: Vec<String>,
 ) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let history = load_history(&history_path);
     let mut state = TuiState::new(history, completions);
+    state.models = models;
     let mut redraw = true;
 
     loop {
@@ -317,6 +319,7 @@ struct TuiState {
     history: Vec<String>,
     history_index: Option<usize>,
     metrics: Option<String>,
+    models: Vec<String>,
     plan: Option<Vec<String>>,
     scroll: u16,
     status: Option<String>,
@@ -338,6 +341,7 @@ impl TuiState {
             history,
             history_index: None,
             metrics: None,
+            models: Vec::new(),
             plan: None,
             scroll: 0,
             status: None,
@@ -536,7 +540,7 @@ impl TuiState {
     }
 
     fn active_command_completions(&self) -> Vec<&CommandCompletion> {
-        if self.active_file_query().is_some() {
+        if self.active_file_query().is_some() || self.active_model_query().is_some() {
             return Vec::new();
         }
         let value = self.composer.text.trim_start();
@@ -547,6 +551,37 @@ impl TuiState {
             .iter()
             .filter(|completion| completion.command.starts_with(value))
             .take(8)
+            .collect()
+    }
+
+    fn active_model_query(&self) -> Option<String> {
+        let value = self.composer.text.trim_start();
+        let query = value.strip_prefix("/model")?;
+        if query.is_empty() || !query.starts_with(char::is_whitespace) || query.contains('\n') {
+            return None;
+        }
+        Some(query.trim().to_ascii_lowercase())
+    }
+
+    fn active_model_completions(&self) -> Vec<&String> {
+        let Some(query) = self.active_model_query() else {
+            return Vec::new();
+        };
+        let mut matches = self
+            .models
+            .iter()
+            .filter_map(|model| file_match_score(model, &query).map(|score| (score, model)))
+            .collect::<Vec<_>>();
+        matches.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left.len().cmp(&right.len()))
+                .then_with(|| left.cmp(right))
+        });
+        matches
+            .into_iter()
+            .take(8)
+            .map(|(_, model)| model)
             .collect()
     }
 
@@ -601,6 +636,10 @@ impl TuiState {
     }
 
     fn active_completion_count(&self) -> usize {
+        let models = self.active_model_completions();
+        if !models.is_empty() {
+            return models.len();
+        }
         let files = self.active_file_completions();
         if files.is_empty() {
             self.active_command_completions().len()
@@ -610,6 +649,19 @@ impl TuiState {
     }
 
     fn apply_completion(&mut self, force: bool) -> bool {
+        let model = self
+            .active_model_completions()
+            .get(self.completion_selected)
+            .map(|model| (*model).clone());
+        if let Some(model) = model {
+            if !force && self.composer.text.trim() == format!("/model {model}") {
+                return false;
+            }
+            self.composer.set(format!("/model {model}"));
+            self.completion_selected = 0;
+            return true;
+        }
+
         let file = self
             .active_file_completions()
             .get(self.completion_selected)
@@ -914,10 +966,17 @@ fn draw_attachments(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState
 }
 
 fn draw_completions(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let model_completions = state.active_model_completions();
     let file_completions = state.active_file_completions();
     let command_completions = state.active_command_completions();
-    let file_mode = !file_completions.is_empty();
-    let completions = if file_mode {
+    let model_mode = !model_completions.is_empty();
+    let file_mode = !model_mode && !file_completions.is_empty();
+    let completions = if model_mode {
+        model_completions
+            .iter()
+            .map(|model| ((*model).as_str(), "switch for this session"))
+            .collect::<Vec<_>>()
+    } else if file_mode {
         file_completions
             .iter()
             .map(|path| ((*path).as_str(), "attach to message"))
@@ -960,7 +1019,9 @@ fn draw_completions(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState
         Paragraph::new(lines).block(
             Block::default()
                 .title(Span::styled(
-                    if file_mode {
+                    if model_mode {
+                        " Models · ↑↓ select · Enter/Tab complete "
+                    } else if file_mode {
                         " Files · ↑↓ select · Enter/Tab attach "
                     } else {
                         " Commands · ↑↓ select · Tab complete "
@@ -1446,6 +1507,37 @@ mod tests {
         assert!(rendered.contains("/review"));
         assert!(rendered.contains("Review current changes"));
         assert!(rendered.contains("Tab complete"));
+    }
+
+    #[test]
+    fn model_palette_filters_completes_and_submits() {
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.models = vec![
+            "gpt-5.4".into(),
+            "gpt-5.4-mini".into(),
+            "claude-haiku-4-5".into(),
+        ];
+        state.composer.insert("/model mini");
+
+        assert_eq!(
+            state
+                .active_model_completions()
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["gpt-5.4-mini"]
+        );
+        let completed = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(completed.input.is_none());
+        assert_eq!(state.composer.text, "/model gpt-5.4-mini");
+
+        let submitted = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            submitted.input,
+            Some(ChatInput::Command(crate::chat::ChatCommand::Model(Some(
+                "gpt-5.4-mini".into()
+            ))))
+        );
     }
 
     #[test]

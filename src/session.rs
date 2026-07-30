@@ -67,6 +67,11 @@ enum SessionEntry {
         timestamp_ms: u64,
         title: String,
     },
+    Model {
+        timestamp_ms: u64,
+        provider: String,
+        model: String,
+    },
     Checkpoint {
         timestamp_ms: u64,
         id: String,
@@ -206,6 +211,29 @@ impl ChatSession {
             }],
         )?;
         self.summary.title = Some(title);
+        self.summary.updated_at_ms = timestamp_ms;
+        Ok(())
+    }
+
+    pub fn set_model(&mut self, provider: &str, model: &str) -> Result<()> {
+        if self.summary.provider == provider && self.summary.model == model {
+            return Ok(());
+        }
+        let timestamp_ms = timestamp_ms();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.summary.path)
+            .with_context(|| format!("failed to append session {}", self.summary.path.display()))?;
+        write_entries(
+            file,
+            &[SessionEntry::Model {
+                timestamp_ms,
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+            }],
+        )?;
+        self.summary.provider = provider.to_owned();
+        self.summary.model = model.to_owned();
         self.summary.updated_at_ms = timestamp_ms;
         Ok(())
     }
@@ -401,8 +429,8 @@ fn load_session(path: &Path) -> Result<LoadedSession> {
         id,
         workspace,
         created_at_ms,
-        provider,
-        model,
+        mut provider,
+        mut model,
     } = serde_json::from_str(&header).context("invalid session header")?
     else {
         bail!("first session record is not a header");
@@ -446,6 +474,15 @@ fn load_session(path: &Path) -> Result<LoadedSession> {
             } => {
                 updated_at_ms = updated_at_ms.max(timestamp_ms);
                 title = Some(next_title);
+            }
+            SessionEntry::Model {
+                timestamp_ms,
+                provider: next_provider,
+                model: next_model,
+            } => {
+                updated_at_ms = updated_at_ms.max(timestamp_ms);
+                provider = next_provider;
+                model = next_model;
             }
             SessionEntry::Checkpoint {
                 timestamp_ms,
@@ -753,16 +790,20 @@ mod tests {
             Message::assistant(r#"{"action":"finish","summary":"done"}"#),
         ]);
         session.set_initial_title("fix parser").unwrap();
+        session.set_model("openai", "gpt-next").unwrap();
         session.save(&conversation).unwrap();
 
         let summaries = ChatSession::list(&state, &workspace).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].title.as_deref(), Some("fix parser"));
         assert_eq!(summaries[0].message_count, 2);
+        assert_eq!(summaries[0].provider, "openai");
+        assert_eq!(summaries[0].model, "gpt-next");
 
         let (resumed, resumed_conversation) =
             ChatSession::resume(&state, &workspace, Some(&session.summary().id[..8])).unwrap();
         assert_eq!(resumed.summary().id, session.summary().id);
+        assert_eq!(resumed.summary().model, "gpt-next");
         assert_eq!(resumed_conversation, conversation);
     }
 

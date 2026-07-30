@@ -147,6 +147,7 @@ composer remains editable while the agent works.
 /approve-session
              Allow matching actions for this session
 /deny        Deny the pending action with optional feedback
+/model       Show the current model; `/model <id>` switches it for this session
 /status      Show model, workspace, cache, and context
 /mcp         Show connected MCP servers and tools
 /lsp         Show detected, configured, and running language servers
@@ -169,6 +170,12 @@ stored at `~/.wecode/history`. WeCode automatically creates a checkpoint before 
 `/checkpoint [name]` adds a manual marker, `/fork [checkpoint]` branches from a marker (or the
 current conversation), and `/rewind [checkpoint]` creates and switches to a fork of an earlier
 state. Rewind never truncates or rewrites the original append-only session.
+
+Use `/model` to inspect the active provider, model, and wire protocol. `/model <id>` switches the
+model for the current interactive session while preserving conversation context. WeCode rebuilds
+the model client before the next task, and the response cache automatically uses the new model
+namespace. Model switching is unavailable while a task is active so one agent turn never mixes
+models.
 
 Attach a UTF-8 source or text file with `/attach path`, or paste a PNG, JPEG, GIF, or WebP path
 directly into the full-screen composer. A compact attachment panel stays visible until the next
