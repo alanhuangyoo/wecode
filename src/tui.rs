@@ -63,6 +63,7 @@ pub(crate) enum TuiMessage {
         title: Option<String>,
         placeholder: Option<String>,
     },
+    Attachments(Vec<String>),
 }
 
 impl TuiHandle {
@@ -103,6 +104,10 @@ impl TuiHandle {
         let _ = self
             .sender
             .send(TuiMessage::Composer { title, placeholder });
+    }
+
+    pub fn set_attachments(&self, attachments: Vec<String>) {
+        let _ = self.sender.send(TuiMessage::Attachments(attachments));
     }
 }
 
@@ -160,8 +165,15 @@ pub(crate) fn run(
                 }
             }
             Event::Paste(text) => {
-                state.composer.insert(&text);
-                redraw = true;
+                if crate::attachments::looks_like_image_path(&text) {
+                    let path = crate::attachments::normalized_path_text(&text).to_owned();
+                    let _ = inputs.send(Ok(ChatInput::Command(crate::chat::ChatCommand::Attach(
+                        path,
+                    ))));
+                } else {
+                    state.composer.insert(&text);
+                    redraw = true;
+                }
             }
             Event::Resize(_, _) => redraw = true,
             _ => {}
@@ -196,6 +208,7 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
                 state.plan = None;
                 state.composer_title = None;
                 state.composer_placeholder = None;
+                state.attachments.clear();
                 changed = true;
             }
             Ok(TuiMessage::Header { primary, secondary }) => {
@@ -218,6 +231,10 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
             Ok(TuiMessage::Composer { title, placeholder }) => {
                 state.composer_title = title;
                 state.composer_placeholder = placeholder;
+                changed = true;
+            }
+            Ok(TuiMessage::Attachments(attachments)) => {
+                state.attachments = attachments;
                 changed = true;
             }
             Err(TryRecvError::Disconnected) => {
@@ -279,6 +296,7 @@ struct TranscriptEntry {
 }
 
 struct TuiState {
+    attachments: Vec<String>,
     composer: Composer,
     composer_placeholder: Option<String>,
     composer_title: Option<String>,
@@ -298,6 +316,7 @@ struct TuiState {
 impl TuiState {
     fn new(history: Vec<String>, completions: Vec<CommandCompletion>) -> Self {
         Self {
+            attachments: Vec::new(),
             composer: Composer::default(),
             composer_placeholder: None,
             composer_title: None,
@@ -388,7 +407,15 @@ impl TuiState {
                 }
                 let text = self.composer.take();
                 if text.trim().is_empty() {
-                    return KeyOutcome::changed();
+                    if self.attachments.is_empty() {
+                        return KeyOutcome::changed();
+                    }
+                    let prompt = "Inspect the attached file or image.".to_owned();
+                    return if modifiers.contains(KeyModifiers::ALT) {
+                        KeyOutcome::input(ChatInput::FollowUp(prompt))
+                    } else {
+                        KeyOutcome::input(ChatInput::Task(prompt))
+                    };
                 }
                 if modifiers.contains(KeyModifiers::ALT) {
                     KeyOutcome::input(ChatInput::FollowUp(text))
@@ -650,8 +677,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
     let composer_height = composer_height(&state.composer.text, area.width);
     let completion_count = state.active_completions().len();
+    let transcript_min = area
+        .height
+        .saturating_sub(3_u16.saturating_add(composer_height).saturating_add(1))
+        .min(3);
     let base_height = 3_u16
-        .saturating_add(3)
+        .saturating_add(transcript_min)
         .saturating_add(composer_height)
         .saturating_add(1);
     let mut optional_height = area.height.saturating_sub(base_height);
@@ -664,6 +695,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         0
     };
     optional_height = optional_height.saturating_sub(completion_height);
+    let desired_attachment_height = if state.attachments.is_empty() { 0 } else { 3 };
+    let attachment_height = if desired_attachment_height > 0 && optional_height >= 3 {
+        desired_attachment_height
+    } else {
+        0
+    };
+    optional_height = optional_height.saturating_sub(attachment_height);
     let desired_plan_height = state
         .plan
         .as_ref()
@@ -678,9 +716,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     if plan_height > 0 {
         constraints.push(Constraint::Length(plan_height));
     }
-    constraints.push(Constraint::Min(3));
+    constraints.push(Constraint::Min(transcript_min));
     if completion_height > 0 {
         constraints.push(Constraint::Length(completion_height));
+    }
+    if attachment_height > 0 {
+        constraints.push(Constraint::Length(attachment_height));
     }
     constraints.extend([Constraint::Length(composer_height), Constraint::Length(1)]);
     let chunks = Layout::default()
@@ -700,8 +741,38 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         draw_completions(frame, chunks[index], state);
         index += 1;
     }
+    if attachment_height > 0 {
+        draw_attachments(frame, chunks[index], state);
+        index += 1;
+    }
     draw_composer(frame, chunks[index], state);
     draw_footer(frame, chunks[index + 1], state);
+}
+
+fn draw_attachments(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let available = area.width.saturating_sub(6) as usize;
+    let names = state.attachments.join("  ·  ");
+    let line = Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(Color::Magenta)),
+        Span::styled(
+            truncate(&names, available),
+            Style::default().fg(Color::Gray),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).block(
+            Block::default()
+                .title(Span::styled(
+                    " Attachments · /detach [number|all] ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        area,
+    );
 }
 
 fn draw_completions(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
@@ -905,11 +976,17 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(block, area);
 
     if state.composer.text.is_empty() {
-        let placeholder = state.composer_placeholder.as_deref().unwrap_or(if running {
-            "Type to steer, or Alt-Enter to queue the next task"
-        } else {
-            "Ask WeCode to do anything in this repository"
-        });
+        let placeholder =
+            state
+                .composer_placeholder
+                .as_deref()
+                .unwrap_or(if !state.attachments.is_empty() {
+                    "Add a message, or press Enter to send the attachments"
+                } else if running {
+                    "Type to steer, or Alt-Enter to queue the next task"
+                } else {
+                    "Ask WeCode to do anything in this repository"
+                });
         frame.render_widget(
             Paragraph::new(Span::styled(
                 placeholder,
@@ -1203,6 +1280,20 @@ mod tests {
     }
 
     #[test]
+    fn enter_submits_pending_attachments_without_requiring_text() {
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.attachments = vec!["1:image:~/screen.png".into()];
+
+        let outcome = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            outcome.input,
+            Some(ChatInput::Task(
+                "Inspect the attached file or image.".into()
+            ))
+        );
+    }
+
+    #[test]
     fn short_terminal_keeps_the_composer_visible() {
         let backend = TestBackend::new(48, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1279,5 +1370,46 @@ mod tests {
         assert!(rendered.contains("Answer WeCode"));
         assert!(rendered.contains("another answer"));
         assert!(rendered.contains("cancel task"));
+    }
+
+    #[test]
+    fn attachment_panel_renders_without_hiding_the_composer() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.attachments = vec!["1:image:~/screen.png".into(), "2:file:~/notes.txt".into()];
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Attachments"));
+        assert!(rendered.contains("screen.png"));
+        assert!(rendered.contains("Message"));
+        assert!(rendered.contains("send"));
+    }
+
+    #[test]
+    fn short_terminal_prioritizes_composer_over_attachment_panel() {
+        let backend = TestBackend::new(48, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.attachments = vec!["1:image:~/screen.png".into()];
+        state.composer.insert("describe this");
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Message"));
+        assert!(rendered.contains("describe this"));
     }
 }

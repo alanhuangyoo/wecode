@@ -6,6 +6,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::agent::{Agent, Conversation, RunOptions};
 use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalEnvelope};
+use crate::attachments::{
+    PendingAttachment, load as load_attachment, normalized_path_text, prepare_message, validate_set,
+};
 use crate::background_process::BackgroundProcessManager;
 use crate::bench::{BenchOptions, run_manifest};
 use crate::cache::ResponseCache;
@@ -15,6 +18,7 @@ use crate::config::{
     ApprovalPolicy, CacheMode, Config, ProviderFamily, WireApi, default_config_path,
     provider_preset,
 };
+use crate::context::ImageAttachment;
 use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
 use crate::hooks::{HookEvent, HookInput, HookOutcome, HookRunner, append_context};
@@ -182,6 +186,9 @@ pub struct RunArgs {
     /// Event output format.
     #[arg(long, value_enum, default_value = "human")]
     pub output: OutputMode,
+    /// Attach a UTF-8 text file or supported image to the task. May be repeated.
+    #[arg(long = "file", alias = "image", value_name = "PATH")]
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -311,6 +318,8 @@ async fn run_once(args: RunArgs) -> Result<()> {
     }
 
     let (config, workspace) = resolve_config_passive(&args.common)?;
+    let files = load_attachments(&args.files, &workspace)?;
+    let (task, images) = prepare_message(&task, files)?;
     let cache = ResponseCache::new(config.cache.clone())?;
     let model = create_model(&config.model, config.api_key()?, cache)?;
     let sink: Box<dyn EventSink> = match args.output {
@@ -348,6 +357,7 @@ async fn run_once(args: RunArgs) -> Result<()> {
                 lsp: None,
                 subagents: None,
                 additional_system_prompt: None,
+                images,
             },
         )
         .await;
@@ -405,6 +415,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     let (approval, mut approval_requests) = ApprovalClient::channel();
     let (user_input, mut user_input_requests) = UserInputClient::channel();
     let mut plan = PlanState::restore(conversation.messages());
+    let mut pending_attachments = Vec::new();
     view.welcome(
         &config,
         &workspace,
@@ -414,6 +425,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         commands.len(),
     )?;
     view.sync_plan(&plan.current());
+    view.sync_attachments(&pending_attachments);
     let initial_hooks = run_hook_event(
         &hooks,
         HookEvent::SessionStart,
@@ -590,6 +602,8 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 conversation = Conversation::default();
                 plan.clear();
                 input_queue.clear();
+                pending_attachments.clear();
+                view.sync_attachments(&pending_attachments);
                 processes = create_background_process_manager(&config, &workspace, &view);
                 lsp = create_lsp_manager(&config, &workspace, &view)?;
                 subagents = create_subagent_manager(&config, &workspace, &view)?;
@@ -624,6 +638,15 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             }
             ChatInput::Command(ChatCommand::Cancel) => {
                 view.notice("No task is running.")?;
+            }
+            ChatInput::Command(ChatCommand::Attach(path)) => {
+                attach_pending(&mut pending_attachments, &path, &workspace, &view)?;
+            }
+            ChatInput::Command(ChatCommand::Attachments) => {
+                view.show_attachments(&pending_attachments)?;
+            }
+            ChatInput::Command(ChatCommand::Detach(selector)) => {
+                detach_pending(&mut pending_attachments, &selector, &view)?;
             }
             ChatInput::Command(ChatCommand::Checkpoint(label)) => {
                 let checkpoint = session.checkpoint(label.as_deref(), &conversation, false)?;
@@ -695,6 +718,8 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        pending_attachments.clear();
+                        view.sync_attachments(&pending_attachments);
                         processes = create_background_process_manager(&config, &workspace, &view);
                         lsp = create_lsp_manager(&config, &workspace, &view)?;
                         subagents = create_subagent_manager(&config, &workspace, &view)?;
@@ -771,6 +796,8 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        pending_attachments.clear();
+                        view.sync_attachments(&pending_attachments);
                         processes = create_background_process_manager(&config, &workspace, &view);
                         lsp = create_lsp_manager(&config, &workspace, &view)?;
                         subagents = create_subagent_manager(&config, &workspace, &view)?;
@@ -837,6 +864,8 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         conversation = next_conversation;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
+                        pending_attachments.clear();
+                        view.sync_attachments(&pending_attachments);
                         processes = create_background_process_manager(&config, &workspace, &view);
                         lsp = create_lsp_manager(&config, &workspace, &view)?;
                         subagents = create_subagent_manager(&config, &workspace, &view)?;
@@ -915,12 +944,6 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 let mut contexts = std::mem::take(&mut pending_session_hook_context);
                 contexts.extend(prompt_contexts);
                 let task = append_context(&task, &contexts);
-                session.set_initial_title(title_override.as_deref().unwrap_or(&task_title))?;
-                session.checkpoint(
-                    Some(&automatic_checkpoint_label(&task_title)),
-                    &conversation,
-                    true,
-                )?;
                 if agent.is_none() {
                     let api_key = match config.api_key() {
                         Ok(api_key) => api_key,
@@ -947,13 +970,24 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         skills.clone(),
                     ));
                 }
+                let attachments = std::mem::take(&mut pending_attachments);
+                view.sync_attachments(&pending_attachments);
+                let (task, images) = prepare_message(&task, attachments)?;
+                session.set_initial_title(title_override.as_deref().unwrap_or(&task_title))?;
+                session.checkpoint(
+                    Some(&automatic_checkpoint_label(&task_title)),
+                    &conversation,
+                    true,
+                )?;
 
                 let mut current_task = task;
+                let mut current_images = images;
                 let mut stop_blocks = 0_usize;
                 let exit_requested = loop {
                     let result = run_active_chat_task(
                         agent.as_mut().expect("chat agent initialized"),
                         &current_task,
+                        &current_images,
                         &mut conversation,
                         &session,
                         &config,
@@ -972,6 +1006,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &skills,
                         &commands,
                         &hooks,
+                        &mut pending_attachments,
                         &mut inputs,
                         &view,
                     )
@@ -1003,6 +1038,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                                     .unwrap_or("Continue working before stopping."),
                                 &stop_hooks.additional_context,
                             );
+                            current_images.clear();
                             view.notice(format!(
                                 "Stop hook requested another agent turn ({stop_blocks}/3)."
                             ))?;
@@ -1022,7 +1058,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     if follow_ups.is_empty() {
                         break false;
                     }
-                    current_task = combined_follow_up(&follow_ups);
+                    (current_task, current_images) = combined_follow_up(&follow_ups);
                     view.notice(format!(
                         "Starting {} queued follow-up message{}.",
                         follow_ups.len(),
@@ -1096,6 +1132,101 @@ fn create_subagent_manager(
         let _ = event_view.show_subagent_event(&event);
     });
     Ok(manager)
+}
+
+fn load_attachments(paths: &[PathBuf], workspace: &Path) -> Result<Vec<PendingAttachment>> {
+    let mut attachments = Vec::new();
+    for path in paths {
+        let attachment = load_attachment(path, workspace)?;
+        if attachments
+            .iter()
+            .any(|current: &PendingAttachment| current.path() == attachment.path())
+        {
+            continue;
+        }
+        attachments.push(attachment);
+        validate_set(&attachments)?;
+    }
+    Ok(attachments)
+}
+
+fn attach_pending(
+    attachments: &mut Vec<PendingAttachment>,
+    path: &str,
+    workspace: &Path,
+    view: &ChatView,
+) -> Result<()> {
+    let path = normalized_path_text(path);
+    if path.is_empty() {
+        view.warning("Usage: /attach <path>")?;
+        return Ok(());
+    }
+    let attachment = match load_attachment(Path::new(path), workspace) {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            view.warning(error.to_string())?;
+            return Ok(());
+        }
+    };
+    if attachments
+        .iter()
+        .any(|current| current.path() == attachment.path())
+    {
+        view.warning(format!(
+            "{} is already attached.",
+            attachment.display_name()
+        ))?;
+        return Ok(());
+    }
+    let display = attachment.display_name();
+    attachments.push(attachment);
+    if let Err(error) = validate_set(attachments) {
+        attachments.pop();
+        view.warning(error.to_string())?;
+        return Ok(());
+    }
+    view.sync_attachments(attachments);
+    view.notice(format!(
+        "Attached {display} to the next message · {} pending.",
+        attachments.len()
+    ))
+}
+
+fn detach_pending(
+    attachments: &mut Vec<PendingAttachment>,
+    selector: &str,
+    view: &ChatView,
+) -> Result<()> {
+    if attachments.is_empty() {
+        view.warning("No pending attachments.")?;
+        return Ok(());
+    }
+    let selector = selector.trim();
+    if selector.eq_ignore_ascii_case("all") {
+        let count = attachments.len();
+        attachments.clear();
+        view.sync_attachments(attachments);
+        return view.notice(format!("Removed all {count} pending attachments."));
+    }
+    let index = if selector.is_empty() {
+        attachments.len() - 1
+    } else {
+        let Ok(number) = selector.parse::<usize>() else {
+            view.warning("Usage: /detach [number|all]")?;
+            return Ok(());
+        };
+        if number == 0 || number > attachments.len() {
+            view.warning(format!(
+                "Attachment number must be between 1 and {}.",
+                attachments.len()
+            ))?;
+            return Ok(());
+        }
+        number - 1
+    };
+    let removed = attachments.remove(index);
+    view.sync_attachments(attachments);
+    view.notice(format!("Detached {}.", removed.display_name()))
 }
 
 async fn stop_background_process(
@@ -1196,6 +1327,7 @@ struct ActiveChatResult {
 async fn run_active_chat_task(
     agent: &mut Agent,
     task: &str,
+    images: &[ImageAttachment],
     conversation: &mut Conversation,
     session: &ChatSession,
     config: &Config,
@@ -1214,6 +1346,7 @@ async fn run_active_chat_task(
     skills: &SkillCatalog,
     commands: &CommandCatalog,
     hooks: &HookRunner,
+    pending_attachments: &mut Vec<PendingAttachment>,
     inputs: &mut tokio::sync::mpsc::UnboundedReceiver<Result<ChatInput>>,
     view: &ChatView,
 ) -> Result<ActiveChatResult> {
@@ -1232,6 +1365,7 @@ async fn run_active_chat_task(
             processes: Some(processes.clone()),
             lsp: Some(lsp.clone()),
             subagents: Some(subagents.clone()),
+            images: images.to_vec(),
             ..Default::default()
         },
         conversation,
@@ -1264,6 +1398,18 @@ async fn run_active_chat_task(
                 };
                 let input = input?;
                 match &input {
+                    ChatInput::Command(ChatCommand::Attach(path)) => {
+                        attach_pending(pending_attachments, path, workspace, view)?;
+                        continue;
+                    }
+                    ChatInput::Command(ChatCommand::Attachments) => {
+                        view.show_attachments(pending_attachments)?;
+                        continue;
+                    }
+                    ChatInput::Command(ChatCommand::Detach(selector)) => {
+                        detach_pending(pending_attachments, selector, view)?;
+                        continue;
+                    }
                     ChatInput::Command(ChatCommand::Processes) => {
                         view.show_processes(&processes.summaries())?;
                         continue;
@@ -1444,7 +1590,13 @@ async fn run_active_chat_task(
                         )
                         .await?
                         {
-                            let queued = input_queue.steer(append_context(&text, &contexts));
+                            let attachments = std::mem::take(pending_attachments);
+                            view.sync_attachments(pending_attachments);
+                            let (text, images) = prepare_message(
+                                &append_context(&text, &contexts),
+                                attachments,
+                            )?;
+                            let queued = input_queue.steer_with_images(text, images);
                             view.show_queued("steer", queued.id, input_queue.snapshot().len())?;
                         }
                     }
@@ -1462,7 +1614,13 @@ async fn run_active_chat_task(
                         )
                         .await?
                         {
-                            let queued = input_queue.follow_up(append_context(&text, &contexts));
+                            let attachments = std::mem::take(pending_attachments);
+                            view.sync_attachments(pending_attachments);
+                            let (text, images) = prepare_message(
+                                &append_context(&text, &contexts),
+                                attachments,
+                            )?;
+                            let queued = input_queue.follow_up_with_images(text, images);
                             view.show_queued(
                                 "follow-up",
                                 queued.id,
@@ -1500,6 +1658,11 @@ async fn run_active_chat_task(
                     ChatInput::Command(ChatCommand::Agents)
                     | ChatInput::Command(ChatCommand::StopAgent(_)) => {
                         unreachable!("subagent commands are handled before interaction dispatch")
+                    }
+                    ChatInput::Command(ChatCommand::Attach(_))
+                    | ChatInput::Command(ChatCommand::Attachments)
+                    | ChatInput::Command(ChatCommand::Detach(_)) => {
+                        unreachable!("attachment commands are handled before interaction dispatch")
                     }
                     ChatInput::Command(ChatCommand::Help) => view.show_help()?,
                     ChatInput::Command(ChatCommand::Approve)
@@ -1544,8 +1707,14 @@ async fn run_active_chat_task(
                                 )
                                 .await?
                                 {
+                                    let attachments = std::mem::take(pending_attachments);
+                                    view.sync_attachments(pending_attachments);
+                                    let (request, images) = prepare_message(
+                                        &append_context(&request, &contexts),
+                                        attachments,
+                                    )?;
                                     let queued =
-                                        input_queue.steer(append_context(&request, &contexts));
+                                        input_queue.steer_with_images(request, images);
                                     view.show_queued(
                                         "skill steer",
                                         queued.id,
@@ -1569,8 +1738,14 @@ async fn run_active_chat_task(
                                 )
                                 .await?
                                 {
+                                    let attachments = std::mem::take(pending_attachments);
+                                    view.sync_attachments(pending_attachments);
+                                    let (request, images) = prepare_message(
+                                        &append_context(&request, &contexts),
+                                        attachments,
+                                    )?;
                                     let queued =
-                                        input_queue.steer(append_context(&request, &contexts));
+                                        input_queue.steer_with_images(request, images);
                                     view.show_queued(
                                         "command steer",
                                         queued.id,
@@ -1640,15 +1815,19 @@ async fn run_active_chat_task(
     })
 }
 
-fn combined_follow_up(inputs: &[QueuedInput]) -> String {
+fn combined_follow_up(inputs: &[QueuedInput]) -> (String, Vec<ImageAttachment>) {
+    let images = inputs
+        .iter()
+        .flat_map(|input| input.images.clone())
+        .collect();
     if inputs.len() == 1 {
-        return inputs[0].text.clone();
+        return (inputs[0].text.clone(), images);
     }
     let mut result = String::from("Queued follow-up requests, in order:\n");
     for (index, input) in inputs.iter().enumerate() {
         result.push_str(&format!("\n{}. {}", index + 1, input.text.trim()));
     }
-    result
+    (result, images)
 }
 
 fn automatic_checkpoint_label(task: &str) -> String {
@@ -1934,6 +2113,30 @@ mod tests {
             panic!("expected run command");
         };
         assert!(args.common.text_actions);
+    }
+
+    #[test]
+    fn parses_repeated_file_and_image_attachments() {
+        let cli = Cli::try_parse_from([
+            "wecode",
+            "run",
+            "--file",
+            "src/parser.rs",
+            "--image",
+            "/tmp/failure.png",
+            "fix the parser",
+        ])
+        .unwrap();
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            args.files,
+            [
+                PathBuf::from("src/parser.rs"),
+                PathBuf::from("/tmp/failure.png")
+            ]
+        );
     }
 
     #[test]

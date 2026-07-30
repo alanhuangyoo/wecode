@@ -14,6 +14,7 @@ use wecode::config::McpServerConfig;
 use wecode::config::{
     ApprovalPolicy, CacheConfig, Config, LspConfig, LspServerConfig, SkillsConfig,
 };
+use wecode::context::ImageAttachment;
 use wecode::control::CancellationToken;
 use wecode::events::{Event, EventSink};
 use wecode::input_queue::InputQueue;
@@ -849,6 +850,11 @@ async fn interactive_conversation_preserves_follow_up_context() {
             "inspect the project",
             RunOptions {
                 session_id: Some("stable-chat-session".into()),
+                images: vec![ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: "Zmlyc3Q=".into(),
+                    name: "first.png".into(),
+                }],
                 ..Default::default()
             },
             &mut conversation,
@@ -860,6 +866,11 @@ async fn interactive_conversation_preserves_follow_up_context() {
             "now explain the result",
             RunOptions {
                 session_id: Some("stable-chat-session".into()),
+                images: vec![ImageAttachment {
+                    media_type: "image/jpeg".into(),
+                    data: "c2Vjb25k".into(),
+                    name: "second.jpg".into(),
+                }],
                 ..Default::default()
             },
             &mut conversation,
@@ -872,6 +883,13 @@ async fn interactive_conversation_preserves_follow_up_context() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].session_id, "stable-chat-session");
     assert_eq!(requests[1].session_id, "stable-chat-session");
+    assert_eq!(requests[0].messages[0].images[0].name, "first.png");
+    assert!(requests[1].messages.iter().any(|message| {
+        message
+            .images
+            .iter()
+            .any(|image| image.name == "second.jpg")
+    }));
     assert!(
         requests[1]
             .messages
@@ -1019,7 +1037,14 @@ async fn steering_arriving_during_sampling_reopens_the_active_run() {
         let queue = queue.clone();
         async move {
             started.notified().await;
-            queue.steer("also explain the result");
+            queue.steer_with_images(
+                "also explain the result",
+                vec![ImageAttachment {
+                    media_type: "image/webp".into(),
+                    data: "c3RlZXI=".into(),
+                    name: "steering.webp".into(),
+                }],
+            );
             release.notify_one();
         }
     });
@@ -1049,6 +1074,12 @@ async fn steering_arriving_during_sampling_reopens_the_active_run() {
             .iter()
             .any(|message| message.content.contains("also explain the result"))
     );
+    assert!(requests[1].messages.iter().any(|message| {
+        message
+            .images
+            .iter()
+            .any(|image| image.name == "steering.webp")
+    }));
     assert!(
         events
             .lock()

@@ -128,6 +128,9 @@ composer remains editable while the agent works.
 /checkpoints List checkpoints in the current session
 /fork        Fork from now or from a selected checkpoint
 /rewind      Rewind safely by forking from an earlier checkpoint
+/attach      Attach a text file or image to the next message
+/attachments Show files attached to the next message
+/detach      Remove the last, selected, or all attachments
 /plan        Show the current task plan
 /processes   Show managed background processes
 /stop-process <id>
@@ -166,6 +169,22 @@ stored at `~/.wecode/history`. WeCode automatically creates a checkpoint before 
 `/checkpoint [name]` adds a manual marker, `/fork [checkpoint]` branches from a marker (or the
 current conversation), and `/rewind [checkpoint]` creates and switches to a fork of an earlier
 state. Rewind never truncates or rewrites the original append-only session.
+
+Attach a UTF-8 source or text file with `/attach path`, or paste a PNG, JPEG, GIF, or WebP path
+directly into the full-screen composer. A compact attachment panel stays visible until the next
+message is sent; use `/attachments` to inspect it and `/detach [number|all]` to remove entries.
+Attachments also work in machine-oriented runs:
+
+```bash
+wecode run -C /path/to/repository \
+  --file src/parser.rs --file /tmp/failure.png \
+  "Diagnose this failure and fix the parser."
+```
+
+Text files become bounded prompt context, while images remain first-class multimodal message
+parts for OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini. Attachments
+are carried through steering, queued follow-ups, saved sessions, forks, and rewinds. Empty
+attachment state does not change normal request serialization or the benchmark tool profile.
 
 For substantial work, the agent can create and maintain a plan that remains visible above the
 timeline; `/plan` shows it in the line-oriented fallback. When a choice materially changes the

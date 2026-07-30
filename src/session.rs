@@ -582,6 +582,17 @@ fn message_digest(messages: &[Message]) -> [u8; 32] {
                 .to_le_bytes(),
         );
         hasher.update(message.content.as_bytes());
+        hasher.update(
+            u64::try_from(message.images.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for image in &message.images {
+            for value in [&image.media_type, &image.name, &image.data] {
+                hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+        }
     }
     hasher.finalize().into()
 }
@@ -728,6 +739,7 @@ fn write_entries(file: File, entries: &[SessionEntry]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ImageAttachment;
 
     #[test]
     fn persists_lists_renames_and_resumes_a_conversation() {
@@ -752,6 +764,37 @@ mod tests {
             ChatSession::resume(&state, &workspace, Some(&session.summary().id[..8])).unwrap();
         assert_eq!(resumed.summary().id, session.summary().id);
         assert_eq!(resumed_conversation, conversation);
+    }
+
+    #[test]
+    fn image_messages_round_trip_through_resume_checkpoint_and_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let workspace = temp.path().join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = ChatSession::create(&state, &workspace, "openai", "gpt-test").unwrap();
+        let image = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "YWJj".into(),
+            name: "screen.png".into(),
+        };
+        let conversation = Conversation::from_messages(vec![
+            Message::user_with_images("inspect", vec![image]),
+            Message::assistant("done"),
+        ]);
+        session.save(&conversation).unwrap();
+        let checkpoint = session
+            .checkpoint(Some("with image"), &conversation, false)
+            .unwrap();
+
+        let (_, resumed) =
+            ChatSession::resume(&state, &workspace, Some(&session.summary().id[..8])).unwrap();
+        assert_eq!(resumed, conversation);
+        let (_, forked) = session
+            .fork(&state, &conversation, Some(&checkpoint.id))
+            .unwrap();
+        assert_eq!(forked, conversation);
+        assert_eq!(forked.messages()[0].images[0].data, "YWJj");
     }
 
     #[test]

@@ -118,6 +118,9 @@ Agent 工作时仍可继续编辑。
 /checkpoints 列出当前会话的检查点
 /fork        从当前位置或指定检查点创建分支
 /rewind      通过分支安全回到更早的检查点
+/attach      给下一条消息附加文本文件或图片
+/attachments 查看下一条消息的待发送附件
+/detach      删除最后一个、指定或全部附件
 /plan        查看当前任务计划
 /processes   查看受管理的后台进程
 /stop-process <id>
@@ -155,6 +158,21 @@ Agent 工作时仍可继续编辑。
 每个任务开始前，WeCode 都会自动创建检查点。`/checkpoint [名称]` 可添加手动检查点，
 `/fork [检查点]` 会从检查点（不传参数时为当前位置）创建分支，`/rewind [检查点]`
 会创建并切换到更早状态的分支。Rewind 永远不会截断或改写原始的 append-only 会话。
+
+使用 `/attach 路径` 可以附加 UTF-8 源码/文本文件；在全屏界面里直接粘贴 PNG、JPEG、GIF
+或 WebP 图片路径也会自动加入附件。附件面板会一直显示到下一条消息发送为止；
+`/attachments` 用于查看，`/detach [编号|all]` 用于移除。非交互任务也支持附件：
+
+```bash
+wecode run -C /path/to/repository \
+  --file src/parser.rs --file /tmp/failure.png \
+  "分析这个错误并修复解析器。"
+```
+
+文本文件会作为有大小上限的 Prompt 上下文；图片会作为 OpenAI Chat Completions、
+OpenAI Responses、Anthropic Messages 和 Gemini 的原生多模态消息发送。附件可以跟随
+Steer、排队的 Follow-up、持久化会话、Fork 和 Rewind。没有附件时，请求序列化和 Benchmark
+工具配置保持不变。
 
 面对复杂任务时，Agent 可以创建并持续更新计划，计划会固定显示在时间线上方；普通行模式
 可以使用 `/plan` 查看。当某个选择会实质影响结果时，Agent 可以暂停并给出两到四个具体

@@ -14,9 +14,24 @@ pub enum Role {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ImageAttachment {
+    pub media_type: String,
+    pub data: String,
+    pub name: String,
+}
+
+impl ImageAttachment {
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
 }
 
 impl Message {
@@ -24,6 +39,15 @@ impl Message {
         Self {
             role: Role::User,
             content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            images,
         }
     }
 
@@ -31,6 +55,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 }
@@ -52,8 +77,20 @@ impl ContextWindow {
     pub fn compact(&self, messages: &mut Vec<Message>) -> usize {
         let total: u64 = messages
             .iter()
-            .map(|message| xai_token_estimation::estimate_tokens(&message.content))
-            .sum();
+            .map(|message| {
+                xai_token_estimation::estimate_tokens(&message.content).saturating_add(
+                    message
+                        .images
+                        .iter()
+                        .map(|image| {
+                            u64::try_from(image.data.len().saturating_div(4))
+                                .unwrap_or(u64::MAX)
+                                .clamp(256, 4_096)
+                        })
+                        .fold(0_u64, u64::saturating_add),
+                )
+            })
+            .fold(0_u64, u64::saturating_add);
         if total <= self.max_tokens || messages.len() <= self.keep_messages + 1 {
             return 0;
         }
@@ -100,6 +137,16 @@ fn summarize(messages: &[Message]) -> String {
                 ingest_actions(&message.content, result, &mut facts);
             }
             Role::User => ingest_user_message(&message.content, &mut facts),
+        }
+        for image in &message.images {
+            push_fact(
+                &mut facts.other,
+                format!(
+                    "User attached image `{}` ({}).",
+                    image.name, image.media_type
+                ),
+                10,
+            );
         }
     }
 
@@ -609,5 +656,44 @@ mod tests {
         context.compact(&mut right);
         assert_eq!(left, right);
         assert!(left[1].content.len() <= MAX_SUMMARY_BYTES);
+    }
+
+    #[test]
+    fn compaction_drops_old_image_payloads_but_keeps_a_durable_fact() {
+        let image = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "a".repeat(20_000),
+            name: "failure.png".into(),
+        };
+        let mut messages = vec![Message::user("task")];
+        messages.push(Message::user_with_images("inspect this", vec![image]));
+        for index in 0..10 {
+            messages.push(Message::assistant(format!(
+                "step {index} {}",
+                "x".repeat(500)
+            )));
+            messages.push(Message::user(format!("result {index} {}", "y".repeat(500))));
+        }
+
+        assert!(ContextWindow::new(200, 4).compact(&mut messages) > 0);
+        assert!(messages[1].content.contains("failure.png"));
+        assert!(messages[1].content.contains("image/png"));
+        assert!(messages.iter().all(|message| message.images.is_empty()));
+        assert!(
+            !serde_json::to_string(&messages)
+                .unwrap()
+                .contains(&"a".repeat(1_000))
+        );
+    }
+
+    #[test]
+    fn old_message_json_deserializes_and_empty_images_do_not_change_shape() {
+        let message: Message =
+            serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert!(message.images.is_empty());
+        assert_eq!(
+            serde_json::to_value(message).unwrap(),
+            serde_json::json!({"role": "user", "content": "hello"})
+        );
     }
 }

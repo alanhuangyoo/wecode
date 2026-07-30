@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use crate::context::ImageAttachment;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueuedInputKind {
     Steer,
@@ -12,6 +14,7 @@ pub struct QueuedInput {
     pub id: u64,
     pub kind: QueuedInputKind,
     pub text: String,
+    pub images: Vec<ImageAttachment>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -48,11 +51,27 @@ impl InputQueue {
     }
 
     pub fn steer(&self, text: impl Into<String>) -> QueuedInput {
-        self.enqueue(QueuedInputKind::Steer, text.into())
+        self.steer_with_images(text, Vec::new())
+    }
+
+    pub fn steer_with_images(
+        &self,
+        text: impl Into<String>,
+        images: Vec<ImageAttachment>,
+    ) -> QueuedInput {
+        self.enqueue(QueuedInputKind::Steer, text.into(), images)
     }
 
     pub fn follow_up(&self, text: impl Into<String>) -> QueuedInput {
-        self.enqueue(QueuedInputKind::FollowUp, text.into())
+        self.follow_up_with_images(text, Vec::new())
+    }
+
+    pub fn follow_up_with_images(
+        &self,
+        text: impl Into<String>,
+        images: Vec<ImageAttachment>,
+    ) -> QueuedInput {
+        self.enqueue(QueuedInputKind::FollowUp, text.into(), images)
     }
 
     pub fn has_steering(&self) -> bool {
@@ -90,13 +109,19 @@ impl InputQueue {
         }
     }
 
-    fn enqueue(&self, kind: QueuedInputKind, text: String) -> QueuedInput {
+    fn enqueue(
+        &self,
+        kind: QueuedInputKind,
+        text: String,
+        images: Vec<ImageAttachment>,
+    ) -> QueuedInput {
         let mut state = self.inner.lock().expect("input queue lock poisoned");
         state.next_id = state.next_id.saturating_add(1);
         let input = QueuedInput {
             id: state.next_id,
             kind,
             text,
+            images,
         };
         match kind {
             QueuedInputKind::Steer => state.steering.push_back(input.clone()),

@@ -227,6 +227,7 @@ fn merge_adjacent_messages(messages: &[Message]) -> Vec<Message> {
         {
             last.content.push_str("\n\n");
             last.content.push_str(&message.content);
+            last.images.extend(message.images.clone());
             continue;
         }
         result.push(message.clone());
@@ -266,6 +267,7 @@ mod tests {
 
     use super::*;
     use crate::config::CacheConfig;
+    use crate::context::ImageAttachment;
 
     struct FakeRawModel {
         calls: Arc<AtomicUsize>,
@@ -414,5 +416,50 @@ mod tests {
         .unwrap();
         assert_ne!(base, extended);
         assert!(extended.contains(":tools:"));
+    }
+
+    #[test]
+    fn image_content_changes_cache_keys_without_entering_the_namespace() {
+        let cache = ResponseCache::new(CacheConfig::default()).unwrap();
+        let request = |data: &str| CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message::user_with_images(
+                "inspect",
+                vec![ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: data.into(),
+                    name: "screen.png".into(),
+                }],
+            )],
+            session_id: "session".into(),
+        };
+        let first = cache.key("safe-namespace", &request("image-one")).unwrap();
+        let second = cache.key("safe-namespace", &request("image-two")).unwrap();
+
+        assert_ne!(first, second);
+        assert!(!first.contains("image-one"));
+        assert!(!second.contains("image-two"));
+        assert!(
+            !cache_namespace(&ModelConfig::default(), None, ToolProfile::Coding)
+                .unwrap()
+                .contains("image")
+        );
+    }
+
+    #[test]
+    fn empty_images_preserve_completion_request_json_shape() {
+        let request = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message::user("task")],
+            session_id: "session".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({
+                "system": "system",
+                "messages": [{"role": "user", "content": "task"}],
+                "session_id": "session"
+            })
+        );
     }
 }

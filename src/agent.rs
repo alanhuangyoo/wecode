@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalKind, RiskLevel, classify_shell};
 use crate::background_process::BackgroundProcessManager;
 use crate::config::Config;
-use crate::context::{ContextWindow, Message};
+use crate::context::{ContextWindow, ImageAttachment, Message};
 use crate::control::CancellationToken;
 use crate::events::{Event, EventSink, JsonlSink};
 use crate::executor::{ExecutionResult, Executor};
@@ -49,6 +49,7 @@ pub struct RunOptions {
     pub lsp: Option<LspManager>,
     pub subagents: Option<SubagentManager>,
     pub additional_system_prompt: Option<String>,
+    pub images: Vec<ImageAttachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -220,17 +221,16 @@ impl Agent {
         let mut messages = match conversation.as_deref() {
             Some(conversation) if !conversation.messages.is_empty() => {
                 let mut messages = conversation.messages.clone();
-                messages.push(Message::user(follow_up_prompt(
-                    task,
-                    options.verify.as_deref(),
-                )));
+                messages.push(Message::user_with_images(
+                    follow_up_prompt(task, options.verify.as_deref()),
+                    options.images.clone(),
+                ));
                 messages
             }
-            _ => vec![Message::user(initial_prompt(
-                task,
-                &self.workspace,
-                options.verify.as_deref(),
-            )?)],
+            _ => vec![Message::user_with_images(
+                initial_prompt(task, &self.workspace, options.verify.as_deref())?,
+                options.images.clone(),
+            )],
         };
         let mut format_errors = 0;
         let mut verify_failures = 0;
@@ -1378,7 +1378,11 @@ impl Agent {
             return Ok(0);
         }
         let count = inputs.len();
-        messages.push(Message::user(steering_prompt(&inputs)));
+        let images = inputs
+            .iter()
+            .flat_map(|input| input.images.clone())
+            .collect();
+        messages.push(Message::user_with_images(steering_prompt(&inputs), images));
         self.emit(recorder, Event::SteeringDelivered { step, count })?;
         Ok(count)
     }

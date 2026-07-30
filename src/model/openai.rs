@@ -61,7 +61,7 @@ impl OpenAiModel {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                 },
-                "content": message.content,
+                "content": chat_message_content(message),
             })
         }));
         let mut body = json!({
@@ -101,7 +101,7 @@ impl OpenAiModel {
                         Role::User => "user",
                         Role::Assistant => "assistant",
                     },
-                    "content": message.content,
+                    "content": responses_message_content(message),
                 })
             })
             .collect();
@@ -136,6 +136,42 @@ impl OpenAiModel {
         }
         body
     }
+}
+
+fn chat_message_content(message: &crate::context::Message) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+    let mut content = vec![json!({"type": "text", "text": message.content})];
+    content.extend(message.images.iter().map(|image| {
+        json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image.data_url(),
+                "detail": "auto",
+            }
+        })
+    }));
+    Value::Array(content)
+}
+
+fn responses_message_content(message: &crate::context::Message) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+    let text_type = match message.role {
+        Role::User => "input_text",
+        Role::Assistant => "output_text",
+    };
+    let mut content = vec![json!({"type": text_type, "text": message.content})];
+    content.extend(message.images.iter().map(|image| {
+        json!({
+            "type": "input_image",
+            "image_url": image.data_url(),
+            "detail": "auto",
+        })
+    }));
+    Value::Array(content)
 }
 
 #[async_trait]
@@ -524,6 +560,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::context::{ImageAttachment, Message};
 
     #[derive(Default)]
     struct RecordingStream(Mutex<Vec<ModelStreamEvent>>);
@@ -533,6 +570,44 @@ mod tests {
             self.0.lock().unwrap().push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn serializes_images_for_chat_and_responses_without_changing_text_only_shape() {
+        let text = Message::user("inspect");
+        assert_eq!(chat_message_content(&text), json!("inspect"));
+        assert_eq!(responses_message_content(&text), json!("inspect"));
+
+        let image = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "YWJj".into(),
+            name: "screen.png".into(),
+        };
+        let message = Message::user_with_images("inspect", vec![image]);
+        assert_eq!(
+            chat_message_content(&message),
+            json!([
+                {"type": "text", "text": "inspect"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,YWJj",
+                        "detail": "auto"
+                    }
+                }
+            ])
+        );
+        assert_eq!(
+            responses_message_content(&message),
+            json!([
+                {"type": "input_text", "text": "inspect"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,YWJj",
+                    "detail": "auto"
+                }
+            ])
+        );
     }
 
     #[test]

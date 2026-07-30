@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod approval;
+pub mod attachments;
 pub mod background_process;
 pub mod bench;
 pub mod cache;

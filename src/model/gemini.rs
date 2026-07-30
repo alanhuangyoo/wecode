@@ -41,12 +41,21 @@ impl GeminiModel {
         let contents: Vec<Value> = merge_adjacent_messages(&request.messages)
             .iter()
             .map(|message| {
+                let mut parts = vec![json!({"text": message.content})];
+                parts.extend(message.images.iter().map(|image| {
+                    json!({
+                        "inlineData": {
+                            "mimeType": image.media_type,
+                            "data": image.data,
+                        }
+                    })
+                }));
                 json!({
                     "role": match message.role {
                         Role::User => "user",
                         Role::Assistant => "model",
                     },
-                    "parts": [{"text": message.content}],
+                    "parts": parts,
                 })
             })
             .collect();
@@ -297,6 +306,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::context::{ImageAttachment, Message};
 
     #[derive(Default)]
     struct RecordingStream(Mutex<Vec<ModelStreamEvent>>);
@@ -306,6 +316,47 @@ mod tests {
             self.0.lock().unwrap().push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn serializes_gemini_inline_images_and_preserves_text_only_parts() {
+        let config = ModelConfig {
+            native_tools: false,
+            ..Default::default()
+        };
+        let model = GeminiModel::new(
+            config,
+            None,
+            reqwest::Client::new(),
+            ToolProfile::Coding,
+            Vec::new(),
+        );
+        let plain = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message::user("inspect")],
+            session_id: "session".into(),
+        };
+        assert_eq!(
+            model.body(&plain)["contents"][0]["parts"],
+            json!([{"text": "inspect"}])
+        );
+
+        let image = ImageAttachment {
+            media_type: "image/webp".into(),
+            data: "YWJj".into(),
+            name: "screen.webp".into(),
+        };
+        let request = CompletionRequest {
+            messages: vec![Message::user_with_images("inspect", vec![image])],
+            ..plain
+        };
+        assert_eq!(
+            model.body(&request)["contents"][0]["parts"],
+            json!([
+                {"text": "inspect"},
+                {"inlineData": {"mimeType": "image/webp", "data": "YWJj"}}
+            ])
+        );
     }
 
     #[test]

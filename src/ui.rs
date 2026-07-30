@@ -129,6 +129,14 @@ impl TerminalOutput {
         true
     }
 
+    pub fn set_tui_attachments(&self, attachments: Vec<String>) -> bool {
+        let TerminalOutputInner::Tui(handle) = self.inner.as_ref() else {
+            return false;
+        };
+        handle.set_attachments(attachments);
+        true
+    }
+
     pub fn tui_entry(
         &self,
         label: impl Into<String>,

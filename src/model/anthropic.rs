@@ -77,12 +77,23 @@ impl AnthropicModel {
                 {
                     block["cache_control"] = cache_control.clone();
                 }
+                let mut content = vec![block];
+                content.extend(message.images.iter().map(|image| {
+                    json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.media_type,
+                            "data": image.data,
+                        }
+                    })
+                }));
                 json!({
                     "role": match message.role {
                         Role::User => "user",
                         Role::Assistant => "assistant",
                     },
-                    "content": [block],
+                    "content": content,
                 })
             })
             .collect();
@@ -370,6 +381,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::context::{ImageAttachment, Message};
 
     #[derive(Default)]
     struct RecordingStream(Mutex<Vec<ModelStreamEvent>>);
@@ -379,6 +391,55 @@ mod tests {
             self.0.lock().unwrap().push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn serializes_anthropic_image_blocks_and_preserves_text_only_blocks() {
+        let config = ModelConfig {
+            prompt_cache: PromptCacheMode::Off,
+            native_tools: false,
+            ..Default::default()
+        };
+        let model = AnthropicModel::new(
+            config,
+            None,
+            reqwest::Client::new(),
+            ToolProfile::Coding,
+            Vec::new(),
+        );
+        let plain = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message::user("inspect")],
+            session_id: "session".into(),
+        };
+        assert_eq!(
+            model.body(&plain)["messages"][0]["content"],
+            json!([{"type": "text", "text": "inspect"}])
+        );
+
+        let image = ImageAttachment {
+            media_type: "image/jpeg".into(),
+            data: "YWJj".into(),
+            name: "screen.jpg".into(),
+        };
+        let request = CompletionRequest {
+            messages: vec![Message::user_with_images("inspect", vec![image])],
+            ..plain
+        };
+        assert_eq!(
+            model.body(&request)["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "inspect"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": "YWJj"
+                    }
+                }
+            ])
+        );
     }
 
     #[test]

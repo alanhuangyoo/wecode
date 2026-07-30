@@ -13,6 +13,7 @@ use rustyline::{
 use tokio::sync::mpsc;
 
 use crate::approval::ApprovalRequest;
+use crate::attachments::PendingAttachment;
 use crate::background_process::{
     BackgroundProcessEvent, BackgroundProcessStatus, BackgroundProcessSummary,
 };
@@ -36,6 +37,8 @@ use crate::ui::TerminalOutput;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatCommand {
     Agents,
+    Attach(String),
+    Attachments,
     Approve,
     ApproveSession,
     Cancel,
@@ -45,6 +48,7 @@ pub enum ChatCommand {
     Commands,
     Config,
     Deny(String),
+    Detach(String),
     Help,
     History,
     Hooks,
@@ -224,6 +228,9 @@ fn command_completions(
 ) -> Vec<tui::CommandCompletion> {
     let builtins = [
         ("/new", "Start a fresh conversation"),
+        ("/attach", "Attach a text file or image"),
+        ("/attachments", "Show pending attachments"),
+        ("/detach", "Remove pending attachments"),
         ("/resume", "Resume a saved session"),
         ("/sessions", "List saved sessions"),
         ("/checkpoint", "Save a conversation checkpoint"),
@@ -356,6 +363,9 @@ impl ChatView {
              \n  {:12} List checkpoints in the current session\
              \n  {:12} Fork from now or a selected checkpoint\
              \n  {:12} Rewind safely by forking from an earlier checkpoint\
+             \n  {:12} Attach a text file or image to the next message\
+             \n  {:12} Show files attached to the next message\
+             \n  {:12} Remove the last, selected, or all attachments\
              \n  {:12} Show the current task plan\
              \n  {:12} Show managed background processes\
              \n  {:12} Stop a managed background process\
@@ -393,6 +403,9 @@ impl ChatView {
             "/checkpoints",
             "/fork [checkpoint]",
             "/rewind [checkpoint]",
+            "/attach <path>",
+            "/attachments",
+            "/detach [number|all]",
             "/plan",
             "/processes",
             "/stop-process <id>",
@@ -655,6 +668,44 @@ impl ChatView {
         self.output.print(output)
     }
 
+    pub fn sync_attachments(&self, attachments: &[PendingAttachment]) {
+        self.output.set_tui_attachments(
+            attachments
+                .iter()
+                .enumerate()
+                .map(|(index, attachment)| format!("{}:{}", index + 1, attachment.display_name()))
+                .collect(),
+        );
+    }
+
+    pub fn show_attachments(&self, attachments: &[PendingAttachment]) -> Result<()> {
+        self.sync_attachments(attachments);
+        if attachments.is_empty() {
+            return self.notice("No files are attached to the next message.");
+        }
+        if self.output.tui_entry(
+            "ATTACHMENTS",
+            attachments
+                .iter()
+                .enumerate()
+                .map(|(index, attachment)| format!("{}. {}", index + 1, attachment.display_name()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            TuiTone::Normal,
+        ) {
+            return Ok(());
+        }
+        let mut output = format!(
+            "\n{}\n",
+            Style::new().magenta().bold().apply_to("Attachments")
+        );
+        for (index, attachment) in attachments.iter().enumerate() {
+            output.push_str(&format!("  {}. {}\n", index + 1, attachment.display_name()));
+        }
+        output.push('\n');
+        self.output.print(output)
+    }
+
     pub fn show_subagent_event(&self, event: &SubagentEvent) -> Result<()> {
         let tone = match event.status {
             SubagentStatus::Completed => TuiTone::Success,
@@ -897,19 +948,23 @@ impl ChatView {
             queue.len()
         );
         for input in &queue.steering {
+            let images = image_count_label(input.images.len());
             output.push_str(&format!(
-                "  {} #{:<3} {}\n",
+                "  {} #{:<3} {}{}\n",
                 Style::new().cyan().apply_to("steer"),
                 input.id,
-                one_line(&input.text)
+                one_line(&input.text),
+                images
             ));
         }
         for input in &queue.follow_ups {
+            let images = image_count_label(input.images.len());
             output.push_str(&format!(
-                "  {} #{:<3} {}\n",
+                "  {} #{:<3} {}{}\n",
                 Style::new().magenta().apply_to("follow-up"),
                 input.id,
-                one_line(&input.text)
+                one_line(&input.text),
+                images
             ));
         }
         if queue.is_empty() {
@@ -1217,6 +1272,8 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
     match command {
         "/quit" | "/exit" => ChatInput::Exit,
         "/agents" => ChatInput::Command(ChatCommand::Agents),
+        "/attach" | "/image" => ChatInput::Command(ChatCommand::Attach(argument.to_owned())),
+        "/attachments" | "/files" => ChatInput::Command(ChatCommand::Attachments),
         "/approve" | "/allow" => ChatInput::Command(ChatCommand::Approve),
         "/approve-session" | "/allow-session" | "/always" => {
             ChatInput::Command(ChatCommand::ApproveSession)
@@ -1231,6 +1288,9 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         "/clear" | "/new" => ChatInput::Command(ChatCommand::New),
         "/config" => ChatInput::Command(ChatCommand::Config),
         "/deny" | "/reject" => ChatInput::Command(ChatCommand::Deny(argument.to_owned())),
+        "/detach" | "/remove-attachment" => {
+            ChatInput::Command(ChatCommand::Detach(argument.to_owned()))
+        }
         "/followup" | "/follow-up" | "/later" => ChatInput::FollowUp(argument.to_owned()),
         "/help" | "/?" => ChatInput::Command(ChatCommand::Help),
         "/history" => ChatInput::Command(ChatCommand::History),
@@ -1277,6 +1337,14 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
 fn one_line(value: &str) -> String {
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&value, 72)
+}
+
+fn image_count_label(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(" · {count} image{}", if count == 1 { "" } else { "s" })
+    }
 }
 
 fn short_id(id: &str) -> &str {
@@ -1426,6 +1494,24 @@ mod tests {
         assert_eq!(
             parse_input("/deny no network"),
             ChatInput::Command(ChatCommand::Deny("no network".into()))
+        );
+        assert_eq!(
+            parse_input("/attach \"screenshots/error state.png\""),
+            ChatInput::Command(ChatCommand::Attach(
+                "\"screenshots/error state.png\"".into()
+            ))
+        );
+        assert_eq!(
+            parse_input("/attachments"),
+            ChatInput::Command(ChatCommand::Attachments)
+        );
+        assert_eq!(
+            parse_input("/detach"),
+            ChatInput::Command(ChatCommand::Detach(String::new()))
+        );
+        assert_eq!(
+            parse_input("/detach all"),
+            ChatInput::Command(ChatCommand::Detach("all".into()))
         );
         assert_eq!(parse_input("/quit"), ChatInput::Exit);
         assert_eq!(
