@@ -1568,9 +1568,11 @@ async fn interactive_agent_progressively_loads_a_matching_skill() {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(requests[0].system.contains("<name>reviewer</name>"));
-        assert!(requests[0]
-            .system
-            .contains("Review Rust changes for correctness."));
+        assert!(
+            requests[0]
+                .system
+                .contains("Review Rust changes for correctness.")
+        );
         assert!(!requests[0].system.contains("# Review instructions"));
         assert!(
             requests[1]
