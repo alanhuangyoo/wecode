@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Take};
 use std::path::{Component, Path, PathBuf};
@@ -85,6 +85,7 @@ impl SkillCatalog {
     fn discover_roots(roots: &[DiscoveryRoot], config: &SkillsConfig) -> Result<Self> {
         let mut selected: BTreeMap<String, (usize, Skill)> = BTreeMap::new();
         let mut diagnostics = Vec::new();
+        let mut seen_files = BTreeSet::new();
         for root in roots {
             let files = match discover_skill_files(&root.path) {
                 Ok(files) => files,
@@ -107,6 +108,9 @@ impl SkillCatalog {
                         continue;
                     }
                 };
+                if !seen_files.insert(canonical.clone()) {
+                    continue;
+                }
                 let parsed = parse_skill(&canonical, root.scope, config.max_file_bytes);
                 let skill = match parsed {
                     Ok((skill, warnings)) => {
@@ -997,6 +1001,38 @@ mod tests {
         .unwrap();
         assert_eq!(catalog.skills()[0].description, "Project review.");
         assert_eq!(catalog.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn same_physical_skill_discovered_through_two_scopes_is_not_a_duplicate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("skills/review");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code.\n---\n",
+        )
+        .unwrap();
+        let parent = root.parent().unwrap().to_path_buf();
+        let catalog = SkillCatalog::discover_roots(
+            &[
+                DiscoveryRoot {
+                    path: parent.clone(),
+                    scope: SkillScope::User,
+                    priority: 1,
+                },
+                DiscoveryRoot {
+                    path: parent,
+                    scope: SkillScope::Project,
+                    priority: 2,
+                },
+            ],
+            &config(),
+        )
+        .unwrap();
+
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.diagnostics().is_empty());
     }
 
     #[test]

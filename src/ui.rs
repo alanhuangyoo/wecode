@@ -182,6 +182,28 @@ impl TerminalOutput {
         handle.entry(label.into(), text.into(), tone);
         true
     }
+
+    pub fn tui_tool_start(
+        &self,
+        step: usize,
+        label: impl Into<String>,
+        text: impl Into<String>,
+        tone: TuiTone,
+    ) -> bool {
+        let TerminalOutputInner::Tui(handle) = self.inner.as_ref() else {
+            return false;
+        };
+        handle.tool_start(step, label.into(), text.into(), tone);
+        true
+    }
+
+    pub fn tui_tool_result(&self, step: usize, text: impl Into<String>, tone: TuiTone) -> bool {
+        let TerminalOutputInner::Tui(handle) = self.inner.as_ref() else {
+            return false;
+        };
+        handle.tool_result(step, text.into(), tone);
+        true
+    }
 }
 
 pub struct TerminalUi {
@@ -288,7 +310,11 @@ impl TerminalUi {
         if self.output.is_tui() {
             self.output.push_tui_stream(text.to_owned(), reasoning);
             self.output
-                .set_tui_status(Some(format!("{label} · {preview}")));
+                .set_tui_status(Some(if preview.trim_start().starts_with('{') {
+                    "Selecting next action".into()
+                } else {
+                    format!("{label} · {preview}")
+                }));
         } else if let Some(spinner) = self.spinner.lock().expect("spinner lock poisoned").as_ref() {
             spinner.set_message(format!("{label} · {preview}"));
         }
@@ -355,10 +381,10 @@ impl EventSink for TerminalUi {
                 ))?;
             }
             Event::Action {
+                step,
                 kind,
                 description,
                 detail,
-                ..
             } => {
                 self.stop_spinner();
                 self.output.finish_tui_stream(kind != "finish");
@@ -366,25 +392,31 @@ impl EventSink for TerminalUi {
                     return Ok(());
                 }
                 if self.output.is_tui() {
+                    if kind == "finish" {
+                        self.output.print(detail.to_owned())?;
+                        return Ok(());
+                    }
+                    if matches!(kind.as_str(), "update_plan" | "request_user_input") {
+                        return Ok(());
+                    }
                     let (label, text, tone) = match kind.as_str() {
                         "read_file" => ("READ".into(), detail.to_owned(), TuiTone::Normal),
                         "list_files" => ("LIST".into(), detail.to_owned(), TuiTone::Normal),
                         "glob" => ("GLOB".into(), detail.to_owned(), TuiTone::Normal),
                         "grep" => ("GREP".into(), detail.to_owned(), TuiTone::Normal),
                         "shell" => (
-                            format!("RUN · {description}"),
-                            detail.to_owned(),
+                            "RUN".into(),
+                            format!("{description} · {detail}"),
                             TuiTone::Normal,
                         ),
                         "patch" => (
-                            format!("EDIT · {description}"),
-                            detail.to_owned(),
+                            "EDIT".into(),
+                            format!("{description} · {detail}"),
                             TuiTone::Warning,
                         ),
-                        "finish" => ("WECODE".into(), detail.to_owned(), TuiTone::Success),
                         _ => (kind.to_uppercase(), detail.to_owned(), TuiTone::Normal),
                     };
-                    self.output.tui_entry(label, text, tone);
+                    self.output.tui_tool_start(*step, label, text, tone);
                     return Ok(());
                 }
                 let panel = match kind.as_str() {
@@ -497,7 +529,7 @@ impl EventSink for TerminalUi {
                 truncated_bytes,
                 ..
             } => {
-                if self.output.is_tui() && *exit_code == Some(0) && *truncated_bytes == 0 {
+                if self.output.is_tui() {
                     return Ok(());
                 }
                 let status = match exit_code {
@@ -537,19 +569,25 @@ impl EventSink for TerminalUi {
                     *duration_ms as f64 / 1000.0
                 ))?;
             }
-            Event::ToolOutput { output, .. } => {
+            Event::ToolOutput { step, output } => {
                 if self.output.is_tui() && output.starts_with("PLAN UPDATED:") {
                     return Ok(());
                 }
                 let recovering = output.starts_with("FORMAT ERROR:");
-                if self.output.tui_entry(
-                    if recovering { "RECOVERING" } else { "OUTPUT" },
+                if recovering
+                    && self
+                        .output
+                        .tui_entry("RECOVERING", output, TuiTone::Warning)
+                {
+                    return Ok(());
+                }
+                let failed = output.starts_with("TOOL ERROR:")
+                    || output.contains("\nTOOL ERROR:")
+                    || has_failed_exit_code(output);
+                if self.output.tui_tool_result(
+                    *step,
                     output,
-                    if recovering {
-                        TuiTone::Warning
-                    } else {
-                        TuiTone::Dim
-                    },
+                    if failed { TuiTone::Error } else { TuiTone::Dim },
                 ) {
                     return Ok(());
                 }
@@ -646,26 +684,25 @@ impl EventSink for TerminalUi {
                 if self.mode == UiMode::Review {
                     return Ok(());
                 }
+                if self.output.is_tui() {
+                    if !success {
+                        self.output.tui_entry(
+                            "STOPPED",
+                            format!(
+                                "{steps} steps · {:.1}s · {} patch · {cache_hits} cache hits",
+                                *duration_ms as f64 / 1000.0,
+                                human_bytes(*patch_bytes as u64),
+                            ),
+                            TuiTone::Error,
+                        );
+                    }
+                    return Ok(());
+                }
                 let marker = if *success {
                     Style::new().green().bold().apply_to("✓ Done")
                 } else {
                     Style::new().red().bold().apply_to("■ Stopped")
                 };
-                if self.output.tui_entry(
-                    if *success { "DONE" } else { "STOPPED" },
-                    format!(
-                        "{steps} steps · {:.1}s · {} patch · {cache_hits} cache hits",
-                        *duration_ms as f64 / 1000.0,
-                        human_bytes(*patch_bytes as u64),
-                    ),
-                    if *success {
-                        TuiTone::Success
-                    } else {
-                        TuiTone::Error
-                    },
-                ) {
-                    return Ok(());
-                }
                 self.output.print(format!(
                     "  {marker} · {steps} steps · {:.1}s · {} patch · {cache_hits} cache hits\n\n",
                     *duration_ms as f64 / 1000.0,
@@ -788,6 +825,15 @@ fn compact_number(value: u64) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn has_failed_exit_code(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("exit code:")
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .is_some_and(|code| code != 0)
+    })
 }
 
 fn human_bytes(value: u64) -> String {

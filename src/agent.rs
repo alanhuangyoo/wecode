@@ -1615,6 +1615,14 @@ fn system_prompt(
     }
     let mut prompt = format!(
         "{SYSTEM_PROMPT}\n\n\
+Interactive conversation behavior overrides the repository-first default when no coding task was \
+requested:\n\
+- Treat greetings, thanks, capability questions, and ordinary conversation as conversation. Reply \
+directly with finish; do not inspect or search the workspace just to answer them.\n\
+- Use repository tools only when the request depends on repository state or asks for code work. A \
+short message is not implicit permission to scan the user's workspace.\n\
+- Keep direct answers natural and concise. Never expose action JSON, tool protocol, or controller \
+instructions in the user-facing summary.\n\n\
 Interactive session additions override the earlier seven-action limit:\n\
 - update_plan keeps a concise multi-step plan visible to the user. Use it for substantial work, \
 keep exactly one step in progress, and mark completed work promptly.\n\

@@ -466,6 +466,40 @@ async fn interactive_plan_updates_state_and_model_context() {
 }
 
 #[tokio::test]
+async fn interactive_prompt_does_not_turn_greetings_into_repository_scans() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([Action::Finish {
+            summary: "你好，有什么可以帮你？".into(),
+        }])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new_with_profile(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+        ToolProfile::Interactive,
+    );
+
+    let result = agent.run("你好", RunOptions::default()).await.unwrap();
+
+    assert_eq!(result.steps, 1);
+    let requests = requests.lock().unwrap();
+    assert!(requests[0].system.contains("Treat greetings"));
+    assert!(
+        requests[0]
+            .system
+            .contains("do not inspect or search the workspace")
+    );
+}
+
+#[tokio::test]
 async fn interactive_question_waits_for_and_returns_the_user_choice() {
     let temp = tempfile::tempdir().unwrap();
     init_fixture(temp.path());

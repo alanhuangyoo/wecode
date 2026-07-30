@@ -51,6 +51,17 @@ pub(crate) enum TuiMessage {
         text: String,
         tone: TuiTone,
     },
+    ToolStart {
+        step: usize,
+        label: String,
+        text: String,
+        tone: TuiTone,
+    },
+    ToolResult {
+        step: usize,
+        text: String,
+        tone: TuiTone,
+    },
     Clear,
     Header {
         primary: String,
@@ -93,6 +104,21 @@ impl TuiHandle {
 
     pub fn entry(&self, label: String, text: String, tone: TuiTone) {
         let _ = self.sender.send(TuiMessage::Entry { label, text, tone });
+    }
+
+    pub fn tool_start(&self, step: usize, label: String, text: String, tone: TuiTone) {
+        let _ = self.sender.send(TuiMessage::ToolStart {
+            step,
+            label,
+            text,
+            tone,
+        });
+    }
+
+    pub fn tool_result(&self, step: usize, text: String, tone: TuiTone) {
+        let _ = self
+            .sender
+            .send(TuiMessage::ToolResult { step, text, tone });
     }
 
     pub fn clear(&self) {
@@ -277,6 +303,19 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
                 state.append_entry(label, text, tone);
                 changed = true;
             }
+            Ok(TuiMessage::ToolStart {
+                step,
+                label,
+                text,
+                tone,
+            }) => {
+                state.append_tool(step, label, text, tone);
+                changed = true;
+            }
+            Ok(TuiMessage::ToolResult { step, text, tone }) => {
+                state.finish_tool(step, text, tone);
+                changed = true;
+            }
             Ok(TuiMessage::Clear) => {
                 state.transcript.clear();
                 state.live_response = None;
@@ -335,6 +374,7 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
                 if let Some(response) = state.live_response.take()
                     && commit
                     && !response.text.trim().is_empty()
+                    && !looks_like_internal_protocol(&response.text)
                 {
                     state.transcript.push(TranscriptEntry {
                         kind: TranscriptKind::Agent,
@@ -416,7 +456,16 @@ impl Drop for TerminalGuard {
 enum TranscriptKind {
     User,
     Agent,
-    Custom { label: String, tone: TuiTone },
+    Custom {
+        label: String,
+        tone: TuiTone,
+    },
+    Tool {
+        step: usize,
+        label: String,
+        tone: TuiTone,
+        result: Option<(String, TuiTone)>,
+    },
 }
 
 #[derive(Clone)]
@@ -513,6 +562,39 @@ impl TuiState {
             kind: TranscriptKind::Custom { label, tone },
             text: strip_ansi_codes(&text).trim().to_owned(),
         });
+        self.scroll = 0;
+    }
+
+    fn append_tool(&mut self, step: usize, label: String, text: String, tone: TuiTone) {
+        self.transcript.push(TranscriptEntry {
+            kind: TranscriptKind::Tool {
+                step,
+                label,
+                tone,
+                result: None,
+            },
+            text: strip_ansi_codes(&text).trim().to_owned(),
+        });
+        self.scroll = 0;
+    }
+
+    fn finish_tool(&mut self, step: usize, text: String, tone: TuiTone) {
+        let text = strip_ansi_codes(&text).trim().to_owned();
+        if let Some(entry) = self.transcript.iter_mut().find(|entry| {
+            matches!(
+                &entry.kind,
+                TranscriptKind::Tool {
+                    step: tool_step,
+                    result: None,
+                    ..
+                } if *tool_step == step
+            )
+        }) && let TranscriptKind::Tool { result, .. } = &mut entry.kind
+        {
+            *result = Some((text, tone));
+        } else {
+            self.append_entry("TOOL".into(), text, tone);
+        }
         self.scroll = 0;
     }
 
@@ -1301,6 +1383,23 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
         render_empty_state(&mut lines, state, width, area.height);
     } else {
         for entry in &state.transcript {
+            if let TranscriptKind::Tool {
+                label,
+                tone,
+                result,
+                ..
+            } = &entry.kind
+            {
+                render_tool_entry(
+                    &mut lines,
+                    label,
+                    &entry.text,
+                    *tone,
+                    result.as_ref(),
+                    width,
+                );
+                continue;
+            }
             let (label, color, marker) = match &entry.kind {
                 TranscriptKind::User => ("YOU", Color::Blue, "›"),
                 TranscriptKind::Agent => ("WECODE", Color::Cyan, "◆"),
@@ -1315,6 +1414,7 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
                     },
                     tool_marker(label),
                 ),
+                TranscriptKind::Tool { .. } => unreachable!("tool entries render separately"),
             };
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -1337,6 +1437,9 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
                     TranscriptKind::Custom {
                         tone: TuiTone::Dim, ..
                     } => Style::default().fg(Color::Gray),
+                    TranscriptKind::Tool { .. } => {
+                        unreachable!("tool entries render separately")
+                    }
                     _ => Style::default(),
                 };
                 for line in wrap_plain(raw, width) {
@@ -1365,6 +1468,128 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_tool_entry<'a>(
+    lines: &mut Vec<Line<'a>>,
+    label: &str,
+    detail: &str,
+    tone: TuiTone,
+    result: Option<&(String, TuiTone)>,
+    width: usize,
+) {
+    let color = tone_color(tone);
+    let compact_detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let label_width = UnicodeWidthStr::width(label);
+    let detail_width = width.saturating_sub(label_width + 8);
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {} ", tool_marker(label)),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            label.to_owned(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", truncate(&compact_detail, detail_width)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    match result {
+        None => lines.push(Line::from(Span::styled(
+            "    └ running…",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Some((result, result_tone)) => {
+            let result_color = tone_color(*result_tone);
+            let compact = compact_tool_result(result);
+            for (index, result_line) in compact.iter().enumerate() {
+                let branch = if index + 1 == compact.len() {
+                    "└"
+                } else {
+                    "├"
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {branch} "), Style::default().fg(result_color)),
+                    Span::styled(
+                        truncate(result_line, width.saturating_sub(8)),
+                        Style::default().fg(result_color),
+                    ),
+                ]));
+            }
+        }
+    }
+}
+
+fn compact_tool_result(result: &str) -> Vec<String> {
+    let clean = result
+        .trim()
+        .strip_prefix("TOOL ERROR:")
+        .map(str::trim)
+        .unwrap_or(result.trim());
+    if clean.is_empty() {
+        return vec!["completed".into()];
+    }
+    let lines = clean
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("TOOL RESULT "))
+        .collect::<Vec<_>>();
+    if let Some(entries) = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("entries:").map(str::trim))
+    {
+        return vec![format!("{entries} entries")];
+    }
+    if let Some(summary) = lines.iter().rev().find(|line| {
+        (line.starts_with('[') && line.contains("matches across")) || **line == "No matches found."
+    }) {
+        return vec![summary.trim_matches(['[', ']']).to_owned()];
+    }
+    if let Some(range) = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("lines:").map(str::trim))
+        && let Some(file) = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("file:").map(str::trim))
+    {
+        return vec![format!("{file} · lines {range}")];
+    }
+    if lines.len() <= 3 {
+        return lines.into_iter().map(ToOwned::to_owned).collect();
+    }
+
+    let mut output = lines
+        .iter()
+        .take(2)
+        .map(|line| (*line).to_owned())
+        .collect::<Vec<_>>();
+    if let Some(summary) = lines.iter().find(|line| {
+        line.starts_with("entries:")
+            || line.starts_with("matches:")
+            || line.starts_with("exit code:")
+            || line.starts_with("lines:")
+    }) && !output.iter().any(|line| line == summary)
+    {
+        output.push((*summary).to_owned());
+    }
+    output.push(format!(
+        "… {} more lines",
+        lines.len().saturating_sub(output.len())
+    ));
+    output
+}
+
+fn tone_color(tone: TuiTone) -> Color {
+    match tone {
+        TuiTone::Normal => Color::Cyan,
+        TuiTone::Success => Color::Green,
+        TuiTone::Warning => Color::Yellow,
+        TuiTone::Error => Color::Red,
+        TuiTone::Dim => Color::DarkGray,
+    }
 }
 
 fn render_empty_state<'a>(
@@ -1475,6 +1700,17 @@ fn render_live_response<'a>(
         )));
         return;
     }
+    if visible.trim_start().starts_with('{')
+        && (visible.contains("\"action\"")
+            || visible.contains("\"tool_calls\"")
+            || !visible.contains('\n'))
+    {
+        lines.push(Line::from(Span::styled(
+            "    Selecting the next repository action…",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return;
+    }
     for raw in visible
         .lines()
         .rev()
@@ -1542,6 +1778,25 @@ fn markdown_line_style(line: &str) -> Style {
     } else {
         Style::default()
     }
+}
+
+fn looks_like_internal_protocol(text: &str) -> bool {
+    let trimmed = text.trim();
+    let trimmed = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed)
+        .strip_suffix("```")
+        .unwrap_or(trimmed)
+        .trim();
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|object| {
+            object.contains_key("action")
+                || object.contains_key("tool_calls")
+                || object.contains_key("function_call")
+        })
 }
 
 fn diff_line_style(line: &str) -> Style {
@@ -1688,7 +1943,8 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let animated = status.starts_with("Thinking")
             || status.starts_with("Streaming")
-            || status.starts_with("Reviewing");
+            || status.starts_with("Reviewing")
+            || status.starts_with("Selecting");
         let spans = vec![
             Span::raw(" "),
             Span::styled(
@@ -2328,5 +2584,45 @@ mod tests {
         assert_eq!(composer.cursor, 4);
         composer.next_word();
         assert_eq!(composer.cursor, 8);
+    }
+
+    #[test]
+    fn internal_tool_protocol_is_never_rendered_as_assistant_copy() {
+        assert!(looks_like_internal_protocol(
+            r#"{"action":"list_files","path":".","depth":2}"#
+        ));
+        assert!(looks_like_internal_protocol(
+            "```json\n{\"action\":\"finish\",\"summary\":\"done\"}\n```"
+        ));
+        assert!(!looks_like_internal_protocol(
+            r#"{"status":"healthy","tests":12}"#
+        ));
+    }
+
+    #[test]
+    fn tool_call_and_result_render_as_one_compact_timeline_item() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.append_user("inspect the repository");
+        state.append_tool(1, "LIST".into(), ". · depth 2".into(), TuiTone::Normal);
+        state.finish_tool(
+            1,
+            "directory: .\ndepth: 2\nentries: 42\nsrc/\nsrc/main.rs\nCargo.toml".into(),
+            TuiTone::Dim,
+        );
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("LIST"));
+        assert!(rendered.contains("depth 2"));
+        assert!(rendered.contains("42 entries"));
+        assert!(!rendered.contains("OUTPUT"));
     }
 }

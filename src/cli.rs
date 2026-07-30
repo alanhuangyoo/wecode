@@ -494,13 +494,6 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             skills.diagnostics().len() - 5
         ))?;
     }
-    if !skills.is_empty() {
-        view.notice(format!(
-            "Discovered {} skill{} · /skills to inspect.",
-            skills.len(),
-            if skills.len() == 1 { "" } else { "s" }
-        ))?;
-    }
     for diagnostic in commands.diagnostics().iter().take(5) {
         view.warning(format!(
             "Command {}: {}",
@@ -512,20 +505,6 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         view.warning(format!(
             "{} additional command diagnostics omitted; use /commands to inspect loaded commands.",
             commands.diagnostics().len() - 5
-        ))?;
-    }
-    if !commands.is_empty() {
-        view.notice(format!(
-            "Discovered {} prompt command{} · /commands to inspect.",
-            commands.len(),
-            if commands.len() == 1 { "" } else { "s" }
-        ))?;
-    }
-    if !hooks.is_empty() {
-        view.notice(format!(
-            "Enabled {} lifecycle hook{} · /hooks to inspect.",
-            hooks.len(),
-            if hooks.len() == 1 { "" } else { "s" }
         ))?;
     }
     sync_context_metrics(&conversation, &config, last_usage, &view);

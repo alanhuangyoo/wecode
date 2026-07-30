@@ -623,7 +623,10 @@ fn walk_entries(root: &Path, max_depth: Option<usize>, include_dirs: bool) -> Re
     let mut entries = Vec::new();
     let mut truncated = false;
     for item in builder.build() {
-        let entry = item.with_context(|| format!("failed to walk {}", root.display()))?;
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
         if entry.depth() == 0 {
             continue;
         }
