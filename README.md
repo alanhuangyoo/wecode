@@ -173,6 +173,12 @@ state. Rewind never truncates or rewrites the original append-only session.
 Attach a UTF-8 source or text file with `/attach path`, or paste a PNG, JPEG, GIF, or WebP path
 directly into the full-screen composer. A compact attachment panel stays visible until the next
 message is sent; use `/attachments` to inspect it and `/detach [number|all]` to remove entries.
+Type `@` anywhere at a token boundary to open a repository-aware fuzzy file palette. Continue
+typing to filter, use `Up`/`Down` to select, and press `Enter` or `Tab` to insert the file mention.
+Paths with spaces are quoted automatically. When the message is sent, mentions such as
+`fix @src/parser.rs` become bounded attachments; ordinary email addresses and missing `@names`
+remain plain text. File indexing runs off the UI thread, respects Git ignore rules, includes hidden
+project files, and is hard-capped so startup stays responsive in large repositories.
 Attachments also work in machine-oriented runs:
 
 ```bash

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 use wecode::agent::{Agent, Conversation, RunOptions};
 use wecode::approval::{ApprovalClient, ApprovalDecision};
+use wecode::attachments::{prepare_message, resolve_file_mentions};
 use wecode::cache::ResponseCache;
 #[cfg(unix)]
 use wecode::config::McpServerConfig;
@@ -902,6 +903,57 @@ async fn interactive_conversation_preserves_follow_up_context() {
             .iter()
             .any(|message| message.content.contains("now explain the result"))
     );
+}
+
+#[tokio::test]
+async fn file_mentions_reach_the_initial_model_context_as_bounded_attachments() {
+    let temp = tempfile::tempdir().unwrap();
+    init_fixture(temp.path());
+    std::fs::write(
+        temp.path().join("parser note.txt"),
+        "The parser fails on trailing commas.\n",
+    )
+    .unwrap();
+    let (task, attachments) =
+        resolve_file_mentions("Inspect @\"parser note.txt\"", temp.path()).unwrap();
+    let (task, images) = prepare_message(&task, attachments).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = CapturingModel {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from([Action::Finish {
+            summary: "attachment inspected".into(),
+        }])),
+    };
+    let mut config = Config::default();
+    config.agent.trajectory_directory = temp.path().join("trajectories");
+    config.cache.directory = temp.path().join("cache");
+    let mut agent = Agent::new(
+        config,
+        Box::new(model),
+        Box::new(NullSink),
+        temp.path().canonicalize().unwrap(),
+    );
+
+    let result = agent
+        .run(
+            &task,
+            RunOptions {
+                images,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].messages[0]
+            .content
+            .contains("The parser fails on trailing commas.")
+    );
+    assert!(requests[0].messages[0].content.contains("<attached_file"));
 }
 
 #[tokio::test]

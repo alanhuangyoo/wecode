@@ -170,6 +170,65 @@ pub fn prepare_message(
     Ok((prompt, images))
 }
 
+pub fn resolve_file_mentions(text: &str, base: &Path) -> Result<(String, Vec<PendingAttachment>)> {
+    let mut output = String::with_capacity(text.len());
+    let mut attachments = Vec::new();
+    let mut copied_until = 0;
+    let mut indices = text.char_indices().peekable();
+
+    while let Some((start, character)) = indices.next() {
+        if character != '@' || !starts_file_mention(text, start) {
+            continue;
+        }
+        let Some((next, next_character)) = indices.peek().copied() else {
+            continue;
+        };
+        if next_character == '@' {
+            continue;
+        }
+
+        let parsed = if matches!(next_character, '"' | '\'') {
+            parse_quoted_mention(text, next, next_character).map(|value| (value, true))
+        } else {
+            parse_plain_mention(text, next).map(|value| (value, false))
+        };
+        let Some(((path_text, token_end, path_end), quoted)) = parsed else {
+            continue;
+        };
+        let Some((resolved_text, resolved_path_end)) =
+            existing_mention_path(path_text, path_end, base)
+        else {
+            continue;
+        };
+        let attachment = load(Path::new(resolved_text), base)?;
+        if !attachments
+            .iter()
+            .any(|current: &PendingAttachment| current.path() == attachment.path())
+        {
+            attachments.push(attachment);
+            validate_set(&attachments)?;
+        }
+
+        output.push_str(&text[copied_until..start]);
+        output.push('`');
+        output.push_str(resolved_text);
+        output.push('`');
+        if !quoted {
+            output.push_str(&text[resolved_path_end..token_end]);
+        }
+        copied_until = token_end;
+        while indices.peek().is_some_and(|(index, _)| *index < token_end) {
+            indices.next();
+        }
+    }
+
+    if attachments.is_empty() {
+        return Ok((text.to_owned(), attachments));
+    }
+    output.push_str(&text[copied_until..]);
+    Ok((output, attachments))
+}
+
 pub fn looks_like_image_path(value: &str) -> bool {
     let value = strip_quotes(value.trim());
     if value.is_empty() || value.contains('\n') || value.contains('\r') || value.contains("://") {
@@ -183,6 +242,54 @@ pub fn looks_like_image_path(value: &str) -> bool {
 
 pub fn normalized_path_text(value: &str) -> &str {
     strip_quotes(value.trim())
+}
+
+pub(crate) fn starts_file_mention(text: &str, start: usize) -> bool {
+    text[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|character| character.is_whitespace() || "([{".contains(character))
+}
+
+fn parse_quoted_mention(
+    text: &str,
+    quote_start: usize,
+    quote: char,
+) -> Option<(&str, usize, usize)> {
+    let path_start = quote_start + quote.len_utf8();
+    let relative_end = text[path_start..].find(quote)?;
+    let path_end = path_start + relative_end;
+    let token_end = path_end + quote.len_utf8();
+    (path_end > path_start).then_some((&text[path_start..path_end], token_end, path_end))
+}
+
+fn parse_plain_mention(text: &str, path_start: usize) -> Option<(&str, usize, usize)> {
+    let token_end = text[path_start..]
+        .char_indices()
+        .find_map(|(offset, character)| character.is_whitespace().then_some(path_start + offset))
+        .unwrap_or(text.len());
+    (token_end > path_start).then_some((&text[path_start..token_end], token_end, token_end))
+}
+
+fn existing_mention_path<'a>(
+    path_text: &'a str,
+    absolute_end: usize,
+    base: &Path,
+) -> Option<(&'a str, usize)> {
+    let mut candidate = path_text;
+    loop {
+        if resolve_path(Path::new(candidate), base).is_ok() {
+            return Some((
+                candidate,
+                absolute_end - (path_text.len() - candidate.len()),
+            ));
+        }
+        let last = candidate.chars().next_back()?;
+        if !",.;:!?)]}".contains(last) {
+            return None;
+        }
+        candidate = &candidate[..candidate.len() - last.len_utf8()];
+    }
 }
 
 fn resolve_path(path: &Path, base: &Path) -> Result<PathBuf> {
@@ -298,5 +405,41 @@ mod tests {
         assert!(!looks_like_image_path("please inspect image.png now"));
         assert!(!looks_like_image_path("https://example.com/image.png"));
         assert!(!looks_like_image_path("image.svg"));
+    }
+
+    #[test]
+    fn resolves_existing_file_mentions_and_preserves_regular_at_text() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("failure image.png"),
+            b"\x89PNG\r\n\x1a\nfixture",
+        )
+        .unwrap();
+
+        let (text, attachments) = resolve_file_mentions(
+            "Fix @src/main.rs, compare @\"failure image.png\", email a@b.com and keep @missing.",
+            temp.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            text,
+            "Fix `src/main.rs`, compare `failure image.png`, email a@b.com and keep @missing."
+        );
+        assert_eq!(attachments.len(), 2);
+        assert!(matches!(attachments[0], PendingAttachment::Text { .. }));
+        assert!(matches!(attachments[1], PendingAttachment::Image { .. }));
+    }
+
+    #[test]
+    fn deduplicates_repeated_file_mentions() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "hello").unwrap();
+
+        let (_, attachments) =
+            resolve_file_mentions("@note.txt then @./note.txt", temp.path()).unwrap();
+        assert_eq!(attachments.len(), 1);
     }
 }

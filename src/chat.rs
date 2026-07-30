@@ -6,6 +6,7 @@ use std::thread;
 
 use anyhow::Result;
 use console::{Style, Term};
+use ignore::WalkBuilder;
 use rustyline::{
     Cmd, ConditionalEventHandler, DefaultEditor, Event, EventContext, EventHandler, KeyCode,
     KeyEvent, Modifiers, RepeatCount, error::ReadlineError,
@@ -98,7 +99,7 @@ pub struct ChatView {
 }
 
 impl ChatShell {
-    pub fn new(commands: &[PromptCommand], skills: &[Skill]) -> Result<Self> {
+    pub fn new(workspace: &Path, commands: &[PromptCommand], skills: &[Skill]) -> Result<Self> {
         let history_path = default_history_path();
         if let Some(parent) = history_path.parent() {
             create_private_directory(parent)?;
@@ -122,6 +123,11 @@ impl ChatShell {
         };
         let (tui_handle, tui_receiver) = if use_tui {
             let (handle, receiver) = TuiHandle::new();
+            let file_handle = handle.clone();
+            let file_workspace = workspace.to_path_buf();
+            thread::spawn(move || {
+                file_handle.set_files(completion_files(&file_workspace));
+            });
             (Some(handle), Some(receiver))
         } else {
             (None, None)
@@ -220,6 +226,43 @@ impl ChatShell {
         }
         Ok(input)
     }
+}
+
+fn completion_files(workspace: &Path) -> Vec<String> {
+    const MAX_COMPLETION_FILES: usize = 50_000;
+
+    let mut builder = WalkBuilder::new(workspace);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "node_modules" | "target")
+                )
+        });
+    let mut files = builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            entry
+                .path()
+                .strip_prefix(workspace)
+                .ok()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+        })
+        .filter(|path| !path.contains(['"', '\n', '\r']))
+        .take(MAX_COMPLETION_FILES)
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn command_completions(
@@ -366,6 +409,7 @@ impl ChatView {
              \n  {:12} Attach a text file or image to the next message\
              \n  {:12} Show files attached to the next message\
              \n  {:12} Remove the last, selected, or all attachments\
+             \n  {:12} Fuzzy-search and attach a repository file\
              \n  {:12} Show the current task plan\
              \n  {:12} Show managed background processes\
              \n  {:12} Stop a managed background process\
@@ -406,6 +450,7 @@ impl ChatView {
             "/attach <path>",
             "/attachments",
             "/detach [number|all]",
+            "@path",
             "/plan",
             "/processes",
             "/stop-process <id>",
@@ -1539,6 +1584,24 @@ mod tests {
         assert_eq!(
             std::fs::metadata(history).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn completion_file_index_respects_ignores_and_includes_hidden_project_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::create_dir_all(temp.path().join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(temp.path().join("target/debug")).unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(temp.path().join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+        std::fs::write(temp.path().join("ignored.txt"), "ignored\n").unwrap();
+        std::fs::write(temp.path().join("target/debug/build"), "ignored\n").unwrap();
+
+        assert_eq!(
+            completion_files(temp.path()),
+            [".github/workflows/ci.yml", ".gitignore", "src/main.rs"]
         );
     }
 }

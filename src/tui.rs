@@ -64,6 +64,7 @@ pub(crate) enum TuiMessage {
         placeholder: Option<String>,
     },
     Attachments(Vec<String>),
+    Files(Vec<String>),
 }
 
 impl TuiHandle {
@@ -108,6 +109,10 @@ impl TuiHandle {
 
     pub fn set_attachments(&self, attachments: Vec<String>) {
         let _ = self.sender.send(TuiMessage::Attachments(attachments));
+    }
+
+    pub fn set_files(&self, files: Vec<String>) {
+        let _ = self.sender.send(TuiMessage::Files(files));
     }
 }
 
@@ -237,6 +242,10 @@ fn drain_messages(receiver: &Receiver<TuiMessage>, state: &mut TuiState) -> Mess
                 state.attachments = attachments;
                 changed = true;
             }
+            Ok(TuiMessage::Files(files)) => {
+                state.files = files;
+                changed = true;
+            }
             Err(TryRecvError::Disconnected) => {
                 return MessageState::Stop;
             }
@@ -302,6 +311,7 @@ struct TuiState {
     composer_title: Option<String>,
     completion_selected: usize,
     completions: Vec<CommandCompletion>,
+    files: Vec<String>,
     header_primary: String,
     header_secondary: String,
     history: Vec<String>,
@@ -322,6 +332,7 @@ impl TuiState {
             composer_title: None,
             completion_selected: 0,
             completions,
+            files: Vec::new(),
             header_primary: format!("WeCode {}", env!("CARGO_PKG_VERSION")),
             header_secondary: "Lightweight coding agent".into(),
             history,
@@ -461,7 +472,7 @@ impl TuiState {
                 }
             }
             KeyCode::BackTab => {
-                let count = self.active_completions().len();
+                let count = self.active_completion_count();
                 if count > 0 {
                     self.completion_selected =
                         self.completion_selected.checked_sub(1).unwrap_or(count - 1);
@@ -470,14 +481,14 @@ impl TuiState {
                     KeyOutcome::unchanged()
                 }
             }
-            KeyCode::Up if !self.active_completions().is_empty() => {
-                let count = self.active_completions().len();
+            KeyCode::Up if self.active_completion_count() > 0 => {
+                let count = self.active_completion_count();
                 self.completion_selected =
                     self.completion_selected.checked_sub(1).unwrap_or(count - 1);
                 KeyOutcome::changed()
             }
-            KeyCode::Down if !self.active_completions().is_empty() => {
-                let count = self.active_completions().len();
+            KeyCode::Down if self.active_completion_count() > 0 => {
+                let count = self.active_completion_count();
                 self.completion_selected = (self.completion_selected + 1) % count;
                 KeyOutcome::changed()
             }
@@ -524,7 +535,10 @@ impl TuiState {
         );
     }
 
-    fn active_completions(&self) -> Vec<&CommandCompletion> {
+    fn active_command_completions(&self) -> Vec<&CommandCompletion> {
+        if self.active_file_query().is_some() {
+            return Vec::new();
+        }
         let value = self.composer.text.trim_start();
         if !value.starts_with('/') || value.chars().any(char::is_whitespace) {
             return Vec::new();
@@ -536,9 +550,85 @@ impl TuiState {
             .collect()
     }
 
+    fn active_file_query(&self) -> Option<(usize, usize, String)> {
+        let cursor_byte = char_to_byte(&self.composer.text, self.composer.cursor);
+        let before = &self.composer.text[..cursor_byte];
+
+        if let Some(start_byte) = before.rfind("@\"")
+            && crate::attachments::starts_file_mention(before, start_byte)
+        {
+            let query_start = start_byte + 2;
+            if !before[query_start..].contains('"') {
+                return Some((
+                    before[..start_byte].chars().count(),
+                    self.composer.cursor,
+                    before[query_start..].to_owned(),
+                ));
+            }
+        }
+
+        let start_byte = before.char_indices().rev().find_map(|(index, character)| {
+            (character == '@' && crate::attachments::starts_file_mention(before, index))
+                .then_some(index)
+        })?;
+        let query = &before[start_byte + 1..];
+        (!query.chars().any(char::is_whitespace) && !query.contains('"')).then(|| {
+            (
+                before[..start_byte].chars().count(),
+                self.composer.cursor,
+                query.to_owned(),
+            )
+        })
+    }
+
+    fn active_file_completions(&self) -> Vec<&String> {
+        let Some((_, _, query)) = self.active_file_query() else {
+            return Vec::new();
+        };
+        let query = query.to_ascii_lowercase().replace('\\', "/");
+        let mut matches = self
+            .files
+            .iter()
+            .filter_map(|path| file_match_score(path, &query).map(|score| (score, path)))
+            .collect::<Vec<_>>();
+        matches.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left.len().cmp(&right.len()))
+                .then_with(|| left.cmp(right))
+        });
+        matches.into_iter().take(8).map(|(_, path)| path).collect()
+    }
+
+    fn active_completion_count(&self) -> usize {
+        let files = self.active_file_completions();
+        if files.is_empty() {
+            self.active_command_completions().len()
+        } else {
+            files.len()
+        }
+    }
+
     fn apply_completion(&mut self, force: bool) -> bool {
+        let file = self
+            .active_file_completions()
+            .get(self.completion_selected)
+            .map(|path| (*path).clone());
+        if let Some(file) = file
+            && let Some((start, end, _)) = self.active_file_query()
+        {
+            let mention = if file.chars().any(char::is_whitespace) {
+                format!("@\"{file}\" ")
+            } else {
+                format!("@{file} ")
+            };
+            self.composer.replace(start, end, &mention);
+            self.completion_selected = 0;
+            return true;
+        }
+
         let selected = self
-            .active_completions()
+            .active_command_completions()
             .get(self.completion_selected)
             .map(|completion| completion.command.clone());
         let Some(command) = selected else {
@@ -551,6 +641,47 @@ impl TuiState {
         self.completion_selected = 0;
         true
     }
+}
+
+fn file_match_score(path: &str, query: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(10_000_i64.saturating_sub(path.len() as i64));
+    }
+    let path = path.to_ascii_lowercase();
+    let basename = path.rsplit('/').next().unwrap_or(&path);
+    if path.starts_with(query) {
+        return Some(50_000_i64.saturating_sub(path.len() as i64));
+    }
+    if basename.starts_with(query) {
+        return Some(40_000_i64.saturating_sub(path.len() as i64));
+    }
+    if let Some(index) = path.find(query) {
+        return Some(
+            30_000_i64
+                .saturating_sub(index as i64 * 10)
+                .saturating_sub(path.len() as i64),
+        );
+    }
+
+    let mut score = 20_000_i64;
+    let mut query = query.chars();
+    let mut wanted = query.next()?;
+    let mut previous_match = None;
+    for (index, character) in path.chars().enumerate() {
+        if character != wanted {
+            continue;
+        }
+        score = score.saturating_sub(index as i64);
+        if previous_match.is_some_and(|previous| previous + 1 == index) {
+            score = score.saturating_add(100);
+        }
+        previous_match = Some(index);
+        let Some(next) = query.next() else {
+            return Some(score.saturating_sub(path.len() as i64));
+        };
+        wanted = next;
+    }
+    None
 }
 
 struct KeyOutcome {
@@ -605,6 +736,13 @@ impl Composer {
     fn take(&mut self) -> String {
         self.cursor = 0;
         std::mem::take(&mut self.text)
+    }
+
+    fn replace(&mut self, start: usize, end: usize, value: &str) {
+        let start_byte = char_to_byte(&self.text, start);
+        let end_byte = char_to_byte(&self.text, end);
+        self.text.replace_range(start_byte..end_byte, value);
+        self.cursor = start.saturating_add(value.chars().count());
     }
 
     fn insert(&mut self, value: &str) {
@@ -676,7 +814,7 @@ fn char_to_byte(value: &str, character_index: usize) -> usize {
 fn draw(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
     let composer_height = composer_height(&state.composer.text, area.width);
-    let completion_count = state.active_completions().len();
+    let completion_count = state.active_completion_count();
     let transcript_min = area
         .height
         .saturating_sub(3_u16.saturating_add(composer_height).saturating_add(1))
@@ -776,7 +914,20 @@ fn draw_attachments(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState
 }
 
 fn draw_completions(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    let completions = state.active_completions();
+    let file_completions = state.active_file_completions();
+    let command_completions = state.active_command_completions();
+    let file_mode = !file_completions.is_empty();
+    let completions = if file_mode {
+        file_completions
+            .iter()
+            .map(|path| ((*path).as_str(), "attach to message"))
+            .collect::<Vec<_>>()
+    } else {
+        command_completions
+            .iter()
+            .map(|completion| (completion.command.as_str(), completion.description.as_str()))
+            .collect::<Vec<_>>()
+    };
     let selected = state
         .completion_selected
         .min(completions.len().saturating_sub(1));
@@ -787,7 +938,7 @@ fn draw_completions(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState
         .enumerate()
         .skip(first_visible)
         .take(visible_rows)
-        .map(|(index, completion)| {
+        .map(|(index, (label, description))| {
             let marker = if index == selected { "›" } else { " " };
             let style = if index == selected {
                 Style::default()
@@ -797,12 +948,9 @@ fn draw_completions(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState
                 Style::default().fg(Color::Gray)
             };
             Line::from(vec![
-                Span::styled(format!(" {marker} {:24}", completion.command), style),
+                Span::styled(format!(" {marker} {label:24}"), style),
                 Span::styled(
-                    truncate(
-                        &completion.description,
-                        area.width.saturating_sub(31) as usize,
-                    ),
+                    truncate(description, area.width.saturating_sub(31) as usize),
                     Style::default().fg(Color::DarkGray),
                 ),
             ])
@@ -812,7 +960,11 @@ fn draw_completions(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState
         Paragraph::new(lines).block(
             Block::default()
                 .title(Span::styled(
-                    " Commands · ↑↓ select · Tab complete ",
+                    if file_mode {
+                        " Files · ↑↓ select · Enter/Tab attach "
+                    } else {
+                        " Commands · ↑↓ select · Tab complete "
+                    },
                     Style::default().fg(Color::Cyan),
                 ))
                 .borders(Borders::ALL)
@@ -906,7 +1058,7 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiSt
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                "Examples: “fix the failing tests” · “explain this codebase”",
+                "Examples: “fix the failing tests” · “explain @src/main.rs”",
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -1047,16 +1199,26 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     } else {
-        let mut spans = vec![
-            key(" Enter "),
-            hint("send"),
-            separator(),
-            key(" Ctrl-J "),
-            hint("newline"),
-            separator(),
-            key(" Alt-Enter "),
-            hint("follow-up"),
-        ];
+        let mut spans = if area.width < 90 {
+            vec![
+                key(" Enter "),
+                hint("send"),
+                separator(),
+                key(" Alt-Enter "),
+                hint("later"),
+            ]
+        } else {
+            vec![
+                key(" Enter "),
+                hint("send"),
+                separator(),
+                key(" Ctrl-J "),
+                hint("newline"),
+                separator(),
+                key(" Alt-Enter "),
+                hint("follow-up"),
+            ]
+        };
         if let Some(metrics) = &state.metrics {
             spans.push(Span::raw("    "));
             spans.push(Span::styled(
@@ -1064,7 +1226,14 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
                 Style::default().fg(Color::DarkGray),
             ));
         } else {
-            spans.extend([separator(), key(" / "), hint("commands")]);
+            spans.extend([
+                separator(),
+                key(" / "),
+                hint("commands"),
+                separator(),
+                key(" @ "),
+                hint("files"),
+            ]);
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -1246,11 +1415,11 @@ mod tests {
         ];
         let mut state = TuiState::new(Vec::new(), completions);
         state.composer.insert("/h");
-        assert_eq!(state.active_completions().len(), 2);
+        assert_eq!(state.active_command_completions().len(), 2);
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(state.composer.text, "/hooks ");
-        assert!(state.active_completions().is_empty());
+        assert!(state.active_command_completions().is_empty());
     }
 
     #[test]
@@ -1277,6 +1446,63 @@ mod tests {
         assert!(rendered.contains("/review"));
         assert!(rendered.contains("Review current changes"));
         assert!(rendered.contains("Tab complete"));
+    }
+
+    #[test]
+    fn file_palette_fuzzy_matches_and_inserts_mentions() {
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.files = vec![
+            "README.md".into(),
+            "src/parse_helpers.rs".into(),
+            "src/parser.rs".into(),
+        ];
+        state.composer.insert("Fix @par");
+
+        assert_eq!(
+            state
+                .active_file_completions()
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["src/parser.rs", "src/parse_helpers.rs"]
+        );
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.composer.text, "Fix @src/parser.rs ");
+        assert!(state.active_file_completions().is_empty());
+    }
+
+    #[test]
+    fn file_palette_quotes_paths_with_spaces_and_ignores_emails() {
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.files = vec!["docs/error report.md".into()];
+        state.composer.insert("Read @\"error rep");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.composer.text, "Read @\"docs/error report.md\" ");
+
+        state.composer.set("Email a@b.com".into());
+        assert!(state.active_file_query().is_none());
+    }
+
+    #[test]
+    fn file_palette_renders_above_the_composer() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        state.files = vec!["src/parser.rs".into()];
+        state.composer.insert("Fix @parser");
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Files"));
+        assert!(rendered.contains("src/parser.rs"));
+        assert!(rendered.contains("Enter/Tab attach"));
+        assert!(rendered.contains("Fix @parser"));
     }
 
     #[test]
@@ -1342,6 +1568,25 @@ mod tests {
         assert!(rendered.contains("Message"));
         assert!(rendered.contains("Alt-Enter"));
         assert!(rendered.contains("cached"));
+    }
+
+    #[test]
+    fn narrow_footer_keeps_file_and_command_discovery_visible() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = TuiState::new(Vec::new(), Vec::new());
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("later"));
+        assert!(rendered.contains("commands"));
+        assert!(rendered.contains("files"));
     }
 
     #[test]

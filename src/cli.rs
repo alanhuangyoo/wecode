@@ -7,7 +7,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::agent::{Agent, Conversation, RunOptions};
 use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalEnvelope};
 use crate::attachments::{
-    PendingAttachment, load as load_attachment, normalized_path_text, prepare_message, validate_set,
+    PendingAttachment, load as load_attachment, normalized_path_text, prepare_message,
+    resolve_file_mentions, validate_set,
 };
 use crate::background_process::BackgroundProcessManager;
 use crate::bench::{BenchOptions, run_manifest};
@@ -388,7 +389,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
         Some(config.model.api_key_env.clone()),
     );
     let state_directory = config.agent.trajectory_directory.clone();
-    let shell = ChatShell::new(&commands.commands(), &skills.skills())?;
+    let shell = ChatShell::new(&workspace, &commands.commands(), &skills.skills())?;
     let view = shell.view();
     let mut processes = create_background_process_manager(&config, &workspace, &view);
     let mut lsp = create_lsp_manager(&config, &workspace, &view)?;
@@ -943,7 +944,6 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                 };
                 let mut contexts = std::mem::take(&mut pending_session_hook_context);
                 contexts.extend(prompt_contexts);
-                let task = append_context(&task, &contexts);
                 if agent.is_none() {
                     let api_key = match config.api_key() {
                         Ok(api_key) => api_key,
@@ -970,9 +970,16 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         skills.clone(),
                     ));
                 }
-                let attachments = std::mem::take(&mut pending_attachments);
-                view.sync_attachments(&pending_attachments);
-                let (task, images) = prepare_message(&task, attachments)?;
+                let Some((task, images)) = prepare_chat_message(
+                    &task,
+                    &contexts,
+                    &mut pending_attachments,
+                    &workspace,
+                    &view,
+                )?
+                else {
+                    continue;
+                };
                 session.set_initial_title(title_override.as_deref().unwrap_or(&task_title))?;
                 session.checkpoint(
                     Some(&automatic_checkpoint_label(&task_title)),
@@ -1227,6 +1234,43 @@ fn detach_pending(
     let removed = attachments.remove(index);
     view.sync_attachments(attachments);
     view.notice(format!("Detached {}.", removed.display_name()))
+}
+
+fn prepare_chat_message(
+    text: &str,
+    contexts: &[String],
+    pending: &mut Vec<PendingAttachment>,
+    workspace: &Path,
+    view: &ChatView,
+) -> Result<Option<(String, Vec<ImageAttachment>)>> {
+    let (text, mentioned) = match resolve_file_mentions(text, workspace) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            view.warning(format!("Could not attach file mention: {error}"))?;
+            return Ok(None);
+        }
+    };
+    let original_len = pending.len();
+    for attachment in mentioned {
+        if !pending
+            .iter()
+            .any(|current| current.path() == attachment.path())
+        {
+            pending.push(attachment);
+        }
+    }
+    if let Err(error) = validate_set(pending) {
+        pending.truncate(original_len);
+        view.warning(error.to_string())?;
+        return Ok(None);
+    }
+
+    let attachments = std::mem::take(pending);
+    view.sync_attachments(pending);
+    Ok(Some(prepare_message(
+        &append_context(&text, contexts),
+        attachments,
+    )?))
 }
 
 async fn stop_background_process(
@@ -1590,14 +1634,20 @@ async fn run_active_chat_task(
                         )
                         .await?
                         {
-                            let attachments = std::mem::take(pending_attachments);
-                            view.sync_attachments(pending_attachments);
-                            let (text, images) = prepare_message(
-                                &append_context(&text, &contexts),
-                                attachments,
-                            )?;
-                            let queued = input_queue.steer_with_images(text, images);
-                            view.show_queued("steer", queued.id, input_queue.snapshot().len())?;
+                            if let Some((text, images)) = prepare_chat_message(
+                                &text,
+                                &contexts,
+                                pending_attachments,
+                                workspace,
+                                view,
+                            )? {
+                                let queued = input_queue.steer_with_images(text, images);
+                                view.show_queued(
+                                    "steer",
+                                    queued.id,
+                                    input_queue.snapshot().len(),
+                                )?;
+                            }
                         }
                     }
                     ChatInput::FollowUp(text) if text.trim().is_empty() => {
@@ -1614,18 +1664,20 @@ async fn run_active_chat_task(
                         )
                         .await?
                         {
-                            let attachments = std::mem::take(pending_attachments);
-                            view.sync_attachments(pending_attachments);
-                            let (text, images) = prepare_message(
-                                &append_context(&text, &contexts),
-                                attachments,
-                            )?;
-                            let queued = input_queue.follow_up_with_images(text, images);
-                            view.show_queued(
-                                "follow-up",
-                                queued.id,
-                                input_queue.snapshot().len(),
-                            )?;
+                            if let Some((text, images)) = prepare_chat_message(
+                                &text,
+                                &contexts,
+                                pending_attachments,
+                                workspace,
+                                view,
+                            )? {
+                                let queued = input_queue.follow_up_with_images(text, images);
+                                view.show_queued(
+                                    "follow-up",
+                                    queued.id,
+                                    input_queue.snapshot().len(),
+                                )?;
+                            }
                         }
                     }
                     ChatInput::Interrupted | ChatInput::Command(ChatCommand::Cancel) => {
@@ -1707,19 +1759,21 @@ async fn run_active_chat_task(
                                 )
                                 .await?
                                 {
-                                    let attachments = std::mem::take(pending_attachments);
-                                    view.sync_attachments(pending_attachments);
-                                    let (request, images) = prepare_message(
-                                        &append_context(&request, &contexts),
-                                        attachments,
-                                    )?;
-                                    let queued =
-                                        input_queue.steer_with_images(request, images);
-                                    view.show_queued(
-                                        "skill steer",
-                                        queued.id,
-                                        input_queue.snapshot().len(),
-                                    )?;
+                                    if let Some((request, images)) = prepare_chat_message(
+                                        &request,
+                                        &contexts,
+                                        pending_attachments,
+                                        workspace,
+                                        view,
+                                    )? {
+                                        let queued =
+                                            input_queue.steer_with_images(request, images);
+                                        view.show_queued(
+                                            "skill steer",
+                                            queued.id,
+                                            input_queue.snapshot().len(),
+                                        )?;
+                                    }
                                 }
                             }
                             Err(error) => view.warning(error.to_string())?,
@@ -1738,19 +1792,21 @@ async fn run_active_chat_task(
                                 )
                                 .await?
                                 {
-                                    let attachments = std::mem::take(pending_attachments);
-                                    view.sync_attachments(pending_attachments);
-                                    let (request, images) = prepare_message(
-                                        &append_context(&request, &contexts),
-                                        attachments,
-                                    )?;
-                                    let queued =
-                                        input_queue.steer_with_images(request, images);
-                                    view.show_queued(
-                                        "command steer",
-                                        queued.id,
-                                        input_queue.snapshot().len(),
-                                    )?;
+                                    if let Some((request, images)) = prepare_chat_message(
+                                        &request,
+                                        &contexts,
+                                        pending_attachments,
+                                        workspace,
+                                        view,
+                                    )? {
+                                        let queued =
+                                            input_queue.steer_with_images(request, images);
+                                        view.show_queued(
+                                            "command steer",
+                                            queued.id,
+                                            input_queue.snapshot().len(),
+                                        )?;
+                                    }
                                 }
                             }
                             Err(_) => {
