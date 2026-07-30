@@ -140,6 +140,8 @@ Agent 工作时仍可继续编辑。
 /approve-session
              本会话允许相同操作
 /deny        拒绝操作并可提供原因
+/context     查看上下文估算与 Prompt Cache 使用情况
+/compact     压缩旧上下文；可附带需要重点保留的内容
 /model       查看当前模型；`/model <id>` 为当前会话切换模型
 /status      查看模型、工作区、缓存和上下文
 /mcp         查看 MCP 服务器和工具状态
@@ -166,6 +168,11 @@ Agent 工作时仍可继续编辑。
 使用 `/model` 可以查看当前 Provider、模型和 Wire Protocol；`/model <id>` 会保留对话
 上下文，并为当前交互会话切换模型。WeCode 会在下一个任务前重建模型客户端，响应缓存也会
 自动进入新模型的命名空间。任务运行中不允许切换，避免同一轮 Agent 请求混用模型。
+
+Footer 会持续显示对话上下文估算和 Prompt Cache 指标。`/context` 会展开文本、图片、规则、
+工具、Provider Cache 读写和本地精确缓存命中的明细。`/compact [重点]` 会保留初始任务和
+最近消息，把符合条件的旧消息替换为有硬上限的本地摘要。压缩过程是事务式的，不额外调用
+模型；旧图片会先记录为持久事实再移除 Base64，并通过 Session Snapshot 持久化。
 
 使用 `/diff` 可以立即检查工作区改动，不消耗模型调用。它按相对 `HEAD` 的最终状态展示
 staged、unstaged 和 untracked 文件。Diff 收集为每条 Git 命令设置 30 秒超时，并禁用

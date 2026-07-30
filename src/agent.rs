@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::approval::{ApprovalClient, ApprovalDecision, ApprovalKind, RiskLevel, classify_shell};
 use crate::background_process::BackgroundProcessManager;
 use crate::config::Config;
-use crate::context::{ContextWindow, ImageAttachment, Message};
+use crate::context::{CompactionReport, ContextUsage, ContextWindow, ImageAttachment, Message};
 use crate::control::CancellationToken;
 use crate::events::{Event, EventSink, JsonlSink};
 use crate::executor::{ExecutionResult, Executor};
@@ -78,6 +78,19 @@ impl Conversation {
 
     pub fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    pub fn context_usage(&self, max_tokens: u64, keep_messages: usize) -> ContextUsage {
+        ContextWindow::new(max_tokens, keep_messages).usage(&self.messages)
+    }
+
+    pub fn compact(
+        &mut self,
+        max_tokens: u64,
+        keep_messages: usize,
+        focus: Option<&str>,
+    ) -> Option<CompactionReport> {
+        ContextWindow::new(max_tokens, keep_messages).compact_manual(&mut self.messages, focus)
     }
 
     pub(crate) fn record_user_shell(&mut self, command: &str, result: &ExecutionResult) {

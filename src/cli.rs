@@ -19,7 +19,7 @@ use crate::config::{
     ApprovalPolicy, CacheMode, Config, ProviderFamily, WireApi, default_config_path,
     provider_preset,
 };
-use crate::context::ImageAttachment;
+use crate::context::{ImageAttachment, estimate_text_tokens};
 use crate::control::CancellationToken;
 use crate::events::{EventSink, JsonlSink};
 use crate::executor::Executor;
@@ -31,7 +31,7 @@ use crate::interaction::{
 };
 use crate::lsp::LspManager;
 use crate::mcp::McpManager;
-use crate::model::{ToolProfile, create_model, create_model_with_tools};
+use crate::model::{ToolProfile, Usage, create_model, create_model_with_tools, tool_definitions};
 use crate::session::ChatSession;
 use crate::setup::{SetupOptions, run as run_setup};
 use crate::skills::SkillCatalog;
@@ -414,6 +414,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
     };
     session.set_model(&config.model.provider, &config.model.model)?;
     let mut agent: Option<Agent> = None;
+    let mut last_usage: Option<(Usage, usize)> = None;
     let input_queue = InputQueue::new();
     let (approval, mut approval_requests) = ApprovalClient::channel();
     let (user_input, mut user_input_requests) = UserInputClient::channel();
@@ -526,6 +527,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             if hooks.len() == 1 { "" } else { "s" }
         ))?;
     }
+    sync_context_metrics(&conversation, &config, last_usage, &view);
     let mut inputs = shell.into_input_stream();
 
     loop {
@@ -603,6 +605,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     &config.model.model,
                 )?;
                 conversation = Conversation::default();
+                last_usage = None;
                 plan.clear();
                 input_queue.clear();
                 pending_attachments.clear();
@@ -637,6 +640,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                     skills.len(),
                     commands.len(),
                 )?;
+                sync_context_metrics(&conversation, &config, last_usage, &view);
                 view.notice("Started a new session.")?;
             }
             ChatInput::Command(ChatCommand::Cancel) => {
@@ -672,6 +676,41 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
             ChatInput::Command(ChatCommand::ClearQueue) => {
                 let cleared = input_queue.clear();
                 view.notice(format!("Cleared {} queued messages.", cleared.len()))?;
+            }
+            ChatInput::Command(ChatCommand::Context) => {
+                show_context_usage(
+                    &conversation,
+                    &config,
+                    &instruction_set,
+                    &mcp,
+                    &skills,
+                    last_usage,
+                    &view,
+                )?;
+            }
+            ChatInput::Command(ChatCommand::Compact(focus)) => {
+                let report = conversation.compact(
+                    config.agent.context_max_tokens,
+                    config.agent.context_keep_messages,
+                    focus.as_deref(),
+                );
+                match report {
+                    Some(report) => {
+                        session.save(&conversation)?;
+                        plan = PlanState::restore(conversation.messages());
+                        view.sync_plan(&plan.current());
+                        view.show_compaction(&report, focus.as_deref())?;
+                        sync_context_metrics(&conversation, &config, last_usage, &view);
+                    }
+                    None if conversation.message_count() == 0 => {
+                        view.notice("Context is empty; there is nothing to compact.")?;
+                    }
+                    None => {
+                        view.notice(
+                            "Context is already compact or too small to reduce without losing the protected recent history.",
+                        )?;
+                    }
+                }
             }
             ChatInput::Command(ChatCommand::Config) => view.show_config_path()?,
             ChatInput::Command(ChatCommand::Commands) => {
@@ -759,6 +798,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         .await?;
                         session = next_session;
                         conversation = next_conversation;
+                        last_usage = None;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         pending_attachments.clear();
@@ -794,6 +834,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             commands.len(),
                         )?;
                         view.sync_plan(&plan.current());
+                        sync_context_metrics(&conversation, &config, last_usage, &view);
                         view.notice(format!(
                             "Forked session {} from {} with {} messages.",
                             session.summary().id,
@@ -837,6 +878,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         .await?;
                         session = next_session;
                         conversation = next_conversation;
+                        last_usage = None;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         pending_attachments.clear();
@@ -872,6 +914,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             commands.len(),
                         )?;
                         view.sync_plan(&plan.current());
+                        sync_context_metrics(&conversation, &config, last_usage, &view);
                         view.notice(format!(
                             "Rewound safely into session {} from {} at {} messages; the original session is unchanged.",
                             session.summary().id,
@@ -905,6 +948,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         .await?;
                         session = next_session;
                         conversation = next_conversation;
+                        last_usage = None;
                         plan = PlanState::restore(conversation.messages());
                         input_queue.clear();
                         pending_attachments.clear();
@@ -940,6 +984,7 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                             commands.len(),
                         )?;
                         view.sync_plan(&plan.current());
+                        sync_context_metrics(&conversation, &config, last_usage, &view);
                         view.notice(format!(
                             "Resumed session {} with {} messages.",
                             session.summary().id,
@@ -1075,7 +1120,11 @@ async fn chat(common: CommonArgs, start: ChatStart) -> Result<()> {
                         &view,
                     )
                     .await?;
+                    if let Some(usage) = result.usage {
+                        last_usage = Some((usage, result.cache_hits));
+                    }
                     session.save(&conversation)?;
+                    sync_context_metrics(&conversation, &config, last_usage, &view);
                     if result.reason == "finished" {
                         let stop_hooks = run_hook_event(
                             &hooks,
@@ -1196,6 +1245,50 @@ fn create_subagent_manager(
         let _ = event_view.show_subagent_event(&event);
     });
     Ok(manager)
+}
+
+fn show_context_usage(
+    conversation: &Conversation,
+    config: &Config,
+    instructions: &instructions::InstructionSet,
+    mcp: &McpManager,
+    skills: &SkillCatalog,
+    last_usage: Option<(Usage, usize)>,
+    view: &ChatView,
+) -> Result<()> {
+    let usage = conversation.context_usage(
+        config.agent.context_max_tokens,
+        config.agent.context_keep_messages,
+    );
+    let rules_tokens = estimate_text_tokens(&instructions.render());
+    let definitions = tool_definitions(ToolProfile::Interactive, &mcp.definitions());
+    let tool_tokens = serde_json::to_string(&definitions)
+        .map(|definitions| estimate_text_tokens(&definitions))
+        .unwrap_or_default()
+        .saturating_add(estimate_text_tokens(&skills.system_prompt()));
+    view.show_context(
+        usage,
+        config.agent.context_max_tokens,
+        rules_tokens,
+        tool_tokens,
+        last_usage,
+    )
+}
+
+fn sync_context_metrics(
+    conversation: &Conversation,
+    config: &Config,
+    last_usage: Option<(Usage, usize)>,
+    view: &ChatView,
+) {
+    view.sync_context_metrics(
+        conversation.context_usage(
+            config.agent.context_max_tokens,
+            config.agent.context_keep_messages,
+        ),
+        config.agent.context_max_tokens,
+        last_usage,
+    );
 }
 
 fn load_attachments(paths: &[PathBuf], workspace: &Path) -> Result<Vec<PendingAttachment>> {
@@ -1466,6 +1559,8 @@ async fn apply_prompt_hooks(
 struct ActiveChatResult {
     reason: String,
     exit_requested: bool,
+    usage: Option<Usage>,
+    cache_hits: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1860,6 +1955,16 @@ async fn run_active_chat_task(
                             "Switch models after the active task finishes; use /cancel first if needed.",
                         )?;
                     }
+                    ChatInput::Command(ChatCommand::Context) => {
+                        view.warning(
+                            "Context usage is available after the active task finishes; live token metrics remain visible in the footer.",
+                        )?;
+                    }
+                    ChatInput::Command(ChatCommand::Compact(_)) => {
+                        view.warning(
+                            "Compact context after the active task finishes; use /cancel first if needed.",
+                        )?;
+                    }
                     ChatInput::Command(ChatCommand::Commands) => {
                         view.show_commands(&commands.commands())?;
                     }
@@ -1978,16 +2083,18 @@ async fn run_active_chat_task(
         });
     }
     view.clear_interaction_prompt();
-    let reason = match result {
-        Ok(result) => result.reason,
+    let (reason, usage, cache_hits) = match result {
+        Ok(result) => (result.reason, Some(result.usage), result.cache_hits),
         Err(error) => {
             view.warning(format!("Agent error: {error:#}"))?;
-            "error".into()
+            ("error".into(), None, 0)
         }
     };
     Ok(ActiveChatResult {
         reason,
         exit_requested,
+        usage,
+        cache_hits,
     })
 }
 

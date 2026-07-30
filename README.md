@@ -150,6 +150,8 @@ composer remains editable while the agent works.
 /approve-session
              Allow matching actions for this session
 /deny        Deny the pending action with optional feedback
+/context     Show estimated context and prompt-cache usage
+/compact     Compact older context; optional text sets the preservation focus
 /model       Show the current model; `/model <id>` switches it for this session
 /status      Show model, workspace, cache, and context
 /mcp         Show connected MCP servers and tools
@@ -179,6 +181,12 @@ model for the current interactive session while preserving conversation context.
 the model client before the next task, and the response cache automatically uses the new model
 namespace. Model switching is unavailable while a task is active so one agent turn never mixes
 models.
+
+The footer continuously shows estimated conversation usage and prompt-cache metrics. `/context`
+opens a breakdown of text, images, rules, tools, provider cache reads/writes, and exact local cache
+hits. `/compact [focus]` replaces eligible older turns with a bounded local summary while preserving
+the initial task and recent messages. Compaction is transactional, costs no model call, drops old
+image payloads after recording durable facts, and persists as a session snapshot.
 
 Use `/diff` for an immediate working-tree review without spending a model call. It shows the final
 state against `HEAD`, including staged, unstaged, and untracked files. Diff collection has a

@@ -22,6 +22,7 @@ use crate::commands::PromptCommand;
 use crate::config::{
     CacheMode, Config, ProviderFamily, WireApi, default_config_path, default_history_path,
 };
+use crate::context::{CompactionReport, ContextUsage};
 use crate::executor::ExecutionResult;
 use crate::hooks::{HookReport, HookStatus, HookSummary};
 use crate::input_queue::QueueSnapshot;
@@ -29,6 +30,7 @@ use crate::instructions::InstructionSet;
 use crate::interaction::{PlanSnapshot, UserInputRequest};
 use crate::lsp::{LspEvent, LspServerStatus, LspServerSummary};
 use crate::mcp::{McpServerReport, McpServerState};
+use crate::model::Usage;
 use crate::protocol::PlanStatus;
 use crate::session::{SessionCheckpoint, SessionSummary};
 use crate::skills::Skill;
@@ -47,8 +49,10 @@ pub enum ChatCommand {
     Checkpoint(Option<String>),
     Checkpoints,
     ClearQueue,
+    Compact(Option<String>),
     Commands,
     Config,
+    Context,
     Deny(String),
     Detach(String),
     Diff,
@@ -338,6 +342,8 @@ fn command_completions(
         ("/queue", "Show queued messages"),
         ("/clear-queue", "Clear queued messages"),
         ("/cancel", "Cancel the active task"),
+        ("/compact", "Compact older context with an optional focus"),
+        ("/context", "Show context usage and prompt-cache metrics"),
         ("/model", "Show or switch the session model"),
         ("/status", "Show session status"),
         ("/mcp", "Show MCP servers"),
@@ -477,6 +483,8 @@ impl ChatView {
              \n  {:12} Allow a pending action once\
              \n  {:12} Allow matching actions for this session\
              \n  {:12} Deny a pending action with optional feedback\
+             \n  {:12} Show context usage and prompt-cache metrics\
+             \n  {:12} Compact older context, preserving an optional focus\
              \n  {:12} Show or switch the model for this session\
              \n  {:12} Show model, workspace, cache, and context\
              \n  {:12} Show MCP server and tool status\
@@ -522,6 +530,8 @@ impl ChatView {
             "/approve",
             "/approve-session",
             "/deny [reason]",
+            "/context",
+            "/compact [focus]",
             "/model [id]",
             "/status",
             "/mcp",
@@ -579,6 +589,106 @@ impl ChatView {
             config.model.provider,
             config.model.model,
             protocol_name(config.model.family, config.model.wire_api),
+        ))
+    }
+
+    pub fn show_context(
+        &self,
+        usage: ContextUsage,
+        max_tokens: u64,
+        rules_tokens: u64,
+        tool_tokens: u64,
+        last_usage: Option<(Usage, usize)>,
+    ) -> Result<()> {
+        self.sync_context_metrics(usage, max_tokens, last_usage);
+        let percent = usage.percent_of(max_tokens);
+        let bar = context_bar(percent, 24);
+        let provider = match last_usage {
+            Some((usage, exact_cache_hits)) => format!(
+                "{} input · {} output · {} cache read · {} cache write · {} exact hit{}",
+                compact_number(usage.input_tokens),
+                compact_number(usage.output_tokens),
+                compact_number(usage.cache_read_tokens),
+                compact_number(usage.cache_write_tokens),
+                exact_cache_hits,
+                if exact_cache_hits == 1 { "" } else { "s" },
+            ),
+            None => "no model request in this session yet".into(),
+        };
+        let body = format!(
+            "{bar}  {percent}%\n\n\
+             Conversation  {} / {} estimated tokens\n\
+             Text          {} tokens in {} messages ({} user · {} assistant)\n\
+             Images        {} tokens across {} images\n\
+             Rules         ~{} tokens\n\
+             Tools         ~{} tokens\n\
+             Last request  {provider}\n\n\
+             Limits are estimates; providers tokenize images and tool schemas differently.",
+            compact_number(usage.total_tokens),
+            compact_number(max_tokens),
+            compact_number(usage.text_tokens),
+            usage.messages,
+            usage.user_messages,
+            usage.assistant_messages,
+            compact_number(usage.image_tokens),
+            usage.images,
+            compact_number(rules_tokens),
+            compact_number(tool_tokens),
+        );
+        if self.output.tui_entry("CONTEXT", &body, TuiTone::Normal) {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "\n{}\n{body}\n",
+            Style::new().cyan().bold().apply_to("Context")
+        ))
+    }
+
+    pub fn sync_context_metrics(
+        &self,
+        usage: ContextUsage,
+        max_tokens: u64,
+        last_usage: Option<(Usage, usize)>,
+    ) {
+        let mut metrics = format!(
+            "context {}/{} · {}%",
+            compact_number(usage.total_tokens),
+            compact_number(max_tokens),
+            usage.percent_of(max_tokens),
+        );
+        if let Some((provider, exact_hits)) = last_usage {
+            metrics.push_str(&format!(
+                " · {} cached · {} exact",
+                compact_number(provider.cache_read_tokens),
+                exact_hits
+            ));
+        }
+        self.output.set_tui_metrics(Some(metrics));
+    }
+
+    pub fn show_compaction(&self, report: &CompactionReport, focus: Option<&str>) -> Result<()> {
+        let saved = report
+            .before
+            .total_tokens
+            .saturating_sub(report.after.total_tokens);
+        let mut body = format!(
+            "{} → {} messages · {} → {} estimated tokens · {} saved",
+            report.before.messages,
+            report.after.messages,
+            compact_number(report.before.total_tokens),
+            compact_number(report.after.total_tokens),
+            compact_number(saved),
+        );
+        if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
+            body.push_str("\n\nPreserved focus: ");
+            body.push_str(focus);
+        }
+        if self.output.tui_entry("COMPACT", &body, TuiTone::Success) {
+            return Ok(());
+        }
+        self.output.print(format!(
+            "\n{}\n{body}\n",
+            Style::new().green().bold().apply_to("Context compacted")
         ))
     }
 
@@ -1518,9 +1628,13 @@ pub(crate) fn parse_input(line: &str) -> ChatInput {
         )),
         "/checkpoints" | "/marks" => ChatInput::Command(ChatCommand::Checkpoints),
         "/clear-queue" => ChatInput::Command(ChatCommand::ClearQueue),
+        "/compact" => ChatInput::Command(ChatCommand::Compact(
+            (!argument.is_empty()).then(|| argument.to_owned()),
+        )),
         "/commands" => ChatInput::Command(ChatCommand::Commands),
         "/clear" | "/new" => ChatInput::Command(ChatCommand::New),
         "/config" => ChatInput::Command(ChatCommand::Config),
+        "/context" => ChatInput::Command(ChatCommand::Context),
         "/deny" | "/reject" => ChatInput::Command(ChatCommand::Deny(argument.to_owned())),
         "/detach" | "/remove-attachment" => {
             ChatInput::Command(ChatCommand::Detach(argument.to_owned()))
@@ -1621,6 +1735,41 @@ fn compact_path(path: &Path) -> String {
         .strip_prefix(&home)
         .map(|suffix| format!("~{suffix}"))
         .unwrap_or(display)
+}
+
+fn compact_number(value: u64) -> String {
+    if value < 1_000 {
+        return value.to_string();
+    }
+    if value < 1_000_000 {
+        let whole = value / 1_000;
+        let decimal = (value % 1_000) / 100;
+        return if decimal == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{decimal}k")
+        };
+    }
+    let whole = value / 1_000_000;
+    let decimal = (value % 1_000_000) / 100_000;
+    if decimal == 0 {
+        format!("{whole}m")
+    } else {
+        format!("{whole}.{decimal}m")
+    }
+}
+
+fn context_bar(percent: u64, width: usize) -> String {
+    let filled = usize::try_from(percent.min(100))
+        .unwrap_or(100)
+        .saturating_mul(width)
+        .saturating_add(50)
+        / 100;
+    format!(
+        "[{}{}]",
+        "█".repeat(filled),
+        "░".repeat(width.saturating_sub(filled))
+    )
 }
 
 fn protocol_name(family: ProviderFamily, wire: WireApi) -> &'static str {
@@ -1729,6 +1878,20 @@ mod tests {
             ChatInput::Command(ChatCommand::Model(Some("gpt-fast".into())))
         );
         assert_eq!(parse_input("/diff"), ChatInput::Command(ChatCommand::Diff));
+        assert_eq!(
+            parse_input("/context"),
+            ChatInput::Command(ChatCommand::Context)
+        );
+        assert_eq!(
+            parse_input("/compact"),
+            ChatInput::Command(ChatCommand::Compact(None))
+        );
+        assert_eq!(
+            parse_input("/compact preserve the failing test"),
+            ChatInput::Command(ChatCommand::Compact(Some(
+                "preserve the failing test".into()
+            )))
+        );
         assert_eq!(
             parse_input("! cargo test"),
             ChatInput::Shell {
